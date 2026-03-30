@@ -1,0 +1,41 @@
+services:
+  raven:
+    build: .
+    container_name: raven
+    init: true
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - GITEA_WEBHOOK_SECRET
+      - GITEA_URL
+      - GITEA_TOKEN
+      - CLAUDE_CODE_OAUTH_TOKEN
+      - CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+      - NOTIFY_CHANNELS
+      - REVIEW_APPROVE_MAX_SEVERITY
+      - MERGE_STRATEGY
+      - MAX_DIFF_LINES
+      - SKIP_REPOS
+      - SKIP_AUTHORS
+      - CLAUDE_MODEL
+      - CLAUDE_EFFORT
+      - CI_WAIT_TIMEOUT
+      - RAVEN_LABEL_NAME
+      - BITBUCKET_DC_URL
+      - BITBUCKET_DC_TOKEN
+      - BITBUCKET_DC_WEBHOOK_SECRET
+      - BITBUCKET_DC_USERNAME
+      - RAVEN_CACHE_DIR=/data/raven
+    volumes:
+      - ./logs:/app/logs
+      - raven-cache:/data/raven
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  raven-cache:
