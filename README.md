@@ -36,7 +36,13 @@ Pushing new commits to a PR branch triggers an incremental re-review (only chang
 
 ### Conversational follow-up
 
-Developers can @mention Raven in PR comments to ask questions or dispute findings. Raven responds with context-aware answers using the PR diff and conversation history. For inline diff comments, responses include the file/line location. A 30-second cooldown per PR prevents spam.
+Developers can @mention Raven in PR comments to ask questions or dispute findings. Raven responds with context-aware answers using the PR diff and conversation history.
+
+- **Immediate acknowledgment** — on Gitea, Raven reacts 👀 to the triggering comment within a second so you know it was picked up, even though the Claude response takes 10–30s.
+- **Threaded replies** — on platforms that support comment threads (Bitbucket Data Center), Raven replies inside the thread rather than posting a top-level comment.
+- **No re-@mention inside Raven's threads** — any reply in a thread where Raven has already participated triggers a follow-up, so the conversation flows naturally.
+- **Line-aware context** — inline diff comments get a line-numbered snippet of the file injected into the prompt, so Raven answers about the exact code without having to parse hunk headers.
+- **Faster effort** — comment replies default to `CLAUDE_EFFORT_COMMENT=medium`; PR reviews still use max.
 
 ## Quick start
 
@@ -122,8 +128,12 @@ All configuration is via environment variables. See `config.example.env` for the
 | `SKIP_REPOS` | No | — | Comma-separated `owner/repo` list to skip. |
 | `SKIP_AUTHORS` | No | — | Comma-separated author names to skip. |
 | `CLAUDE_MODEL` | No | `claude-opus-4-6` | Model to use for reviews. |
-| `CLAUDE_EFFORT` | No | `max` | Thinking effort level (`low`, `medium`, `high`, `max`). |
+| `CLAUDE_EFFORT` | No | `max` | Thinking effort on PR reviews (`low`, `medium`, `high`, `max`). |
+| `CLAUDE_EFFORT_COMMENT` | No | `medium` | Thinking effort on comment replies. Q&A rarely needs max. |
 | `CLAUDE_TIMEOUT` | No | `600` | Timeout in seconds for each Claude CLI invocation. |
+| `RAVEN_COMMENT_HISTORY` | No | `20` | Recent comments passed to Claude as conversation context. |
+| `RAVEN_GITEA_AUTO_MERGE` | No | `false` | Use Gitea's native auto-merge instead of polling CI (Gitea only). |
+| `RAVEN_AUTO_MERGE_ON_APPROVAL` | No | `false` | Auto-merge when a human approves a PR Raven already approved. |
 | `RAVEN_LABEL_NAME` | No | `raven-reviewed` | Label name added to reviewed PRs. |
 | `RAVEN_CACHE_DIR` | No | `/tmp/raven` | Directory for persistent findings cache. Use a Docker volume in production. |
 | `RAVEN_MAX_CACHED_PRS` | No | `200` | Max PR entries in the findings cache (LRU eviction). |
@@ -259,7 +269,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-244 tests across 6 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, PR dedup, incremental reviews, findings cache persistence, conversational follow-up, both git providers, and the full PR flow including CI gating.
+327 tests across 6 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), both git providers, and the full PR flow including CI gating.
 
 ## CI
 
