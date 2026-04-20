@@ -101,10 +101,17 @@ class BitbucketDCProvider(GitProvider):
     # ------------------------------------------------------------------ #
 
     def fetch_pr_diff(self, repo_full_name: str, pr_number: int) -> str:
-        """Return the raw unified diff for a pull request."""
+        """Return the raw unified diff for a pull request.
+
+        Some BB Server versions (observed on 9.4.x) return 500 when the
+        request carries ``Accept: text/plain``. Let the server pick its
+        default (JSON in recent versions) and rely on
+        ``_json_diff_to_unified`` to convert. The content-type check keeps
+        the plain-text branch available if a server does return text.
+        """
         project, repo = _split_repo(repo_full_name)
         url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/diff"
-        resp = self.session.get(url, timeout=30, headers={"Accept": "text/plain"})
+        resp = self.session.get(url, timeout=30)
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
         if "application/json" in content_type:
