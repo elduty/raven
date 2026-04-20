@@ -267,6 +267,11 @@ def create_app() -> Flask:
                 return jsonify({"status": "ignored", "reason": "cannot verify reviewer identity"})
             if requested.lower() != raven_user.lower():
                 return jsonify({"status": "ignored", "reason": "review requested for another user"})
+            # Ignore the webhook that fires when Raven adds itself as a reviewer.
+            # Otherwise the add_self_as_reviewer call at the start of _process_pr
+            # triggers a second _process_pr via pr:reviewer:updated.
+            if sender and sender.lower() == raven_user.lower():
+                return jsonify({"status": "ignored", "reason": "self-triggered"})
             # Dedup review requests separately from normal PR events
             if _should_skip_duplicate(f"{provider.name}:{repo}", f"review-{pr_number}"):
                 return jsonify({"status": "skipped", "reason": "duplicate"})

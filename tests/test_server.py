@@ -197,6 +197,21 @@ class TestPRWebhook:
             resp = _post(client, payload, event="pull_request")
         assert resp.get_json()["status"] == "ignored"
 
+    def test_review_requested_self_triggered_ignored(self, client):
+        """When Raven adds itself as a reviewer, the resulting reviewer-updated
+        webhook must not trigger a second review. Otherwise _process_pr runs
+        twice for the same PR."""
+        _recent_prs.clear()
+        payload = self._pr_payload("review_requested", sender="Raven")
+        payload["requested_reviewer"] = {"login": "Raven"}
+        provider = _providers["gitea"]
+        with patch.object(provider, "get_authenticated_user", return_value="Raven"), \
+             patch("raven.server.executor") as mock_executor:
+            resp = _post(client, payload, event="pull_request")
+        assert resp.get_json()["status"] == "ignored"
+        assert resp.get_json()["reason"] == "self-triggered"
+        mock_executor.submit.assert_not_called()
+
 
 class TestProcessPr:
     def setup_method(self):
