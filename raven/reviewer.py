@@ -372,10 +372,15 @@ def severity_gte(a: str, b: str) -> bool:
 
 def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
                         repo_name: str, claude_md: str = "",
-                        file_path: str = "", line: int = 0) -> str:
+                        file_path: str = "", line: int = 0,
+                        code_snippet: str = "") -> str:
     """Generate a conversational response to a developer's comment.
 
     Returns plain text (markdown). Raises RuntimeError on CLI failure.
+
+    ``code_snippet`` is an optional numbered window of the file around the
+    commented line; when present, it's included in the prompt so Claude
+    doesn't have to hunt through the diff to locate the referenced code.
     """
     repo_context = f"\n\n## Repository Context\n{claude_md}" if claude_md else ""
 
@@ -385,6 +390,13 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
         if line:
             location += f", line {line}"
 
+    snippet_section = ""
+    if code_snippet and file_path:
+        snippet_section = (
+            f"\n\n## Code at `{file_path}` around line {line}\n\n"
+            f"```\n{code_snippet}\n```"
+        )
+
     conv_lines = []
     for c in conversation:
         user = c.get("user", {}).get("login", "unknown")
@@ -393,7 +405,7 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
     conv_text = "\n\n".join(conv_lines)
 
     prompt = (
-        f"## Repository: {repo_name}{repo_context}{location}\n\n"
+        f"## Repository: {repo_name}{repo_context}{location}{snippet_section}\n\n"
         f"{_RESPOND_PROMPT_TEMPLATE}\n\n"
         f"## PR Diff\n\n```diff\n{diff}\n```\n\n"
         f"## Conversation\n\n{conv_text}\n\n"

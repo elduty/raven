@@ -298,32 +298,21 @@ def create_app() -> Flask:
                     re.IGNORECASE,
                 )
             )
-            # Reply-in-Raven-thread check: if no @mention but Raven has
-            # posted anywhere in the thread rooted at parent_comment_id,
-            # treat the new comment as directed at Raven so the conversation
-            # continues naturally. Walks the full thread so replies to
-            # Raven's replies work, not only replies to Raven's top-level
-            # comments (BB DC flattens parent_comment_id to the thread root).
-            is_reply_to_raven = False
+            # Fast reject on the webhook hot path: if neither a mention nor
+            # a potential thread reply, no reason to dispatch at all.
             parent_comment_id = payload.get("parent_comment_id")
-            if not is_mention and raven_user and parent_comment_id and pr_number:
-                try:
-                    thread_authors = provider.get_comment_thread_authors(
-                        repo, pr_number, parent_comment_id,
-                    )
-                except Exception as e:
-                    logger.warning("Failed to look up thread rooted at %s: %s",
-                                   parent_comment_id, e)
-                    thread_authors = []
-                raven_lower = raven_user.lower()
-                if any(a and a.lower() == raven_lower for a in thread_authors):
-                    is_reply_to_raven = True
-            if not is_mention and not is_reply_to_raven:
+            if not is_mention and not parent_comment_id:
                 return jsonify({"status": "ignored", "reason": "not directed at Raven"})
             if not pr_number:
                 return jsonify({"status": "skipped", "reason": "missing PR number"})
             if comment_id and _should_skip_duplicate(f"{provider.name}:{repo}", f"comment-{comment_id}"):
                 return jsonify({"status": "skipped", "reason": "duplicate"})
+            # The thread-author lookup (HTTP GET) runs inside _process_comment
+            # so the webhook always returns 200 promptly — slow provider APIs
+            # can't stall webhook delivery or trigger retries. The worker
+            # decides whether to actually respond; if the thread doesn't
+            # contain Raven, it quietly exits without posting anything.
+            payload["_is_mention"] = bool(is_mention)
             executor.submit(_process_comment, provider, payload)
             return jsonify({"status": "accepted", "reason": "responding to comment"})
 
@@ -542,7 +531,13 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
 # ------------------------------------------------------------------ #
 
 def _process_comment(provider: GitProvider, payload: dict) -> None:
-    """Respond to a comment directed at Raven in a background thread."""
+    """Respond to a comment directed at Raven in a background thread.
+
+    The webhook handler dispatches any comment that *could* be for Raven —
+    either an @mention or a reply inside a thread. This worker confirms the
+    thread case with a provider API call (kept off the webhook hot path) and
+    quietly exits if Raven isn't involved.
+    """
     repo_full_name = payload["repo"]
     pr_number = payload.get("pr_number")
     comment_id = payload.get("comment_id")
@@ -550,6 +545,35 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         comment_body = payload.get("comment_body", "")
         file_path = payload.get("file_path", "") or ""
         line = payload.get("line") or 0
+        parent_comment_id = payload.get("parent_comment_id")
+        is_mention = bool(payload.get("_is_mention"))
+
+        # Thread verification. @mentions dispatched by the handler are
+        # authoritative and skip this step. Reply-with-no-mention events
+        # land here with is_mention=False; look up the thread authors to
+        # decide if Raven should engage.
+        if not is_mention:
+            try:
+                raven_user = provider.get_authenticated_user()
+            except Exception:
+                raven_user = ""
+            if not (raven_user and parent_comment_id):
+                logger.debug("Comment on PR #%s not directed at Raven — skipping",
+                             pr_number)
+                return
+            try:
+                thread_authors = provider.get_comment_thread_authors(
+                    repo_full_name, pr_number, parent_comment_id,
+                )
+            except Exception as e:
+                logger.warning("Thread lookup failed for PR #%s comment %s: %s",
+                               pr_number, parent_comment_id, e)
+                return
+            raven_lower = raven_user.lower()
+            if not any(a and a.lower() == raven_lower for a in thread_authors):
+                logger.debug("Raven not in thread rooted at %s — skipping",
+                             parent_comment_id)
+                return
 
         # Immediate 👀 ack so the user knows Raven saw the comment, long
         # before the Claude response lands. Best-effort — providers without
@@ -565,7 +589,7 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # file's hunk is kept even when the rest of the diff doesn't fit.
         raw_diff = provider.fetch_pr_diff(repo_full_name, pr_number)
         diff = _strip_lockfiles_and_binaries(raw_diff)
-        diff = _truncate_diff_for_comment(diff, file_path)
+        diff = _truncate_diff_for_comment(diff, file_path, line)
         claude_md = ""
         try:
             claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref="HEAD")
@@ -575,10 +599,25 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # Fetch conversation (keep last N to avoid prompt bloat)
         conversation = provider.get_pr_comments(repo_full_name, pr_number)[-COMMENT_HISTORY:]
 
+        # For inline diff comments, pull a line-numbered window of the file
+        # around the commented line and inject it into the prompt so Claude
+        # doesn't have to find the code by parsing hunk headers. Needs the
+        # PR's head SHA — best-effort; fall back to no snippet on failure.
+        code_snippet = ""
+        if file_path and line > 0:
+            try:
+                head_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
+                file_content = provider.fetch_file(repo_full_name, file_path, ref=head_sha)
+                code_snippet = _extract_code_snippet(file_content, line)
+            except Exception as e:
+                logger.debug("Could not fetch code snippet for %s:%s — %s",
+                             file_path, line, e)
+
         # Generate response
         response = respond_to_comment(
             comment_body, conversation, diff, repo_full_name,
             claude_md=claude_md, file_path=file_path, line=line,
+            code_snippet=code_snippet,
         )
 
         # Post response (skip if Claude returned nothing)
@@ -802,6 +841,32 @@ def _findings_by_file(findings: list[dict], filenames: set[str]) -> dict[str, li
     return by_file
 
 
+CODE_SNIPPET_CONTEXT_LINES = 10  # lines before/after the commented line
+
+
+def _extract_code_snippet(file_content: str, line: int,
+                           context: int = CODE_SNIPPET_CONTEXT_LINES) -> str:
+    """Return a line-numbered window of ``file_content`` around ``line``.
+
+    The target line is marked with ``→`` so Claude can't misidentify which
+    line the comment is about. Returns an empty string when the content or
+    line number is invalid.
+    """
+    if not file_content or line <= 0:
+        return ""
+    lines = file_content.splitlines()
+    if not lines or line > len(lines):
+        return ""
+    start = max(1, line - context)
+    end = min(len(lines), line + context)
+    width = len(str(end))
+    formatted: list[str] = []
+    for n in range(start, end + 1):
+        marker = "→" if n == line else " "
+        formatted.append(f"{n:>{width}} {marker} {lines[n - 1]}")
+    return "\n".join(formatted)
+
+
 def _head_truncate(diff: str) -> str:
     """Plain head-truncation fallback used when no relevance bias applies."""
     total = diff.count("\n")
@@ -819,17 +884,145 @@ def _head_truncate(diff: str) -> str:
     return "".join(out_lines) + f"\n... (truncated, {total - seen} lines omitted)"
 
 
-def _truncate_diff_for_comment(diff: str, file_path: str = "") -> str:
+_HUNK_HEADER_RE = re.compile(
+    r"^@@\s+-\d+(?:,\d+)?\s+\+(?P<start>\d+)(?:,(?P<span>\d+))?\s+@@",
+)
+
+
+def _split_chunk_by_hunks(chunk: str) -> tuple[str, list[tuple[int, int, str]]]:
+    """Split a single-file diff chunk into (header, hunks).
+
+    ``header`` is everything before the first ``@@`` line (diff --git,
+    index, ---, +++). Each hunk is ``(dst_start, dst_end, text)`` where
+    dst range is the inclusive destination line span. Returns an empty
+    hunks list if the chunk has no parseable hunk headers.
+    """
+    lines = chunk.splitlines(keepends=True)
+    header_lines: list[str] = []
+    hunks: list[tuple[int, int, str]] = []
+    current_start = 0
+    current_span = 0
+    current_text: list[str] = []
+
+    def _flush() -> None:
+        if current_text:
+            end = current_start + max(current_span - 1, 0)
+            hunks.append((current_start, end, "".join(current_text)))
+
+    seen_hunk = False
+    for ln in lines:
+        m = _HUNK_HEADER_RE.match(ln)
+        if m:
+            _flush()
+            current_start = int(m.group("start"))
+            current_span = int(m.group("span") or "1")
+            current_text = [ln]
+            seen_hunk = True
+        elif not seen_hunk:
+            header_lines.append(ln)
+        else:
+            current_text.append(ln)
+    _flush()
+    return "".join(header_lines), hunks
+
+
+def _window_chunk_around_line(chunk: str, line: int, budget: int) -> str | None:
+    """Return a view of ``chunk`` containing the hunk that covers ``line``
+    plus as many neighbouring hunks as fit in ``budget`` newlines.
+
+    Returns ``None`` if the chunk has no parseable hunks or no hunk covers
+    the target line — callers should fall back to head-truncation in that
+    case. The diff --git / ---/+++ header is always preserved so the
+    output is still a parseable unified-diff fragment.
+    """
+    header, hunks = _split_chunk_by_hunks(chunk)
+    if not hunks:
+        return None
+
+    # Find the hunk covering the target line, or the closest one.
+    covering_idx = None
+    for i, (start, end, _text) in enumerate(hunks):
+        if start <= line <= end:
+            covering_idx = i
+            break
+    if covering_idx is None:
+        return None
+
+    header_lines = header.count("\n")
+    budget -= header_lines
+    if budget <= 0:
+        return None
+
+    kept = [covering_idx]
+    covering_lines = hunks[covering_idx][2].count("\n")
+    if covering_lines > budget:
+        # Even the target hunk exceeds the budget — head-truncate it and
+        # skip the rest.
+        trunc = _head_truncate_chunk(hunks[covering_idx][2], budget)
+        return header + trunc
+    budget -= covering_lines
+
+    # Expand outward alternately — one after, one before, until budget runs out.
+    before = covering_idx - 1
+    after = covering_idx + 1
+    while before >= 0 or after < len(hunks):
+        took = False
+        if after < len(hunks):
+            size = hunks[after][2].count("\n")
+            if size <= budget:
+                kept.append(after)
+                budget -= size
+                after += 1
+                took = True
+            else:
+                after = len(hunks)
+        if before >= 0:
+            size = hunks[before][2].count("\n")
+            if size <= budget:
+                kept.insert(0, before)
+                budget -= size
+                before -= 1
+                took = True
+            else:
+                before = -1
+        if not took:
+            break
+
+    out_hunks = "".join(hunks[i][2] for i in sorted(kept))
+    dropped = len(hunks) - len(kept)
+    suffix = ""
+    if dropped:
+        suffix = f"\n... (truncated, {dropped} hunk(s) omitted to keep line {line} in context)"
+    return header + out_hunks + suffix
+
+
+def _head_truncate_chunk(chunk: str, budget: int) -> str:
+    """Head-truncate a single chunk to ``budget`` newlines, with marker."""
+    lines = chunk.splitlines(keepends=True)
+    out: list[str] = []
+    seen = 0
+    for ln in lines:
+        if seen >= budget:
+            break
+        out.append(ln)
+        seen += ln.count("\n")
+    total = chunk.count("\n")
+    return "".join(out) + f"\n... (truncated, {total - seen} lines of the hunk omitted)"
+
+
+def _truncate_diff_for_comment(diff: str, file_path: str = "", line: int = 0) -> str:
     """Truncate a diff to MAX_DIFF_LINES, keeping the relevant file first.
 
     For diff comments that name a file, split the diff per file, place that
     file's hunk first, then append other files in order until the limit is
-    reached. If the relevant file's own chunk exceeds the budget, head-
-    truncate that chunk so the file is still visible (better than dropping
-    it entirely, which would defeat the purpose).
+    reached. If the relevant file's own chunk exceeds the budget:
 
-    Without a file_path — or when the named file isn't in the diff — falls
-    back to plain head-truncation.
+    - When a ``line`` is provided and one of the hunks covers it, window
+      around that hunk so the commented-on line stays in the output.
+    - Otherwise head-truncate the chunk so the file is at least visible.
+
+    Without a ``file_path`` — or when the named file isn't in the diff —
+    falls back to plain head-truncation of the whole diff.
     """
     if diff.count("\n") <= MAX_DIFF_LINES:
         return diff
@@ -842,8 +1035,6 @@ def _truncate_diff_for_comment(diff: str, file_path: str = "") -> str:
     others = [(fn, ch) for fn, ch in file_chunks if fn != file_path]
 
     if not relevant:
-        # Likely a path-normalisation mismatch between webhook and diff
-        # header — log at debug so ops can spot it if it becomes common.
         logger.debug(
             "Comment file_path %r not found among diff files %r — "
             "falling back to head-truncation",
@@ -851,7 +1042,7 @@ def _truncate_diff_for_comment(diff: str, file_path: str = "") -> str:
         )
         return _head_truncate(diff)
 
-    relevant_fn, relevant_chunk = relevant[0]
+    _relevant_fn, relevant_chunk = relevant[0]
     relevant_lines = relevant_chunk.count("\n")
     output_parts: list[str] = []
     budget = MAX_DIFF_LINES
@@ -859,12 +1050,17 @@ def _truncate_diff_for_comment(diff: str, file_path: str = "") -> str:
     total_files = len(file_chunks)
 
     if relevant_lines > budget:
-        # Target chunk alone exceeds the budget — head-truncate it so the
-        # file is still visible, even if the exact commented-on line ends
-        # up beyond the cut.
-        trunc = _head_truncate(relevant_chunk)
-        output_parts.append(trunc)
-        # The rest of the files don't fit — everything else is skipped.
+        # Target chunk exceeds the budget. If we know which line the user
+        # commented on, window around the hunk that contains it so that
+        # line stays visible. Falling back to head-truncation only when
+        # no hunk covers the line.
+        windowed = None
+        if line > 0:
+            windowed = _window_chunk_around_line(relevant_chunk, line, budget)
+        if windowed is not None:
+            output_parts.append(windowed)
+        else:
+            output_parts.append(_head_truncate(relevant_chunk))
         skipped_files = total_files - 1
     else:
         output_parts.append(relevant_chunk)

@@ -13,7 +13,7 @@ os.environ.setdefault("RAVEN_WEBHOOK_SECRET", "testsecret")
 os.environ.setdefault("GITEA_WEBHOOK_SECRET", "testsecret")
 
 import raven.server as _server_mod
-from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _process_review_approved, _latest_review_per_user, _wait_for_ci, _should_skip_duplicate, _do_merge, _truncate_diff_for_comment, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
+from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _process_review_approved, _latest_review_per_user, _wait_for_ci, _should_skip_duplicate, _do_merge, _truncate_diff_for_comment, _extract_code_snippet, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
 from raven.providers import GitProvider, _providers
 
 
@@ -1064,7 +1064,8 @@ class TestIssueComment:
             "repository": {"full_name": "owner/repo"},
         }
 
-    def _normalized_comment_payload(self, body="@Raven explain this", user="alice"):
+    def _normalized_comment_payload(self, body="@Raven explain this", user="alice",
+                                    is_mention=True):
         return {
             "repo": "owner/repo",
             "sender": user,
@@ -1074,6 +1075,7 @@ class TestIssueComment:
             "comment_id": 999,
             "file_path": "",
             "line": 0,
+            "_is_mention": is_mention,
         }
 
     def test_mention_triggers_response(self, client):
@@ -1229,6 +1231,63 @@ class TestIssueComment:
         mc.post_pr_comment.assert_called_once()
         assert "the answer" in mc.post_pr_comment.call_args[0][2]
 
+    def test_process_comment_reply_path_verifies_thread_in_background(self):
+        """Reply-in-thread payloads reach _process_comment with
+        _is_mention=False — the worker must call get_comment_thread_authors
+        to decide whether Raven should engage."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "bitbucket-dc"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_comment_thread_authors.return_value = ["alice", "Raven"]
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.get_pr_comments.return_value = []
+        payload = self._normalized_comment_payload(is_mention=False)
+        payload["parent_comment_id"] = 700
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = "ok"
+            _process_comment(mc, payload)
+        mc.get_comment_thread_authors.assert_called_once_with("owner/repo", 42, 700)
+        mc.post_pr_comment.assert_called_once()
+
+    def test_process_comment_reply_path_skips_when_raven_not_in_thread(self):
+        """If the thread doesn't contain Raven, the worker exits quietly
+        without posting anything."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "bitbucket-dc"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_comment_thread_authors.return_value = ["alice", "bob"]
+        payload = self._normalized_comment_payload(is_mention=False)
+        payload["parent_comment_id"] = 700
+        _process_comment(mc, payload)
+        mc.post_pr_comment.assert_not_called()
+        mc.react_to_comment.assert_not_called()
+
+    def test_process_comment_reply_path_skips_when_thread_lookup_raises(self):
+        """Provider error during thread lookup — worker exits quietly."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "bitbucket-dc"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_comment_thread_authors.side_effect = RuntimeError("503")
+        payload = self._normalized_comment_payload(is_mention=False)
+        payload["parent_comment_id"] = 700
+        _process_comment(mc, payload)
+        mc.post_pr_comment.assert_not_called()
+
+    def test_process_comment_mention_skips_thread_lookup(self):
+        """When the handler marked the comment as an @mention, the worker
+        trusts that signal and doesn't hit the provider thread API."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.get_pr_comments.return_value = []
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = "the answer"
+            _process_comment(mc, self._normalized_comment_payload(is_mention=True))
+        mc.get_comment_thread_authors.assert_not_called()
+        mc.post_pr_comment.assert_called_once()
+
 
 class TestPullRequestComment:
     """Test handling of pull_request_comment events (inline diff comments)."""
@@ -1255,7 +1314,8 @@ class TestPullRequestComment:
         }
 
     def _normalized_diff_comment(self, body="@Raven explain", user="alice",
-                                  file_path="server.py", line=42):
+                                  file_path="server.py", line=42,
+                                  is_mention=True):
         return {
             "repo": "owner/repo",
             "sender": user,
@@ -1265,6 +1325,7 @@ class TestPullRequestComment:
             "comment_id": 999,
             "file_path": file_path,
             "line": line,
+            "_is_mention": is_mention,
         }
 
     def test_mention_in_diff_comment_triggers_response(self, client):
@@ -1314,6 +1375,45 @@ class TestPullRequestComment:
         assert "line 42" in posted_body
         assert "Because of X." in posted_body
 
+    def test_diff_comment_includes_code_snippet_in_prompt(self):
+        """Inline diff comments should have a line-numbered code window
+        passed to respond_to_comment so Claude doesn't have to locate the
+        line by parsing hunk headers."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.supports_comment_threads = False
+        mc.get_pr_head_sha.return_value = "abc123"
+        mc.fetch_pr_diff.return_value = "diff --git a/server.py\n+x\n"
+        # Return CLAUDE.md first, then the code snippet (two calls)
+        mc.fetch_file.side_effect = ["", "\n".join(f"row-{i}" for i in range(1, 101))]
+        mc.get_pr_comments.return_value = []
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = "ok"
+            _process_comment(mc, self._normalized_diff_comment(line=42))
+        call_kwargs = mock_respond.call_args[1]
+        snippet = call_kwargs.get("code_snippet", "")
+        assert "→ row-42" in snippet
+        # 10 lines of context on each side
+        assert "row-32" in snippet
+        assert "row-52" in snippet
+        mc.get_pr_head_sha.assert_called_once_with("owner/repo", 42)
+
+    def test_diff_comment_snippet_skipped_when_head_sha_fails(self):
+        """If get_pr_head_sha raises, just skip the snippet — the response
+        still gets generated using the diff alone."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.supports_comment_threads = False
+        mc.get_pr_head_sha.side_effect = RuntimeError("no sha")
+        mc.fetch_pr_diff.return_value = "diff --git a/server.py\n+x\n"
+        mc.fetch_file.return_value = ""
+        mc.get_pr_comments.return_value = []
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = "ok"
+            _process_comment(mc, self._normalized_diff_comment(line=42))
+        call_kwargs = mock_respond.call_args[1]
+        assert call_kwargs.get("code_snippet", "") == ""
+
     def test_diff_comment_response_omits_location_header_when_threaded(self):
         """Threading providers (BB DC) render the thread at the file/line
         already, so the Re: header would duplicate context."""
@@ -1330,6 +1430,38 @@ class TestPullRequestComment:
         posted_body = mc.post_pr_comment.call_args[0][2]
         assert "**Re:" not in posted_body
         assert "Because of X." in posted_body
+
+
+class TestExtractCodeSnippet:
+    def test_window_around_line(self):
+        content = "\n".join(f"line-{i}" for i in range(1, 21))
+        out = _extract_code_snippet(content, line=10, context=2)
+        # Expected: lines 8..12, with 10 marked
+        assert "8   line-8" in out
+        assert "9   line-9" in out
+        assert "10 → line-10" in out
+        assert "11   line-11" in out
+        assert "12   line-12" in out
+
+    def test_marks_target_line(self):
+        content = "a\nb\nc\n"
+        out = _extract_code_snippet(content, line=2, context=5)
+        assert "→ b" in out
+        assert "  a" in out  # unmarked
+
+    def test_clamps_to_file_bounds(self):
+        content = "only-line"
+        out = _extract_code_snippet(content, line=1, context=5)
+        assert "only-line" in out
+
+    def test_empty_content_returns_empty(self):
+        assert _extract_code_snippet("", line=1) == ""
+
+    def test_zero_line_returns_empty(self):
+        assert _extract_code_snippet("a\nb\n", line=0) == ""
+
+    def test_out_of_range_line_returns_empty(self):
+        assert _extract_code_snippet("a\nb\n", line=10) == ""
 
 
 class TestTruncateDiffForComment:
@@ -1384,6 +1516,42 @@ class TestTruncateDiffForComment:
         # Unrelated file dropped when the target alone consumed the budget.
         assert "diff --git a/other b/other" not in out
         assert "truncated" in out
+
+    def test_windows_around_commented_line_in_oversized_chunk(self):
+        """When the target chunk is oversized and a hunk covers the
+        commented-on line, the windower keeps that hunk so the line
+        stays visible."""
+        import raven.server as _srv
+        header = "diff --git a/big b/big\n--- a/big\n+++ b/big\n"
+        hunk_a = "@@ -1,0 +1,5 @@\n+early-1\n+early-2\n+early-3\n+early-4\n+early-5\n"
+        hunk_b = "@@ -1,0 +50,5 @@\n+middle-50\n+middle-51\n+middle-52\n+middle-53\n+middle-54\n"
+        hunk_c = "@@ -1,0 +100,5 @@\n+late-100\n+late-101\n+late-102\n+late-103\n+late-104\n"
+        chunk = header + hunk_a + hunk_b + hunk_c
+        diff = chunk + "diff --git a/other b/other\n" + "+x\n" * 50
+        with patch.object(_srv, "MAX_DIFF_LINES", 10):
+            out = _srv._truncate_diff_for_comment(diff, file_path="big", line=52)
+        assert "middle-52" in out
+        assert "+++ b/big" in out
+        assert "truncated" in out
+
+    def test_no_line_info_falls_back_to_head_truncation(self):
+        """Without a line number, oversized target chunk is head-truncated."""
+        import raven.server as _srv
+        header = "diff --git a/big b/big\n--- a/big\n+++ b/big\n"
+        chunk = header + "@@ -1,0 +1,3 @@\n" + "+body\n" * 40
+        with patch.object(_srv, "MAX_DIFF_LINES", 8):
+            out = _srv._truncate_diff_for_comment(chunk, file_path="big", line=0)
+        assert out.startswith("diff --git a/big b/big")
+
+    def test_line_outside_any_hunk_falls_back_to_head_truncation(self):
+        """If the commented-on line sits outside any hunk, fall back."""
+        import raven.server as _srv
+        header = "diff --git a/big b/big\n--- a/big\n+++ b/big\n"
+        hunk = "@@ -1,0 +1,3 @@\n+a\n+b\n+c\n"
+        chunk = header + hunk + "\n" + "+filler\n" * 40
+        with patch.object(_srv, "MAX_DIFF_LINES", 8):
+            out = _srv._truncate_diff_for_comment(chunk, file_path="big", line=999)
+        assert "diff --git a/big b/big" in out
 
 
 class TestCachePersistence:
@@ -1721,16 +1889,19 @@ class TestBitbucketDCWebhook:
                 "author": {"slug": "alice"},
             },
         }
+        # Webhook always returns 200 accepted — the background worker does
+        # the thread lookup and decides to skip when Raven isn't involved.
         with patch.object(self._provider, "get_authenticated_user", return_value=self.BB_USERNAME), \
-             patch.object(self._provider, "get_comment_thread_authors",
-                          return_value=["alice", "someone-else"]):
+             patch("raven.server.executor") as mock_executor:
             resp = self._post_bb_dc(payload, "pr:comment:added")
         assert resp.status_code == 200
-        assert resp.get_json()["status"] == "ignored"
+        assert resp.get_json()["status"] == "accepted"
+        mock_executor.submit.assert_called_once()
 
-    def test_reply_falls_back_to_ignored_when_thread_lookup_raises(self):
-        """If thread lookup raises (network error, 5xx), the webhook must
-        still return 200 and route to 'ignored' rather than crash."""
+    def test_webhook_returns_200_without_calling_thread_lookup(self):
+        """Provider thread API must not be hit on the webhook hot path —
+        the worker does that asynchronously so the webhook stays fast
+        even when the provider is slow or unreachable."""
         payload = {
             "actor": {"slug": "alice"},
             "commentParentId": 900,
@@ -1747,11 +1918,12 @@ class TestBitbucketDCWebhook:
             },
         }
         with patch.object(self._provider, "get_authenticated_user", return_value=self.BB_USERNAME), \
-             patch.object(self._provider, "get_comment_thread_authors",
-                          side_effect=RuntimeError("BB DC 503")):
+             patch.object(self._provider, "get_comment_thread_authors") as mock_lookup, \
+             patch("raven.server.executor"):
             resp = self._post_bb_dc(payload, "pr:comment:added")
         assert resp.status_code == 200
-        assert resp.get_json()["status"] == "ignored"
+        assert resp.get_json()["status"] == "accepted"
+        mock_lookup.assert_not_called()
 
     # -- Reviewer updated triggers review ---------------------------------- #
 
