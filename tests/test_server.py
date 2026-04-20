@@ -1111,6 +1111,19 @@ class TestIssueComment:
             resp = _post(client, self._comment_payload("@Ravenous looks fine"), event="issue_comment")
         assert resp.get_json()["status"] == "ignored"
 
+    def test_quoted_mention_triggers_response(self, client):
+        """BB DC wraps usernames containing dots in double quotes: @"jenkins.builder"."""
+        provider = _providers["gitea"]
+        with patch.object(provider, "get_authenticated_user", return_value="jenkins.builder"), \
+             patch("raven.server.executor") as mock_executor:
+            resp = _post(
+                client,
+                self._comment_payload('@"jenkins.builder" will you reply?'),
+                event="issue_comment",
+            )
+        assert resp.get_json()["status"] == "accepted"
+        mock_executor.submit.assert_called_once()
+
     def test_identity_failure_ignores_comments(self, client):
         """When identity lookup fails, comments are silently ignored."""
         provider = _providers["gitea"]

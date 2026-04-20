@@ -305,9 +305,14 @@ def create_app() -> Flask:
                 raven_user = ""
             if raven_user and comment_user.lower() == raven_user.lower():
                 return jsonify({"status": "skipped", "reason": "own comment"})
-            # Mention check
+            # Mention check — accepts @user or @"user.with.dots" (BB DC wraps
+            # usernames containing dots in double quotes inside comment.text).
             is_mention = raven_user and bool(
-                re.search(rf"@{re.escape(raven_user)}\b", comment_body, re.IGNORECASE)
+                re.search(
+                    rf'@(?:"{re.escape(raven_user)}"|{re.escape(raven_user)}\b)',
+                    comment_body,
+                    re.IGNORECASE,
+                )
             )
             if not is_mention:
                 return jsonify({"status": "ignored", "reason": "not directed at Raven"})
