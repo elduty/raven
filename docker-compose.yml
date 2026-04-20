@@ -6,26 +6,56 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    # Values come from .env via ${VAR} interpolation. Add new vars
+    # here when config.example.env grows — otherwise they silently
+    # don't reach the container even if set in .env.
+    #
+    # For vars with a Python-side default (see raven/*.py), the
+    # default is duplicated here as ${VAR:-<default>} so an unset
+    # .env doesn't inject an empty string that would bypass the
+    # Python default (int("") would crash, and Claude CLI would get
+    # --model ""). Keep the two sides in sync when you change a
+    # default in the code.
     environment:
-      - GITEA_WEBHOOK_SECRET
-      - GITEA_URL
-      - GITEA_TOKEN
-      - CLAUDE_CODE_OAUTH_TOKEN
-      - CLAUDE_CODE_OAUTH_REFRESH_TOKEN
-      - NOTIFY_CHANNELS
-      - REVIEW_APPROVE_MAX_SEVERITY
-      - MERGE_STRATEGY
-      - MAX_DIFF_LINES
-      - SKIP_REPOS
-      - SKIP_AUTHORS
-      - CLAUDE_MODEL
-      - CLAUDE_EFFORT
-      - CI_WAIT_TIMEOUT
-      - RAVEN_LABEL_NAME
-      - BITBUCKET_DC_URL
-      - BITBUCKET_DC_TOKEN
-      - BITBUCKET_DC_WEBHOOK_SECRET
-      - BITBUCKET_DC_USERNAME
+      # ── Gitea (required if using Gitea; no defaults — empty means unset)
+      - GITEA_WEBHOOK_SECRET=${GITEA_WEBHOOK_SECRET:-}
+      - GITEA_URL=${GITEA_URL:-}
+      - GITEA_TOKEN=${GITEA_TOKEN:-}
+      - RAVEN_WEBHOOK_SECRET=${RAVEN_WEBHOOK_SECRET:-}
+      # ── Bitbucket Data Center (required if using BB DC; no defaults)
+      - BITBUCKET_DC_URL=${BITBUCKET_DC_URL:-}
+      - BITBUCKET_DC_TOKEN=${BITBUCKET_DC_TOKEN:-}
+      - BITBUCKET_DC_WEBHOOK_SECRET=${BITBUCKET_DC_WEBHOOK_SECRET:-}
+      - BITBUCKET_DC_USERNAME=${BITBUCKET_DC_USERNAME:-}
+      # ── Claude Code OAuth (CLAUDE_CODE_OAUTH_TOKEN is required; refresh is optional)
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      - CLAUDE_CODE_OAUTH_REFRESH_TOKEN=${CLAUDE_CODE_OAUTH_REFRESH_TOKEN:-}
+      # ── Notifications (optional — empty means no channels)
+      - NOTIFY_CHANNELS=${NOTIFY_CHANNELS:-}
+      # ── Review behaviour (defaults must match raven/server.py + raven/reviewer.py)
+      - REVIEW_APPROVE_MAX_SEVERITY=${REVIEW_APPROVE_MAX_SEVERITY:-low}
+      - MERGE_STRATEGY=${MERGE_STRATEGY:-squash}
+      - MAX_DIFF_LINES=${MAX_DIFF_LINES:-3000}
+      - CI_WAIT_TIMEOUT=${CI_WAIT_TIMEOUT:-300}
+      # Filters: empty means no filter — don't add a fake default.
+      - SKIP_REPOS=${SKIP_REPOS:-}
+      - SKIP_AUTHORS=${SKIP_AUTHORS:-}
+      # Toggles: empty = off. server.py parses (".lower() in 1|true|yes").
+      - RAVEN_GITEA_AUTO_MERGE=${RAVEN_GITEA_AUTO_MERGE:-}
+      - RAVEN_AUTO_MERGE_ON_APPROVAL=${RAVEN_AUTO_MERGE_ON_APPROVAL:-}
+      # ── Claude CLI (defaults must match raven/reviewer.py)
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-opus-4-6}
+      - CLAUDE_EFFORT=${CLAUDE_EFFORT:-max}
+      - CLAUDE_EFFORT_COMMENT=${CLAUDE_EFFORT_COMMENT:-medium}
+      - CLAUDE_TIMEOUT=${CLAUDE_TIMEOUT:-600}
+      # ── Comment replies (default must match raven/server.py)
+      - RAVEN_COMMENT_HISTORY=${RAVEN_COMMENT_HISTORY:-20}
+      # ── Raven internals (defaults must match raven/server.py + raven/providers/gitea.py)
+      - RAVEN_LABEL_NAME=${RAVEN_LABEL_NAME:-raven-reviewed}
+      - RAVEN_MAX_WORKERS=${RAVEN_MAX_WORKERS:-16}
+      - RAVEN_MAX_CONCURRENT_CLAUDE=${RAVEN_MAX_CONCURRENT_CLAUDE:-4}
+      - RAVEN_MAX_CACHED_PRS=${RAVEN_MAX_CACHED_PRS:-200}
+      # Cache dir must live on the named volume — override any .env value.
       - RAVEN_CACHE_DIR=/data/raven
     volumes:
       - ./logs:/app/logs

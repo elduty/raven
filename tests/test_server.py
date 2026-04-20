@@ -510,6 +510,52 @@ class TestProcessPr:
         mc.submit_review.assert_called_once()
         mc.merge_pr.assert_called_once()
 
+    def test_concurrent_process_pr_same_pr_skipped(self):
+        """If one thread is already reviewing a PR and a second _process_pr
+        fires for the same PR, the second exits without fetching a diff or
+        calling review_diff — prevents cache races and duplicate reviews."""
+        import raven.server as _srv
+        _srv._in_progress_prs.add("gitea:owner/repo#42")
+        mc = self._make_provider()
+        try:
+            _process_pr(mc, self._normalized_payload())
+        finally:
+            _srv._in_progress_prs.discard("gitea:owner/repo#42")
+        mc.add_self_as_reviewer.assert_not_called()
+        mc.fetch_pr_diff.assert_not_called()
+        mc.submit_review.assert_not_called()
+
+    def test_in_progress_guard_cleared_after_normal_flow(self):
+        """Normal completion clears the in-progress key so a later push
+        to the same PR can trigger a fresh review."""
+        import raven.server as _srv
+        mc = self._make_provider()
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.get_commit_status.return_value = "success"
+            mc.merge_pr.return_value = True
+            self._setup_raven_only(mc)
+            mock_review.return_value = {"severity": "low", "summary": "OK", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+        assert "gitea:owner/repo#42" not in _srv._in_progress_prs
+
+    def test_in_progress_guard_cleared_after_exception(self):
+        """Even when processing raises, the in-progress key is released so
+        retries aren't blocked forever by a crashed worker."""
+        import raven.server as _srv
+        mc = self._make_provider()
+        mc.add_self_as_reviewer.return_value = None
+        mc.fetch_pr_diff.side_effect = RuntimeError("network")
+        _process_pr(mc, self._normalized_payload())
+        assert "gitea:owner/repo#42" not in _srv._in_progress_prs
+
 
 class TestWaitForCi:
     def test_initial_delay_before_first_check(self):

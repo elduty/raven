@@ -33,6 +33,17 @@ _recent_prs: dict[str, float] = {}
 _recent_prs_lock = threading.Lock()
 DEDUP_WINDOW = 30  # seconds
 
+# ── In-progress guard ─────────────────────────────────────────────── #
+# Dedup's 30s window is shorter than a full review (diff fetch +
+# Claude CLI + CI wait up to CI_WAIT_TIMEOUT). If a second webhook
+# arrives after dedup expires while the original review is still
+# running, both threads race on the findings cache, the submit_review
+# API, and the merge decision. _in_progress_prs tracks keys currently
+# being processed by _process_pr; a second concurrent review on the
+# same PR exits immediately.
+_in_progress_prs: set[str] = set()
+_in_progress_lock = threading.Lock()
+
 # ── Comment response history window ──────────────────────────────── #
 COMMENT_HISTORY = int(os.environ.get("RAVEN_COMMENT_HISTORY", "20"))
 
@@ -331,12 +342,26 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
     """Review a PR in a background thread. All exceptions caught here."""
     repo_full_name = None
     pr_number = None
+    pr_key = None
     try:
         repo_full_name = payload["repo"]
         pr_number = payload["pr_number"]
         pr_title = payload.get("pr_title") or f"PR #{pr_number}"
         pr_url = payload.get("pr_url", "")
         head_sha = payload.get("head_sha") or "HEAD"
+
+        # Skip if another thread is already processing this PR. Guards
+        # against the dedup window (30s) being shorter than the review
+        # duration — a race that would otherwise cause two concurrent
+        # reviews to fight over the findings cache and merge decision.
+        pr_key = f"{provider.name}:{repo_full_name}#{pr_number}"
+        with _in_progress_lock:
+            if pr_key in _in_progress_prs:
+                logger.info("PR %s already being reviewed — skipping concurrent run", pr_key)
+                inc("raven_reviews_skipped_total", {"reason": "in_progress", "repo": repo_full_name})
+                pr_key = None  # don't clear the entry in finally
+                return
+            _in_progress_prs.add(pr_key)
 
         # Make the pending review visible immediately by adding Raven as a reviewer
         # before fetching the diff. Best-effort — failures do not block the review.
@@ -524,6 +549,12 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                     "🦅 **Raven Review**\n\n⚠️ Internal error — review could not be completed.")
             except Exception:
                 pass
+    finally:
+        # Release the in-progress lock for this PR. The sentinel (pr_key
+        # set back to None) means we never acquired it — skip the clear.
+        if pr_key is not None:
+            with _in_progress_lock:
+                _in_progress_prs.discard(pr_key)
 
 
 # ------------------------------------------------------------------ #
