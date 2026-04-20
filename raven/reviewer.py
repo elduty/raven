@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 CLAUDE_BIN = "/usr/bin/claude"
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-6")
 CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "max")
+# Conversational replies don't need max thinking — default to medium for
+# cheaper/faster responses. Override with CLAUDE_EFFORT_COMMENT.
+CLAUDE_EFFORT_COMMENT = os.environ.get("CLAUDE_EFFORT_COMMENT", "medium")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
 MAX_CONCURRENT_CLAUDE = max(int(os.environ.get("RAVEN_MAX_CONCURRENT_CLAUDE", "4")), 1)
 _claude_semaphore = threading.Semaphore(MAX_CONCURRENT_CLAUDE)
@@ -399,7 +402,8 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
     )
 
     env = os.environ.copy()
-    logger.info("Generating response for %s (model=%s)", repo_name, CLAUDE_MODEL)
+    logger.info("Generating response for %s (model=%s effort=%s)",
+                repo_name, CLAUDE_MODEL, CLAUDE_EFFORT_COMMENT)
 
     with _claude_semaphore:
         try:
@@ -407,7 +411,7 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
                 [
                     CLAUDE_BIN, "-p",
                     "--model", CLAUDE_MODEL,
-                    "--effort", CLAUDE_EFFORT,
+                    "--effort", CLAUDE_EFFORT_COMMENT,
                     "--output-format", "text",
                 ],
                 input=prompt,

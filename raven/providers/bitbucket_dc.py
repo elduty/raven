@@ -17,6 +17,7 @@ class BitbucketDCProvider(GitProvider):
     """Bitbucket Data Center API client implementing the GitProvider interface."""
 
     name = "bitbucket-dc"
+    supports_comment_threads = True
 
     def __init__(self, base_url: str, token: str, webhook_secret: str, username: str = ""):
         self.base_url = base_url.rstrip("/")
@@ -179,6 +180,39 @@ class BitbucketDCProvider(GitProvider):
     #  Comments                                                           #
     # ------------------------------------------------------------------ #
 
+    def get_comment_thread_authors(self, repo_full_name: str, pr_number: int,
+                                   comment_id: int) -> list[str]:
+        """Fetch the thread rooted at ``comment_id`` and return unique author
+        slugs (root plus any nested ``comments[]`` replies).
+
+        BB DC returns the root's replies inline in a single GET — the
+        conceptual thread is flat but the response nests child comments one
+        level. Walk recursively just in case a server returns deeper nesting.
+        Returns [] on 404 so the caller can treat missing comments as an
+        unknown thread.
+        """
+        project, repo = _split_repo(repo_full_name)
+        url = (
+            f"{self.api_url}/projects/{project}/repos/{repo}"
+            f"/pull-requests/{pr_number}/comments/{comment_id}"
+        )
+        resp = self.session.get(url, timeout=10)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        seen: list[str] = []
+
+        def _walk(node: dict) -> None:
+            slug = (node.get("author") or {}).get("slug", "")
+            if slug and slug not in seen:
+                seen.append(slug)
+            for child in node.get("comments") or []:
+                if isinstance(child, dict):
+                    _walk(child)
+
+        _walk(resp.json())
+        return seen
+
     def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
         """Return all comments on a PR via the activities endpoint."""
         project, repo = _split_repo(repo_full_name)
@@ -205,11 +239,20 @@ class BitbucketDCProvider(GitProvider):
             start = data.get("nextPageStart", start + 50)
         return all_comments
 
-    def post_pr_comment(self, repo_full_name: str, pr_number: int, body: str) -> dict:
-        """Post a comment on a PR."""
+    def post_pr_comment(self, repo_full_name: str, pr_number: int, body: str,
+                        parent_comment_id: int | None = None) -> dict:
+        """Post a comment on a PR.
+
+        If parent_comment_id is set, the comment is posted as a reply. BB DC
+        threads are flat — replying to any comment in a thread lands the new
+        comment in the same thread.
+        """
         project, repo = _split_repo(repo_full_name)
         url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/comments"
-        resp = self.session.post(url, json={"text": body}, timeout=15)
+        payload: dict = {"text": body}
+        if parent_comment_id:
+            payload["parent"] = {"id": parent_comment_id}
+        resp = self.session.post(url, json=payload, timeout=15)
         resp.raise_for_status()
         return resp.json()
 
@@ -620,6 +663,13 @@ class BitbucketDCProvider(GitProvider):
         file_path = anchor.get("path", "") if anchor else None
         line = anchor.get("line") if anchor else None
 
+        # Parent comment id — present when this comment is a reply in a thread.
+        # BB DC puts it at the payload root; some versions also nest a parent
+        # object inside the comment itself. Use ``(x or {})`` rather than a
+        # dict.get() default so an explicit ``"parent": null`` doesn't raise.
+        parent_comment_id = payload.get("commentParentId") \
+            or (comment.get("parent") or {}).get("id")
+
         return (event_type, {
             "repo": repo_full,
             "sender": sender,
@@ -632,6 +682,7 @@ class BitbucketDCProvider(GitProvider):
             "comment_body": comment.get("text", ""),
             "comment_user": comment.get("author", {}).get("slug", ""),
             "comment_id": comment.get("id"),
+            "parent_comment_id": parent_comment_id,
             "file_path": file_path,
             "line": line,
             "branch": None,

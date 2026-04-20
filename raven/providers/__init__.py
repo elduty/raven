@@ -7,6 +7,9 @@ class GitProvider(ABC):
     """Abstract interface for git platform operations."""
 
     name: str  # "gitea", "bitbucket-cloud", "bitbucket-dc"
+    # True if post_pr_comment with parent_comment_id actually threads the reply.
+    # False for flat-comment providers (e.g. Gitea issue comments).
+    supports_comment_threads: bool = False
 
     @abstractmethod
     def get_authenticated_user(self) -> str: ...
@@ -31,7 +34,37 @@ class GitProvider(ABC):
         ...
 
     @abstractmethod
-    def post_pr_comment(self, repo: str, pr_number: int, body: str) -> dict: ...
+    def get_comment_thread_authors(self, repo: str, pr_number: int,
+                                   comment_id: int) -> list[str]:
+        """Return the set of unique author logins/slugs in the comment's
+        thread — the comment at ``comment_id`` plus any replies below it.
+
+        Used to detect replies inside a Raven-involved thread so Raven can
+        answer without being re-@mentioned, even when Raven wasn't the thread
+        root. Providers without threaded comments return an empty list.
+        """
+        ...
+
+    @abstractmethod
+    def post_pr_comment(self, repo: str, pr_number: int, body: str,
+                        parent_comment_id: int | None = None) -> dict:
+        """Post a comment. If parent_comment_id is set and the provider supports
+        threading, the comment is posted as a reply (thread) — providers that
+        don't support threading ignore the parent and post a top-level comment.
+        """
+        ...
+
+    def react_to_comment(self, repo: str, pr_number: int, comment_id: int,
+                         content: str = "eyes") -> None:
+        """Best-effort emoji reaction on a comment.
+
+        Default is a no-op — platforms without a reactions API keep the base
+        class behaviour. Providers that do support reactions (Gitea) override
+        this to give immediate acknowledgment that Raven saw a comment before
+        the full response is generated. Must not raise on failure — this is
+        fire-and-forget UX, not correctness-critical.
+        """
+        return
 
     @abstractmethod
     def submit_review(self, repo: str, pr_number: int, body: str,

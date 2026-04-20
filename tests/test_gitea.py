@@ -129,6 +129,26 @@ class TestPostPrComment:
                 client.post_pr_comment("owner/repo", 1, "body")
 
 
+class TestReactToComment:
+    def test_posts_to_issue_comments_reactions(self, client):
+        with _mock_post(client, status=201) as mock_post:
+            client.react_to_comment("owner/repo", 3, 42, content="eyes")
+        url = mock_post.call_args[0][0]
+        assert "/issues/comments/42/reactions" in url
+        assert mock_post.call_args[1]["json"] == {"content": "eyes"}
+
+    def test_swallows_404(self, client):
+        """Diff/review comments have a different URL — 404 is expected and silent."""
+        mock_resp = MagicMock(status_code=404)
+        with patch.object(client.session, "post", return_value=mock_resp):
+            client.react_to_comment("owner/repo", 3, 42)  # no raise
+
+    def test_never_raises_on_network_error(self, client):
+        with patch.object(client.session, "post",
+                          side_effect=requests.ConnectionError("down")):
+            client.react_to_comment("owner/repo", 3, 42)  # no raise
+
+
 # ------------------------------------------------------------------ #
 #  PR review submission                                               #
 # ------------------------------------------------------------------ #

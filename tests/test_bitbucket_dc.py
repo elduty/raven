@@ -286,6 +286,44 @@ class TestParseWebhookComment:
         assert data["line"] == 42
         assert data["comment_body"] == "nit: rename this"
 
+    def test_threaded_reply_extracts_parent_comment_id(self, client):
+        """BB DC sends commentParentId at the payload root for thread replies."""
+        payload = _pr_payload()
+        payload["commentParentId"] = 259147
+        payload["comment"] = {
+            "id": 259148,
+            "text": "follow-up question",
+            "author": {"slug": "bob"},
+        }
+        req = _make_request(payload, "pr:comment:added")
+        _, data = client.parse_webhook(req)
+        assert data["parent_comment_id"] == 259147
+
+    def test_top_level_comment_has_no_parent(self, client):
+        payload = _pr_payload()
+        payload["comment"] = {
+            "id": 99,
+            "text": "top level",
+            "author": {"slug": "bob"},
+        }
+        req = _make_request(payload, "pr:comment:added")
+        _, data = client.parse_webhook(req)
+        assert data["parent_comment_id"] is None
+
+    def test_explicit_null_parent_does_not_crash(self, client):
+        """If BB DC sends "parent": null inside the comment object, parsing
+        must not raise AttributeError on (None).get("id")."""
+        payload = _pr_payload()
+        payload["comment"] = {
+            "id": 99,
+            "text": "top level",
+            "author": {"slug": "bob"},
+            "parent": None,
+        }
+        req = _make_request(payload, "pr:comment:added")
+        _, data = client.parse_webhook(req)
+        assert data["parent_comment_id"] is None
+
 
 # ------------------------------------------------------------------ #
 #  parse_webhook — unknown event                                      #
@@ -556,7 +594,56 @@ class TestPostPrComment:
         payload = mock_post.call_args[1]["json"]
         assert payload["text"] == "hello"
         assert "body" not in payload
+        assert "parent" not in payload
         assert result["id"] == 55
+
+    def test_parent_comment_id_creates_thread_reply(self, client):
+        with _mock_post(client, json_data={"id": 56}) as mock_post:
+            client.post_pr_comment("PROJ/repo", 3, "reply", parent_comment_id=42)
+        payload = mock_post.call_args[1]["json"]
+        assert payload["text"] == "reply"
+        assert payload["parent"] == {"id": 42}
+
+
+class TestGetCommentThreadAuthors:
+    def test_root_only(self, client):
+        with _mock_get(client,
+                       json_data={"id": 42, "author": {"slug": "alice"}}) as mock_get:
+            authors = client.get_comment_thread_authors("PROJ/repo", 3, 42)
+        assert authors == ["alice"]
+        url = mock_get.call_args[0][0]
+        assert url.endswith("/pull-requests/3/comments/42")
+
+    def test_includes_child_replies(self, client):
+        """Thread walk must pick up authors nested under comments[]."""
+        with _mock_get(client, json_data={
+            "id": 42,
+            "author": {"slug": "alice"},
+            "comments": [
+                {"id": 43, "author": {"slug": "raven-bot"}},
+                {"id": 44, "author": {"slug": "bob"}},
+            ],
+        }):
+            authors = client.get_comment_thread_authors("PROJ/repo", 3, 42)
+        assert set(authors) == {"alice", "raven-bot", "bob"}
+
+    def test_returns_empty_on_404(self, client):
+        mock_resp = MagicMock(status_code=404)
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "get", return_value=mock_resp):
+            assert client.get_comment_thread_authors("PROJ/repo", 3, 999) == []
+
+    def test_handles_nested_replies_defensively(self, client):
+        """Some BB DC versions may nest comments beyond one level."""
+        with _mock_get(client, json_data={
+            "id": 1, "author": {"slug": "a"},
+            "comments": [
+                {"id": 2, "author": {"slug": "b"},
+                 "comments": [{"id": 3, "author": {"slug": "c"}}]},
+            ],
+        }):
+            authors = client.get_comment_thread_authors("PROJ/repo", 3, 1)
+        assert set(authors) == {"a", "b", "c"}
 
 
 # ------------------------------------------------------------------ #

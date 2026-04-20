@@ -97,6 +97,15 @@ class GiteaProvider(GitProvider):
     #  Comment posting                                                     #
     # ------------------------------------------------------------------ #
 
+    def get_comment_thread_authors(self, repo_full_name: str, pr_number: int,
+                                   comment_id: int) -> list[str]:
+        """Gitea issue comments are flat — always returns [].
+
+        Without threads there is no meaningful "reply in Raven's thread" flow
+        to enable, so the auto-respond-without-mention feature is skipped.
+        """
+        return []
+
     def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
         """Return all comments on a PR (paginated)."""
         owner, repo = _split_repo(repo_full_name)
@@ -112,13 +121,39 @@ class GiteaProvider(GitProvider):
             all_comments.extend(batch)
         return all_comments
 
-    def post_pr_comment(self, repo_full_name: str, pr_number: int, body: str) -> dict:
-        """Post a comment on a PR."""
+    def post_pr_comment(self, repo_full_name: str, pr_number: int, body: str,
+                        parent_comment_id: int | None = None) -> dict:
+        """Post a comment on a PR.
+
+        Gitea issue comments are flat — ``parent_comment_id`` is accepted for
+        interface compatibility but ignored.
+        """
         owner, repo = _split_repo(repo_full_name)
         url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/issues/{pr_number}/comments"
         resp = self.session.post(url, json={"body": body}, timeout=15)
         resp.raise_for_status()
         return resp.json()
+
+    def react_to_comment(self, repo_full_name: str, pr_number: int,
+                         comment_id: int, content: str = "eyes") -> None:
+        """Post an emoji reaction on a PR issue comment.
+
+        Only the issue-comments reactions endpoint is used; diff/review
+        comments live under a different URL and return 404 here, which is
+        swallowed. Never raises — this is fire-and-forget UX.
+        """
+        owner, repo = _split_repo(repo_full_name)
+        url = (
+            f"{self.base_url}/api/v1/repos/{owner}/{repo}"
+            f"/issues/comments/{comment_id}/reactions"
+        )
+        try:
+            resp = self.session.post(url, json={"content": content}, timeout=5)
+            if resp.status_code not in (200, 201, 404):
+                logger.debug("Reaction on comment %s returned %s",
+                             comment_id, resp.status_code)
+        except Exception as e:
+            logger.debug("Reaction on comment %s failed: %s", comment_id, e)
 
     def submit_review(self, repo_full_name: str, pr_number: int, body: str,
                       approve: bool, inline_comments: list[dict] | None = None,

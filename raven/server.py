@@ -33,24 +33,8 @@ _recent_prs: dict[str, float] = {}
 _recent_prs_lock = threading.Lock()
 DEDUP_WINDOW = 30  # seconds
 
-# ── Comment response cooldown per PR ─────────────────────────────── #
-_comment_cooldowns: dict[str, float] = {}
-_comment_cooldowns_lock = threading.Lock()
-COMMENT_COOLDOWN = 30  # seconds between responses on the same PR
-
-def _check_comment_cooldown(repo: str, pr_number: int) -> bool:
-    """Return True if a comment response is on cooldown for this PR."""
-    key = f"{repo}#comment#{pr_number}"
-    now = time.time()
-    with _comment_cooldowns_lock:
-        if key in _comment_cooldowns and now - _comment_cooldowns[key] < COMMENT_COOLDOWN:
-            return True
-        _comment_cooldowns[key] = now
-        # Prune stale entries
-        stale = [k for k, t in _comment_cooldowns.items() if now - t > COMMENT_COOLDOWN * 2]
-        for k in stale:
-            del _comment_cooldowns[k]
-    return False
+# ── Comment response history window ──────────────────────────────── #
+COMMENT_HISTORY = int(os.environ.get("RAVEN_COMMENT_HISTORY", "20"))
 
 # ── Previous diff cache for incremental reviews ──────────────────── #
 _previous_diffs: dict[str, tuple[float, dict[str, str], dict[str, list[dict]]]] = {}
@@ -314,14 +298,32 @@ def create_app() -> Flask:
                     re.IGNORECASE,
                 )
             )
-            if not is_mention:
+            # Reply-in-Raven-thread check: if no @mention but Raven has
+            # posted anywhere in the thread rooted at parent_comment_id,
+            # treat the new comment as directed at Raven so the conversation
+            # continues naturally. Walks the full thread so replies to
+            # Raven's replies work, not only replies to Raven's top-level
+            # comments (BB DC flattens parent_comment_id to the thread root).
+            is_reply_to_raven = False
+            parent_comment_id = payload.get("parent_comment_id")
+            if not is_mention and raven_user and parent_comment_id and pr_number:
+                try:
+                    thread_authors = provider.get_comment_thread_authors(
+                        repo, pr_number, parent_comment_id,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to look up thread rooted at %s: %s",
+                                   parent_comment_id, e)
+                    thread_authors = []
+                raven_lower = raven_user.lower()
+                if any(a and a.lower() == raven_lower for a in thread_authors):
+                    is_reply_to_raven = True
+            if not is_mention and not is_reply_to_raven:
                 return jsonify({"status": "ignored", "reason": "not directed at Raven"})
             if not pr_number:
                 return jsonify({"status": "skipped", "reason": "missing PR number"})
             if comment_id and _should_skip_duplicate(f"{provider.name}:{repo}", f"comment-{comment_id}"):
                 return jsonify({"status": "skipped", "reason": "duplicate"})
-            if _check_comment_cooldown(repo, pr_number):
-                return jsonify({"status": "skipped", "reason": "comment cooldown"})
             executor.submit(_process_comment, provider, payload)
             return jsonify({"status": "accepted", "reason": "responding to comment"})
 
@@ -541,27 +543,37 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
 
 def _process_comment(provider: GitProvider, payload: dict) -> None:
     """Respond to a comment directed at Raven in a background thread."""
+    repo_full_name = payload["repo"]
+    pr_number = payload.get("pr_number")
+    comment_id = payload.get("comment_id")
     try:
-        repo_full_name = payload["repo"]
-        pr_number = payload.get("pr_number")
         comment_body = payload.get("comment_body", "")
         file_path = payload.get("file_path", "") or ""
         line = payload.get("line") or 0
 
-        # Fetch context (truncate diff to avoid token bloat on large PRs)
+        # Immediate 👀 ack so the user knows Raven saw the comment, long
+        # before the Claude response lands. Best-effort — providers without
+        # a reactions API (BB DC) no-op; swallow failures.
+        if comment_id:
+            try:
+                provider.react_to_comment(repo_full_name, pr_number, comment_id)
+            except Exception as e:
+                logger.debug("react_to_comment failed: %s", e)
+
+        # Fetch context (truncate diff to avoid token bloat on large PRs).
+        # For diff comments on a specific file, bias the truncation so that
+        # file's hunk is kept even when the rest of the diff doesn't fit.
         raw_diff = provider.fetch_pr_diff(repo_full_name, pr_number)
         diff = _strip_lockfiles_and_binaries(raw_diff)
-        diff_lines = diff.splitlines(keepends=True)
-        if len(diff_lines) > MAX_DIFF_LINES:
-            diff = "".join(diff_lines[:MAX_DIFF_LINES]) + f"\n... (truncated, {len(diff_lines) - MAX_DIFF_LINES} lines omitted)"
+        diff = _truncate_diff_for_comment(diff, file_path)
         claude_md = ""
         try:
             claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref="HEAD")
         except Exception:
             pass
 
-        # Fetch conversation (keep last 20 to avoid prompt bloat)
-        conversation = provider.get_pr_comments(repo_full_name, pr_number)[-20:]
+        # Fetch conversation (keep last N to avoid prompt bloat)
+        conversation = provider.get_pr_comments(repo_full_name, pr_number)[-COMMENT_HISTORY:]
 
         # Generate response
         response = respond_to_comment(
@@ -572,20 +584,42 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # Post response (skip if Claude returned nothing)
         if not response:
             logger.warning("Empty response from Claude for comment on PR #%d — not posting", pr_number)
+            provider.post_pr_comment(
+                repo_full_name, pr_number,
+                "\U0001f985 \u26a0\ufe0f Couldn't generate a response — please try rephrasing.",
+                parent_comment_id=comment_id,
+            )
             return
-        if file_path:
+        # When the reply is threaded by the provider, the UI already shows
+        # the file/line context of the thread — skip the redundant Re:
+        # header. Keep it for flat-comment providers (Gitea).
+        threaded = bool(comment_id) and getattr(provider, "supports_comment_threads", False)
+        include_location = file_path and not threaded
+        if include_location:
             location = f"`{file_path}`"
             if line:
                 location += f" line {line}"
             body = f"\U0001f985 **Re: {location}**\n\n{response}"
         else:
             body = f"\U0001f985 {response}"
-        provider.post_pr_comment(repo_full_name, pr_number, body)
+        provider.post_pr_comment(repo_full_name, pr_number, body,
+                                 parent_comment_id=comment_id)
         inc("raven_responses_total", {"repo": repo_full_name})
         logger.info("Responded to comment on PR #%d in %s", pr_number, repo_full_name)
 
     except Exception as e:
         logger.error("Failed to respond to comment: %s", e, exc_info=True)
+        inc("raven_errors_total", {"type": "comment_response_failed",
+                                   "repo": repo_full_name or "unknown"})
+        if repo_full_name and pr_number:
+            try:
+                provider.post_pr_comment(
+                    repo_full_name, pr_number,
+                    "\U0001f985 \u26a0\ufe0f Couldn't respond — internal error while processing your comment.",
+                    parent_comment_id=comment_id,
+                )
+            except Exception:
+                pass
 
 
 # ------------------------------------------------------------------ #
@@ -766,6 +800,90 @@ def _findings_by_file(findings: list[dict], filenames: set[str]) -> dict[str, li
         else:
             by_file[""].append(finding)
     return by_file
+
+
+def _head_truncate(diff: str) -> str:
+    """Plain head-truncation fallback used when no relevance bias applies."""
+    total = diff.count("\n")
+    if total <= MAX_DIFF_LINES:
+        return diff
+    lines = diff.splitlines(keepends=True)
+    # Consume lines until we've included MAX_DIFF_LINES newlines.
+    out_lines: list[str] = []
+    seen = 0
+    for ln in lines:
+        if seen >= MAX_DIFF_LINES:
+            break
+        out_lines.append(ln)
+        seen += ln.count("\n")
+    return "".join(out_lines) + f"\n... (truncated, {total - seen} lines omitted)"
+
+
+def _truncate_diff_for_comment(diff: str, file_path: str = "") -> str:
+    """Truncate a diff to MAX_DIFF_LINES, keeping the relevant file first.
+
+    For diff comments that name a file, split the diff per file, place that
+    file's hunk first, then append other files in order until the limit is
+    reached. If the relevant file's own chunk exceeds the budget, head-
+    truncate that chunk so the file is still visible (better than dropping
+    it entirely, which would defeat the purpose).
+
+    Without a file_path — or when the named file isn't in the diff — falls
+    back to plain head-truncation.
+    """
+    if diff.count("\n") <= MAX_DIFF_LINES:
+        return diff
+
+    if not file_path:
+        return _head_truncate(diff)
+
+    file_chunks = split_diff_by_file(diff)
+    relevant = [(fn, ch) for fn, ch in file_chunks if fn == file_path]
+    others = [(fn, ch) for fn, ch in file_chunks if fn != file_path]
+
+    if not relevant:
+        # Likely a path-normalisation mismatch between webhook and diff
+        # header — log at debug so ops can spot it if it becomes common.
+        logger.debug(
+            "Comment file_path %r not found among diff files %r — "
+            "falling back to head-truncation",
+            file_path, [fn for fn, _ in file_chunks],
+        )
+        return _head_truncate(diff)
+
+    relevant_fn, relevant_chunk = relevant[0]
+    relevant_lines = relevant_chunk.count("\n")
+    output_parts: list[str] = []
+    budget = MAX_DIFF_LINES
+    skipped_files = 0
+    total_files = len(file_chunks)
+
+    if relevant_lines > budget:
+        # Target chunk alone exceeds the budget — head-truncate it so the
+        # file is still visible, even if the exact commented-on line ends
+        # up beyond the cut.
+        trunc = _head_truncate(relevant_chunk)
+        output_parts.append(trunc)
+        # The rest of the files don't fit — everything else is skipped.
+        skipped_files = total_files - 1
+    else:
+        output_parts.append(relevant_chunk)
+        budget -= relevant_lines
+        for _fn, chunk in others:
+            chunk_lines = chunk.count("\n")
+            if chunk_lines <= budget:
+                output_parts.append(chunk)
+                budget -= chunk_lines
+            else:
+                skipped_files += 1
+
+    out = "".join(output_parts)
+    if skipped_files:
+        out += (
+            f"\n... (truncated, {skipped_files} of {total_files} file(s) "
+            f"omitted to keep `{file_path}` in context)"
+        )
+    return out
 
 
 MAX_FILE_LINES = 500  # Skip files larger than this (generated/minified)
