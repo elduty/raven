@@ -121,16 +121,20 @@ class GiteaProvider(GitProvider):
         return resp.json()
 
     def submit_review(self, repo_full_name: str, pr_number: int, body: str,
-                      approve: bool, inline_comments: list[dict] | None = None) -> dict:
+                      approve: bool, inline_comments: list[dict] | None = None,
+                      commit_id: str = "") -> dict:
         """Submit a formal PR review with optional inline comments.
 
         approve: True -> APPROVED, False -> REQUEST_CHANGES.
         inline_comments: normalized [{"file": "...", "line": N, "body": "..."}] dicts.
+        commit_id: pin review to a specific commit SHA (prevents stale reviews on force-push).
         """
         owner, repo = _split_repo(repo_full_name)
         url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
         event = "APPROVED" if approve else "REQUEST_CHANGES"
-        payload = {"body": body, "event": event}
+        payload: dict = {"body": body, "event": event}
+        if commit_id:
+            payload["commit_id"] = commit_id
         if inline_comments:
             payload["comments"] = self._normalize_inline_comments(inline_comments)
         resp = self.session.post(url, json=payload, timeout=15)
@@ -208,19 +212,36 @@ class GiteaProvider(GitProvider):
         users = data.get("users", []) if isinstance(data, dict) else data
         return [u.get("login", "") for u in users if isinstance(u, dict)]
 
+    def add_self_as_reviewer(self, repo_full_name: str, pr_number: int) -> None:
+        """Request the authenticated bot user as a reviewer. Idempotent."""
+        owner, repo = _split_repo(repo_full_name)
+        username = self.get_authenticated_user()
+        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/requested_reviewers"
+        resp = self.session.post(url, json={"reviewers": [username]}, timeout=10)
+        # 201 = created, 200 = already requested (Gitea treats as no-op)
+        if resp.status_code not in (200, 201):
+            resp.raise_for_status()
+
     # ------------------------------------------------------------------ #
     #  PR operations                                                       #
     # ------------------------------------------------------------------ #
 
-    def merge_pr(self, repo_full_name: str, pr_number: int, commit_title: str = "", strategy: str = "squash") -> bool:
-        """Merge a PR. Strategy: 'squash', 'merge', or 'rebase'. Returns True on success."""
+    def merge_pr(self, repo_full_name: str, pr_number: int, commit_title: str = "",
+                 strategy: str = "squash", head_sha: str = "",
+                 merge_when_checks_succeed: bool = False) -> bool:
+        """Merge a PR. Strategy: 'squash', 'merge', 'rebase', 'fast-forward-only'. Returns True on success."""
         owner, repo = _split_repo(repo_full_name)
         url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/merge"
-        resp = self.session.post(url, json={
+        payload: dict = {
             "Do": strategy,
-            "merge_message_field": commit_title or f"Merge PR #{pr_number}",
+            "merge_title_field": commit_title or f"Merge PR #{pr_number}",
             "delete_branch_after_merge": True,
-        }, timeout=15)
+        }
+        if head_sha:
+            payload["head_commit_id"] = head_sha
+        if merge_when_checks_succeed:
+            payload["merge_when_checks_succeed"] = True
+        resp = self.session.post(url, json=payload, timeout=15)
         if resp.status_code in (200, 204):
             logger.info("PR #%d merged (%s) in %s", pr_number, strategy, repo_full_name)
             return True
@@ -298,7 +319,8 @@ class GiteaProvider(GitProvider):
         """Parse Gitea webhook into normalized (event_type, payload) or None if ignored.
 
         Event types: "push", "pr_opened", "pr_updated", "pr_reopened",
-                     "review_requested", "comment", "diff_comment"
+                     "review_requested", "review_approved", "review_rejected",
+                     "comment", "diff_comment"
         """
         payload = request.get_json(force=True, silent=True) or {}
         event = request.headers.get("X-Gitea-Event", "")
@@ -307,10 +329,12 @@ class GiteaProvider(GitProvider):
             return self._parse_push(payload)
         elif event == "pull_request_review_request":
             return self._parse_review_request(payload)
-        elif event == "pull_request":
-            return self._parse_pull_request(payload)
+        elif event in ("pull_request", "pull_request_sync"):
+            return self._parse_pull_request(payload, is_sync=(event == "pull_request_sync"))
         elif event in ("issue_comment", "pull_request_comment"):
             return self._parse_comment(payload, event)
+        elif event in ("pull_request_review_approved", "pull_request_review_rejected"):
+            return self._parse_review_event(payload, event)
         else:
             return None
 
@@ -372,23 +396,25 @@ class GiteaProvider(GitProvider):
             "line": None,
         })
 
-    def _parse_pull_request(self, payload: dict) -> tuple[str, dict] | None:
-        """Parse pull_request event into normalized payload."""
+    def _parse_pull_request(self, payload: dict, is_sync: bool = False) -> tuple[str, dict] | None:
+        """Parse pull_request or pull_request_sync event into normalized payload."""
         action = payload.get("action", "")
         pr = payload.get("pull_request", {})
         repo = payload.get("repository", {}).get("full_name", "")
         sender = payload.get("sender", {}).get("login", "")
 
-        action_map = {
-            "opened": "pr_opened",
-            "synchronize": "pr_updated",
-            "reopened": "pr_reopened",
-            "review_requested": "review_requested",
-        }
-
-        event_type = action_map.get(action)
-        if event_type is None:
-            return None
+        if is_sync:
+            event_type = "pr_updated"
+        else:
+            action_map = {
+                "opened": "pr_opened",
+                "synchronize": "pr_updated",
+                "reopened": "pr_reopened",
+                "review_requested": "review_requested",
+            }
+            event_type = action_map.get(action)
+            if event_type is None:
+                return None
 
         normalized = {
             "repo": repo,
@@ -455,6 +481,32 @@ class GiteaProvider(GitProvider):
             "line": line,
             "branch": None,
             "default_branch": None,
+        })
+
+    def _parse_review_event(self, payload: dict, gitea_event: str) -> tuple[str, dict] | None:
+        """Parse pull_request_review_approved / pull_request_review_rejected events."""
+        pr = payload.get("pull_request", {})
+        repo = payload.get("repository", {}).get("full_name", "")
+        sender = payload.get("sender", {}).get("login", "")
+
+        event_type = "review_approved" if gitea_event == "pull_request_review_approved" else "review_rejected"
+
+        return (event_type, {
+            "repo": repo,
+            "sender": sender,
+            "pr_number": pr.get("number"),
+            "pr_title": pr.get("title", ""),
+            "pr_url": pr.get("html_url", ""),
+            "head_sha": pr.get("head", {}).get("sha", ""),
+            "head_ref": pr.get("head", {}).get("ref", ""),
+            "base_ref": pr.get("base", {}).get("ref", ""),
+            "branch": None,
+            "default_branch": None,
+            "comment_body": None,
+            "comment_user": None,
+            "comment_id": None,
+            "file_path": None,
+            "line": None,
         })
 
 

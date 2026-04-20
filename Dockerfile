@@ -2,15 +2,22 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install Node.js + claude CLI (baseline version; entrypoint updates to latest on start)
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git gnupg && \
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-    | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
-    > /etc/apt/sources.list.d/nodesource.list && \
-    apt-get update && apt-get install -y --no-install-recommends nodejs && \
-    npm install -g @anthropic-ai/claude-code && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install system deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Node.js from official binary
+ARG NODE_VERSION=22.22.2
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "amd64" ]; then ARCH="x64"; fi && \
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${ARCH}.tar.gz" \
+      -o /tmp/node.tar.gz && \
+    tar -xzf /tmp/node.tar.gz -C /usr --strip-components=1 && \
+    rm /tmp/node.tar.gz
+
+# Install Claude Code CLI (baseline; entrypoint updates to latest on start)
+RUN npm install -g @anthropic-ai/claude-code
 
 # Install Python deps
 COPY requirements.txt .

@@ -13,7 +13,7 @@ os.environ.setdefault("RAVEN_WEBHOOK_SECRET", "testsecret")
 os.environ.setdefault("GITEA_WEBHOOK_SECRET", "testsecret")
 
 import raven.server as _server_mod
-from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _wait_for_ci, _should_skip_duplicate, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
+from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _process_review_approved, _latest_review_per_user, _wait_for_ci, _should_skip_duplicate, _do_merge, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
 from raven.providers import GitProvider, _providers
 
 
@@ -340,7 +340,8 @@ class TestProcessPr:
             _process_pr(mc, self._normalized_payload())
         mc.merge_pr.assert_not_called()
 
-    def test_not_merged_when_head_sha_changed(self):
+    def test_merge_passes_head_sha_for_atomic_safety(self):
+        """head_commit_id is passed to merge_pr so Gitea rejects if SHA changed."""
         mc = self._make_provider()
         with (
             patch("raven.server.review_diff") as mock_review,
@@ -352,13 +353,12 @@ class TestProcessPr:
             mc.submit_review.return_value = {"id": 1}
             mc.add_label_to_pr.return_value = None
             mc.get_commit_status.return_value = "success"
-            mc.get_authenticated_user.return_value = "Raven"
-            mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
-            mc.get_pr_requested_reviewers.return_value = []
-            mc.get_pr_head_sha.return_value = "newsha456"  # Different from payload's abc123
+            mc.merge_pr.return_value = True
+            self._setup_raven_only(mc)
             mock_review.return_value = {"severity": "low", "summary": "Clean", "findings": []}
             _process_pr(mc, self._normalized_payload())
-        mc.merge_pr.assert_not_called()
+        mc.merge_pr.assert_called_once()
+        assert mc.merge_pr.call_args.kwargs.get("head_sha") == "abc123"
 
     def test_empty_diff_after_stripping_posts_comment_no_review(self):
         lockfile_only_diff = (
@@ -450,6 +450,50 @@ class TestProcessPr:
             mock_review.return_value = {"severity": "low", "summary": "OK", "findings": []}
             _process_pr(mc, self._normalized_payload())
         mc.add_label_to_pr.assert_called_once_with("owner/repo", 42)
+
+    def test_adds_self_as_reviewer_before_diff_fetch(self):
+        """Raven must be added as reviewer before the review work starts,
+        so the pending review is visible immediately in the PR list."""
+        mc = self._make_provider()
+        call_order = []
+        mc.add_self_as_reviewer.side_effect = lambda *a, **kw: call_order.append("add_self")
+        mc.fetch_pr_diff.side_effect = lambda *a, **kw: (call_order.append("fetch_diff") or "diff --git a/f\n+line\n")
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.get_commit_status.return_value = "success"
+            mc.merge_pr.return_value = True
+            self._setup_raven_only(mc)
+            mock_review.return_value = {"severity": "low", "summary": "OK", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+        mc.add_self_as_reviewer.assert_called_once_with("owner/repo", 42)
+        assert call_order.index("add_self") < call_order.index("fetch_diff")
+
+    def test_add_self_as_reviewer_failure_does_not_block_review(self):
+        """If add_self_as_reviewer fails, the review should still proceed."""
+        mc = self._make_provider()
+        mc.add_self_as_reviewer.side_effect = RuntimeError("API down")
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.get_commit_status.return_value = "success"
+            mc.merge_pr.return_value = True
+            self._setup_raven_only(mc)
+            mock_review.return_value = {"severity": "low", "summary": "OK", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+        mc.submit_review.assert_called_once()
+        mc.merge_pr.assert_called_once()
 
 
 class TestWaitForCi:
@@ -1524,3 +1568,231 @@ class TestBitbucketDCWebhookRouting:
             )
         assert resp.status_code == 200
         assert resp.get_json() == {"status": "accepted"}
+
+
+class TestReviewApprovedEvent:
+    """Test that human approval triggers auto-merge check when Raven already approved."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+        yield
+        _recent_prs.clear()
+
+    def test_review_approved_triggers_merge_check(self, client):
+        payload = {
+            "action": "reviewed",
+            "repository": {"full_name": "owner/repo"},
+            "pull_request": {
+                "number": 42,
+                "title": "My PR",
+                "html_url": "http://x",
+                "head": {"ref": "feature", "sha": "abc123"},
+                "base": {"ref": "main"},
+            },
+            "sender": {"login": "alice"},
+        }
+        provider = _providers["gitea"]
+        with patch.object(provider, "get_authenticated_user", return_value="Raven"), \
+             patch("raven.server.executor") as mock_executor:
+            resp = _post(client, payload, event="pull_request_review_approved")
+        assert resp.get_json()["status"] == "accepted"
+        mock_executor.submit.assert_called_once()
+
+    def test_review_rejected_ignored(self, client):
+        payload = {
+            "action": "reviewed",
+            "repository": {"full_name": "owner/repo"},
+            "pull_request": {
+                "number": 42,
+                "title": "My PR",
+                "html_url": "http://x",
+                "head": {"ref": "feature", "sha": "abc123"},
+                "base": {"ref": "main"},
+            },
+            "sender": {"login": "alice"},
+        }
+        resp = _post(client, payload, event="pull_request_review_rejected")
+        assert resp.get_json()["status"] == "ignored"
+
+    def test_process_review_approved_merges_when_raven_approved(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [
+            {"user": {"login": "Raven"}, "state": "APPROVED"},
+            {"user": {"login": "alice"}, "state": "APPROVED"},
+        ]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_head_sha.return_value = "abc123"
+        mc.get_commit_status.return_value = "success"
+        mc.merge_pr.return_value = True
+        with patch("raven.server._AUTO_MERGE_ON_APPROVAL", True), \
+             patch("raven.server.time.sleep"):
+            _process_review_approved(mc, {
+                "repo": "owner/repo",
+                "pr_number": 42,
+                "pr_title": "My PR",
+                "pr_url": "http://x",
+                "head_sha": "abc123",
+            })
+        mc.merge_pr.assert_called_once()
+
+    def test_process_review_approved_skips_when_raven_not_approved(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [
+            {"user": {"login": "alice"}, "state": "APPROVED"},
+        ]
+        with patch("raven.server._AUTO_MERGE_ON_APPROVAL", True):
+            _process_review_approved(mc, {
+                "repo": "owner/repo",
+                "pr_number": 42,
+                "pr_title": "My PR",
+                "pr_url": "http://x",
+            })
+        mc.merge_pr.assert_not_called()
+
+    def test_process_review_approved_skips_when_request_changes_outstanding(self):
+        """Don't merge if another reviewer has REQUEST_CHANGES."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [
+            {"user": {"login": "Raven"}, "state": "APPROVED"},
+            {"user": {"login": "alice"}, "state": "REQUEST_CHANGES"},
+            {"user": {"login": "bob"}, "state": "APPROVED"},
+        ]
+        with patch("raven.server._AUTO_MERGE_ON_APPROVAL", True):
+            _process_review_approved(mc, {
+                "repo": "owner/repo",
+                "pr_number": 42,
+                "pr_title": "My PR",
+                "pr_url": "http://x",
+            })
+        mc.merge_pr.assert_not_called()
+
+    def test_process_review_approved_skips_when_flag_disabled(self):
+        """No-op when RAVEN_AUTO_MERGE_ON_APPROVAL is not set."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        with patch("raven.server._AUTO_MERGE_ON_APPROVAL", False):
+            _process_review_approved(mc, {
+                "repo": "owner/repo",
+                "pr_number": 42,
+            })
+        mc.get_authenticated_user.assert_not_called()
+        mc.merge_pr.assert_not_called()
+
+    def test_process_review_approved_uses_latest_review_per_user(self):
+        """Raven approved then later rejected — should NOT merge."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [
+            {"user": {"login": "Raven"}, "state": "APPROVED"},       # old
+            {"user": {"login": "Raven"}, "state": "REQUEST_CHANGES"},  # latest
+            {"user": {"login": "alice"}, "state": "APPROVED"},
+        ]
+        with patch("raven.server._AUTO_MERGE_ON_APPROVAL", True):
+            _process_review_approved(mc, {
+                "repo": "owner/repo",
+                "pr_number": 42,
+                "pr_title": "My PR",
+                "pr_url": "http://x",
+            })
+        mc.merge_pr.assert_not_called()
+
+
+class TestLatestReviewPerUser:
+    def test_resolves_to_latest(self):
+        reviews = [
+            {"user": {"login": "alice"}, "state": "REQUEST_CHANGES"},
+            {"user": {"login": "alice"}, "state": "APPROVED"},
+            {"user": {"login": "bob"}, "state": "APPROVED"},
+        ]
+        assert _latest_review_per_user(reviews) == {"alice": "APPROVED", "bob": "APPROVED"}
+
+    def test_ignores_comment_state(self):
+        reviews = [
+            {"user": {"login": "alice"}, "state": "APPROVED"},
+            {"user": {"login": "alice"}, "state": "COMMENT"},
+        ]
+        # COMMENT doesn't overwrite APPROVED (only APPROVED/REQUEST_CHANGES tracked)
+        assert _latest_review_per_user(reviews) == {"alice": "APPROVED"}
+
+
+class TestDoMerge:
+    """Test _do_merge SHA re-check and head_sha pass-through."""
+
+    def setup_method(self):
+        _recent_prs.clear()
+
+    def test_sha_recheck_blocks_merge_when_changed(self):
+        """Provider-agnostic SHA re-check prevents merge after force-push during CI wait."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "bitbucket-dc"
+        mc.get_commit_status.return_value = "success"
+        mc.get_pr_head_sha.return_value = "newsha456"  # Changed during CI wait
+        review = {"severity": "low", "summary": "ok", "findings": []}
+        with patch("raven.server.time.sleep"):
+            _do_merge(mc, "owner/repo", 42, "My PR", "http://x", review, "abc123", "squash")
+        mc.merge_pr.assert_not_called()
+
+    def test_sha_recheck_fails_closed_on_api_error(self):
+        """If SHA re-check API call fails, skip merge (fail closed)."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "bitbucket-dc"
+        mc.get_commit_status.return_value = "success"
+        mc.get_pr_head_sha.side_effect = Exception("connection refused")
+        review = {"severity": "low", "summary": "ok", "findings": []}
+        with patch("raven.server.time.sleep"):
+            _do_merge(mc, "owner/repo", 42, "My PR", "http://x", review, "abc123", "squash")
+        mc.merge_pr.assert_not_called()
+
+    def test_sha_recheck_allows_merge_when_unchanged(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "bitbucket-dc"
+        mc.get_commit_status.return_value = "success"
+        mc.get_pr_head_sha.return_value = "abc123"  # Same as original
+        mc.merge_pr.return_value = True
+        review = {"severity": "low", "summary": "ok", "findings": []}
+        with patch("raven.server.time.sleep"):
+            _do_merge(mc, "owner/repo", 42, "My PR", "http://x", review, "abc123", "squash")
+        mc.merge_pr.assert_called_once()
+
+
+class TestGiteaAutoMerge:
+    """Test RAVEN_GITEA_AUTO_MERGE option."""
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def test_auto_merge_passes_merge_when_checks_succeed(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.merge_pr.return_value = True
+        review = {"severity": "low", "summary": "ok", "findings": []}
+        with patch("raven.server._GITEA_AUTO_MERGE", True):
+            _do_merge(mc, "owner/repo", 42, "My PR", "http://x", review, "abc123", "squash")
+        mc.merge_pr.assert_called_once_with(
+            "owner/repo", 42, commit_title="My PR", strategy="squash",
+            head_sha="abc123", merge_when_checks_succeed=True,
+        )
+
+    def test_non_gitea_provider_polls_ci(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "bitbucket-dc"
+        mc.get_commit_status.return_value = "success"
+        mc.get_pr_head_sha.return_value = "abc123"  # Must match for SHA re-check
+        mc.merge_pr.return_value = True
+        review = {"severity": "low", "summary": "ok", "findings": []}
+        with patch("raven.server._GITEA_AUTO_MERGE", True), \
+             patch("raven.server.time.sleep"):
+            _do_merge(mc, "owner/repo", 42, "My PR", "http://x", review, "abc123", "squash")
+        # BB DC should use regular merge (not merge_when_checks_succeed)
+        mc.merge_pr.assert_called_once()
+        assert mc.merge_pr.call_args.kwargs.get("merge_when_checks_succeed") is not True

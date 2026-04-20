@@ -147,6 +147,15 @@ class TestValidateSignature:
         with pytest.raises(Exception):
             client.validate_signature(req)
 
+    def test_diagnostics_ping_accepted_without_signature(self, client):
+        """BB DC's Test connection button sends diagnostics:ping with no signature.
+
+        Allow it through so operators can verify reachability from the BB DC UI.
+        """
+        req = MagicMock()
+        req.headers = {"X-Event-Key": "diagnostics:ping"}
+        client.validate_signature(req)  # no raise
+
 
 # ------------------------------------------------------------------ #
 #  parse_webhook — push                                               #
@@ -356,6 +365,39 @@ class TestDismissPreviousReviews:
             client.dismiss_previous_reviews("PROJ/repo", 5, "raven-bot")
         mock_put.assert_not_called()
         mock_get.assert_not_called()
+
+
+# ------------------------------------------------------------------ #
+#  add_self_as_reviewer                                               #
+# ------------------------------------------------------------------ #
+
+class TestAddSelfAsReviewer:
+    def test_posts_participant_with_reviewer_role(self, client):
+        with _mock_post(client, status=201) as mock_post:
+            client.add_self_as_reviewer("PROJ/repo", 5)
+        url = mock_post.call_args[0][0]
+        assert url.endswith("/projects/PROJ/repos/repo/pull-requests/5/participants")
+        assert mock_post.call_args[1]["json"] == {
+            "user": {"name": "raven-bot"},
+            "role": "REVIEWER",
+        }
+
+    def test_200_accepted(self, client):
+        with _mock_post(client, status=200):
+            client.add_self_as_reviewer("PROJ/repo", 5)  # no raise
+
+    def test_409_tolerated_as_idempotent_noop(self, client):
+        mock_resp = MagicMock(status_code=409)
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "post", return_value=mock_resp):
+            client.add_self_as_reviewer("PROJ/repo", 5)  # no raise
+
+    def test_http_error_raises(self, client):
+        mock_resp = MagicMock(status_code=500)
+        mock_resp.raise_for_status.side_effect = Exception("500")
+        with patch.object(client.session, "post", return_value=mock_resp):
+            with pytest.raises(Exception, match="500"):
+                client.add_self_as_reviewer("PROJ/repo", 5)
 
 
 # ------------------------------------------------------------------ #

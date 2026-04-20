@@ -211,11 +211,13 @@ class BitbucketDCProvider(GitProvider):
     # ------------------------------------------------------------------ #
 
     def submit_review(self, repo_full_name: str, pr_number: int, body: str,
-                      approve: bool, inline_comments: list[dict] | None = None) -> dict:
+                      approve: bool, inline_comments: list[dict] | None = None,
+                      commit_id: str = "") -> dict:
         """Submit a review: post comment + approve or set needs-work.
 
         approve=True  -> post comment + POST /approve
         approve=False -> post comment + PUT /participants/{user} with NEEDS_WORK
+        commit_id is accepted for ABC compatibility but not used by BB DC.
         """
         project, repo = _split_repo(repo_full_name)
 
@@ -327,13 +329,35 @@ class BitbucketDCProvider(GitProvider):
         reviewers = resp.json().get("reviewers", [])
         return [r.get("user", {}).get("slug", "") for r in reviewers if isinstance(r, dict)]
 
+    def add_self_as_reviewer(self, repo_full_name: str, pr_number: int) -> None:
+        """Add the authenticated bot user as a reviewer via POST /participants. Idempotent.
+
+        BB DC returns 409 Conflict if the user is already a participant — tolerated.
+        The bot can't be added as a reviewer on its own PRs; 409 covers that case too.
+        """
+        project, repo = _split_repo(repo_full_name)
+        username = self.get_authenticated_user()
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/participants"
+        resp = self.session.post(
+            url,
+            json={"user": {"name": username}, "role": "REVIEWER"},
+            timeout=10,
+        )
+        # 200/201 = added, 409 = already a participant (idempotent no-op)
+        if resp.status_code not in (200, 201, 409):
+            resp.raise_for_status()
+
     # ------------------------------------------------------------------ #
     #  PR operations                                                      #
     # ------------------------------------------------------------------ #
 
     def merge_pr(self, repo_full_name: str, pr_number: int,
-                 commit_title: str = "", strategy: str = "squash") -> bool:
-        """Merge a PR with deleteSourceBranch. Strategy is controlled by repo settings in BB DC."""
+                 commit_title: str = "", strategy: str = "squash",
+                 head_sha: str = "", merge_when_checks_succeed: bool = False) -> bool:
+        """Merge a PR with deleteSourceBranch. Strategy is controlled by repo settings in BB DC.
+
+        head_sha and merge_when_checks_succeed are accepted for ABC compatibility but not used.
+        """
         project, repo = _split_repo(repo_full_name)
         # Need PR version for merge
         pr_url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}"
@@ -436,7 +460,16 @@ class BitbucketDCProvider(GitProvider):
         """Validate HMAC-SHA256 signature from X-Hub-Signature header.
 
         Format: sha256=<hex>. Strip the sha256= prefix before comparing.
+
+        Exception: BB DC's "Test connection" button fires a ``diagnostics:ping``
+        event with no signature header even when a secret is configured. Allow
+        it through so operators can verify reachability from the BB DC UI; the
+        payload contains no event data and is subsequently ignored by
+        parse_webhook.
         """
+        if request.headers.get("X-Event-Key", "") == "diagnostics:ping":
+            return
+
         sig_header = request.headers.get("X-Hub-Signature", "")
         if not sig_header:
             logger.warning("Missing X-Hub-Signature header")

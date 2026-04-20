@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 CLAUDE_BIN = "/usr/bin/claude"
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-6")
 CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "max")
+CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
 MAX_CONCURRENT_CLAUDE = max(int(os.environ.get("RAVEN_MAX_CONCURRENT_CLAUDE", "4")), 1)
 _claude_semaphore = threading.Semaphore(MAX_CONCURRENT_CLAUDE)
 
@@ -287,11 +288,11 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
                 input=prompt,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=CLAUDE_TIMEOUT,
                 env=env,
             )
         except subprocess.TimeoutExpired:
-            raise RuntimeError("claude CLI timed out after 300s")
+            raise RuntimeError(f"claude CLI timed out after {CLAUDE_TIMEOUT}s")
         except FileNotFoundError:
             raise RuntimeError(f"claude CLI not found at {CLAUDE_BIN}")
 
@@ -412,11 +413,11 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
                 input=prompt,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=CLAUDE_TIMEOUT,
                 env=env,
             )
         except subprocess.TimeoutExpired:
-            raise RuntimeError("claude CLI timed out after 300s")
+            raise RuntimeError(f"claude CLI timed out after {CLAUDE_TIMEOUT}s")
         except FileNotFoundError:
             raise RuntimeError(f"claude CLI not found at {CLAUDE_BIN}")
 

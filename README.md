@@ -1,7 +1,7 @@
 # Raven
 
 [![Tests](https://github.com/elduty/raven/actions/workflows/test.yml/badge.svg)](https://github.com/elduty/raven/actions/workflows/test.yml)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 Automated AI code review for Gitea and Bitbucket Data Center. Every pull request is reviewed before merge. Multi-provider — a single Raven instance handles webhooks from multiple git platforms simultaneously.
 
@@ -27,7 +27,7 @@ push to branch
       -> decision:
           -> Raven is sole reviewer + approved + CI passes -> auto-merge
           -> Other reviewers present -> leave open
-          -> severity high/medium -> WhatsApp/Slack alert, PR stays open
+          -> severity high/medium -> Slack/webhook alert, PR stays open
 ```
 
 Reviews typically complete in 10-30 seconds. Diffs up to 3000 lines are reviewed as a single full-context pass; larger diffs are split by file and reviewed chunk-by-chunk. Repos with a `CLAUDE.md` get richer reviews — the file contents are passed as context to the model.
@@ -123,6 +123,7 @@ All configuration is via environment variables. See `config.example.env` for the
 | `SKIP_AUTHORS` | No | — | Comma-separated author names to skip. |
 | `CLAUDE_MODEL` | No | `claude-opus-4-6` | Model to use for reviews. |
 | `CLAUDE_EFFORT` | No | `max` | Thinking effort level (`low`, `medium`, `high`, `max`). |
+| `CLAUDE_TIMEOUT` | No | `600` | Timeout in seconds for each Claude CLI invocation. |
 | `RAVEN_LABEL_NAME` | No | `raven-reviewed` | Label name added to reviewed PRs. |
 | `RAVEN_CACHE_DIR` | No | `/tmp/raven` | Directory for persistent findings cache. Use a Docker volume in production. |
 | `RAVEN_MAX_CACHED_PRS` | No | `200` | Max PR entries in the findings cache (LRU eviction). |
@@ -197,7 +198,7 @@ prompts/
 ├── review.md           Review prompt template
 ├── respond.md          Conversational response prompt template
 ├── audit.md            Full technical audit prompt
-entrypoint.sh           Writes OAuth credentials + updates Claude CLI on container start
+entrypoint.sh           Writes OAuth credentials, updates Claude CLI on start + daily
 ```
 
 ### Request flow
@@ -248,6 +249,7 @@ entrypoint.sh           Writes OAuth credentials + updates Claude CLI on contain
 - `raven_merges_total{repo}` — successful auto-merges
 - `raven_errors_total{type,repo}` — errors by type
 - `raven_ci_failures_total{repo}` — CI failures
+- `raven_responses_total{repo}` — comment responses
 - `raven_reviews_skipped_total{reason,repo}` — skipped reviews
 
 ## Development
@@ -276,4 +278,4 @@ pytest tests/ -v
 
 ## License
 
-AGPL-3.0. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

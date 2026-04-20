@@ -24,6 +24,8 @@ _SEVERITY_NAME = {v: k for k, v in SEVERITY_ORDER.items()}
 
 logger = logging.getLogger(__name__)
 
+_GITEA_AUTO_MERGE = os.environ.get("RAVEN_GITEA_AUTO_MERGE", "").lower() in ("1", "true", "yes")
+
 executor = ThreadPoolExecutor(max_workers=int(os.environ.get("RAVEN_MAX_WORKERS", "16")))
 
 # ── PR dedup: prevent concurrent reviews for the same PR ──────────── #
@@ -271,6 +273,21 @@ def create_app() -> Flask:
             executor.submit(_process_pr, provider, payload)
             return jsonify({"status": "accepted", "reason": "review requested"})
 
+        elif event_type in ("review_approved", "review_rejected"):
+            if event_type == "review_rejected":
+                return jsonify({"status": "ignored", "reason": "review rejected — no action"})
+            pr_number = payload.get("pr_number")
+            if not pr_number:
+                return jsonify({"status": "skipped", "reason": "missing PR number"})
+            if _is_bot_author(sender):
+                return jsonify({"status": "skipped"})
+            if _is_skipped_repo(repo):
+                return jsonify({"status": "skipped"})
+            if _should_skip_duplicate(f"{provider.name}:{repo}", f"review-approved-{pr_number}"):
+                return jsonify({"status": "skipped", "reason": "duplicate"})
+            executor.submit(_process_review_approved, provider, payload)
+            return jsonify({"status": "accepted", "reason": "checking merge eligibility"})
+
         elif event_type in ("comment", "diff_comment"):
             pr_number = payload.get("pr_number")
             comment_body = payload.get("comment_body", "")
@@ -319,6 +336,13 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         pr_title = payload.get("pr_title") or f"PR #{pr_number}"
         pr_url = payload.get("pr_url", "")
         head_sha = payload.get("head_sha") or "HEAD"
+
+        # Make the pending review visible immediately by adding Raven as a reviewer
+        # before fetching the diff. Best-effort — failures do not block the review.
+        try:
+            provider.add_self_as_reviewer(repo_full_name, pr_number)
+        except Exception as e:
+            logger.warning("Failed to add Raven as reviewer on PR #%d: %s", pr_number, e)
 
         # Fetch diff
         diff = provider.fetch_pr_diff(repo_full_name, pr_number)
@@ -414,18 +438,20 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         body = _format_comment(review)
         approve_sev = os.environ.get("REVIEW_APPROVE_MAX_SEVERITY", "low")
         approve = severity_gte(approve_sev, review["severity"])
+        default_emoji = "\U0001f7e2"
         inline_comments = [
             {
                 "file": f["file"],
                 "line": f["line"],
-                "body": f"{SEVERITY_EMOJI.get(f.get('severity', 'low'), '\U0001f7e2')} **[{f.get('severity', 'low')}]** {f['message']}",
+                "body": f"{SEVERITY_EMOJI.get(f.get('severity', 'low'), default_emoji)} **[{f.get('severity', 'low')}]** {f['message']}",
             }
             for f in review.get("findings", [])
             if f.get("file") and isinstance(f.get("line"), int) and f["line"] > 0
         ]
         try:
             new_review = provider.submit_review(repo_full_name, pr_number, body,
-                                                approve=approve, inline_comments=inline_comments)
+                                                approve=approve, inline_comments=inline_comments,
+                                                commit_id=head_sha)
         except Exception as e:
             logger.error("Failed to submit review on PR #%d: %s", pr_number, e)
             notify(repo_full_name, f"PR #{pr_number}: {pr_title}", review,
@@ -480,38 +506,9 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             _notify_if_needed(repo_full_name, pr_number, pr_title, pr_url, review)
             return
 
-        # Raven is the only reviewer — wait for CI then merge
-        ci_timeout = int(os.environ.get("CI_WAIT_TIMEOUT", "300"))
-        ci_status = _wait_for_ci(provider, repo_full_name, head_sha, timeout=ci_timeout)
-
-        if ci_status == "failure" or ci_status == "error":
-            logger.info("PR #%d CI failed — not merging", pr_number)
-            notify(repo_full_name, f"PR #{pr_number}: {pr_title}", review,
-                   link=pr_url, action="ci_failed")
-            inc("raven_ci_failures_total", {"repo": repo_full_name})
-            return
-
-        if ci_status == "pending":
-            logger.info("PR #%d CI still pending after timeout — not merging", pr_number)
-            notify(repo_full_name, f"PR #{pr_number}: {pr_title}", review,
-                   link=pr_url, action="ci_timeout")
-            return
-
-        # Verify head SHA hasn't changed during CI wait (force-push protection)
-        current_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
-        if current_sha != head_sha:
-            logger.info("PR #%d head SHA changed during CI wait (%s -> %s) — skipping merge", pr_number, head_sha[:8], current_sha[:8])
-            return
-
-        # CI passed or no CI configured — merge
+        # Raven is the only reviewer — merge
         merge_strategy = os.environ.get("MERGE_STRATEGY", "squash")
-        merged = provider.merge_pr(repo_full_name, pr_number, commit_title=pr_title, strategy=merge_strategy)
-        if merged:
-            inc("raven_merges_total", {"repo": repo_full_name})
-        else:
-            notify(repo_full_name, f"PR #{pr_number}: {pr_title}", review,
-                   link=pr_url, action="merge_failed")
-            inc("raven_errors_total", {"type": "merge_failed", "repo": repo_full_name})
+        _do_merge(provider, repo_full_name, pr_number, pr_title, pr_url, review, head_sha, merge_strategy)
 
     except Exception as e:
         logger.error("Unhandled error processing PR: %s", e, exc_info=True)
@@ -579,6 +576,137 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
 
     except Exception as e:
         logger.error("Failed to respond to comment: %s", e, exc_info=True)
+
+
+# ------------------------------------------------------------------ #
+#  Merge orchestration                                                 #
+# ------------------------------------------------------------------ #
+
+def _do_merge(provider: GitProvider, repo_full_name: str, pr_number: int,
+              pr_title: str, pr_url: str, review: dict,
+              head_sha: str, merge_strategy: str) -> None:
+    """Wait for CI (or use Gitea auto-merge) then merge the PR.
+
+    When RAVEN_GITEA_AUTO_MERGE is enabled and the provider is Gitea,
+    delegates CI waiting to Gitea via merge_when_checks_succeed.
+    Otherwise polls CI and merges manually with head_commit_id safety.
+    """
+    if _GITEA_AUTO_MERGE and provider.name == "gitea":
+        merged = provider.merge_pr(repo_full_name, pr_number, commit_title=pr_title,
+                                   strategy=merge_strategy, head_sha=head_sha,
+                                   merge_when_checks_succeed=True)
+        if merged:
+            logger.info("PR #%d auto-merge queued via Gitea", pr_number)
+            inc("raven_auto_merge_queued_total", {"repo": repo_full_name})
+        else:
+            notify(repo_full_name, f"PR #{pr_number}: {pr_title}", review,
+                   link=pr_url, action="merge_failed")
+            inc("raven_errors_total", {"type": "merge_failed", "repo": repo_full_name})
+        return
+
+    ci_timeout = int(os.environ.get("CI_WAIT_TIMEOUT", "300"))
+    ci_status = _wait_for_ci(provider, repo_full_name, head_sha, timeout=ci_timeout)
+
+    if ci_status in ("failure", "error"):
+        logger.info("PR #%d CI failed — not merging", pr_number)
+        notify(repo_full_name, f"PR #{pr_number}: {pr_title}", review,
+               link=pr_url, action="ci_failed")
+        inc("raven_ci_failures_total", {"repo": repo_full_name})
+        return
+
+    if ci_status == "pending":
+        logger.info("PR #%d CI still pending after timeout — not merging", pr_number)
+        notify(repo_full_name, f"PR #{pr_number}: {pr_title}", review,
+               link=pr_url, action="ci_timeout")
+        return
+
+    # Verify head SHA hasn't changed during CI wait (provider-agnostic safety net;
+    # Gitea also enforces this via head_commit_id, but BB DC ignores head_sha)
+    try:
+        current_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
+        if current_sha != head_sha:
+            logger.info("PR #%d head SHA changed during CI wait (%s -> %s) — skipping merge",
+                        pr_number, head_sha[:8], current_sha[:8])
+            return
+    except Exception as e:
+        logger.warning("Could not verify head SHA for PR #%d: %s — skipping merge (fail closed)", pr_number, e)
+        return
+
+    # CI passed or no CI — merge (head_sha provides additional atomic safety on Gitea)
+    merged = provider.merge_pr(repo_full_name, pr_number, commit_title=pr_title,
+                               strategy=merge_strategy, head_sha=head_sha)
+    if merged:
+        inc("raven_merges_total", {"repo": repo_full_name})
+    else:
+        notify(repo_full_name, f"PR #{pr_number}: {pr_title}", review,
+               link=pr_url, action="merge_failed")
+        inc("raven_errors_total", {"type": "merge_failed", "repo": repo_full_name})
+
+
+# ------------------------------------------------------------------ #
+#  Review-approved handler                                             #
+# ------------------------------------------------------------------ #
+
+_AUTO_MERGE_ON_APPROVAL = os.environ.get("RAVEN_AUTO_MERGE_ON_APPROVAL", "").lower() in ("1", "true", "yes")
+
+
+def _latest_review_per_user(reviews: list[dict]) -> dict[str, str]:
+    """Resolve review list to {login: latest_state}. Later entries win."""
+    latest: dict[str, str] = {}
+    for r in reviews:
+        login = r.get("user", {}).get("login", "")
+        state = r.get("state", "")
+        if login and state in ("APPROVED", "REQUEST_CHANGES"):
+            latest[login] = state
+    return latest
+
+
+def _process_review_approved(provider: GitProvider, payload: dict) -> None:
+    """Check if a human approval means we can now auto-merge a Raven-approved PR."""
+    try:
+        if not _AUTO_MERGE_ON_APPROVAL:
+            logger.debug("RAVEN_AUTO_MERGE_ON_APPROVAL not enabled — ignoring review_approved event")
+            return
+
+        repo_full_name = payload["repo"]
+        pr_number = payload["pr_number"]
+        pr_title = payload.get("pr_title") or f"PR #{pr_number}"
+        pr_url = payload.get("pr_url", "")
+
+        raven_user = provider.get_authenticated_user()
+        reviews = provider.get_pr_reviews(repo_full_name, pr_number)
+
+        # Resolve to latest review state per user (handles superseded reviews)
+        latest = _latest_review_per_user(reviews)
+
+        if latest.get(raven_user) != "APPROVED":
+            logger.info("PR #%d: Raven's latest review is not APPROVED — skipping merge", pr_number)
+            return
+
+        # Check no reviewer has outstanding REQUEST_CHANGES
+        has_rejections = any(
+            state == "REQUEST_CHANGES" for login, state in latest.items() if login != raven_user
+        )
+        if has_rejections:
+            logger.info("PR #%d: outstanding REQUEST_CHANGES from another reviewer — skipping merge", pr_number)
+            return
+
+        # Check no outstanding requested reviewers remain
+        requested = provider.get_pr_requested_reviewers(repo_full_name, pr_number)
+        if requested:
+            logger.info("PR #%d: still has requested reviewers — skipping merge", pr_number)
+            return
+
+        current_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
+        merge_strategy = os.environ.get("MERGE_STRATEGY", "squash")
+        # Construct a minimal review dict for notifications
+        review = {"severity": "low", "summary": "Previously approved by Raven", "findings": []}
+
+        _do_merge(provider, repo_full_name, pr_number, pr_title, pr_url, review,
+                  current_sha, merge_strategy)
+
+    except Exception as e:
+        logger.error("Failed to process review_approved: %s", e, exc_info=True)
 
 
 # ------------------------------------------------------------------ #

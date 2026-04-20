@@ -35,7 +35,8 @@ class GitProvider(ABC):
 
     @abstractmethod
     def submit_review(self, repo: str, pr_number: int, body: str,
-                      approve: bool, inline_comments: list[dict] | None = None) -> dict:
+                      approve: bool, inline_comments: list[dict] | None = None,
+                      commit_id: str = "") -> dict:
         """Submit review. inline_comments: [{"file": str, "line": int, "body": str}]. Returns dict with "id"."""
         ...
 
@@ -52,8 +53,14 @@ class GitProvider(ABC):
     def get_pr_requested_reviewers(self, repo: str, pr_number: int) -> list[str]: ...
 
     @abstractmethod
+    def add_self_as_reviewer(self, repo: str, pr_number: int) -> None:
+        """Add the authenticated bot user as a reviewer on the PR. Idempotent."""
+        ...
+
+    @abstractmethod
     def merge_pr(self, repo: str, pr_number: int,
-                 commit_title: str = "", strategy: str = "squash") -> bool: ...
+                 commit_title: str = "", strategy: str = "squash",
+                 head_sha: str = "", merge_when_checks_succeed: bool = False) -> bool: ...
 
     @abstractmethod
     def add_label_to_pr(self, repo: str, pr_number: int) -> None: ...
