@@ -575,12 +575,29 @@ class TestFetchFile:
         data = {"lines": [{"text": "line 1"}, {"text": "line 2"}]}
         with _mock_get(client, json_data=data):
             result = client.fetch_file("PROJ/repo", "README.md", ref="main")
-        assert result == "line 1\nline 2"
+        # Trailing newline for parity with Gitea.
+        assert result == "line 1\nline 2\n"
 
     def test_not_found(self, client):
         with _mock_get(client, status=404):
             result = client.fetch_file("PROJ/repo", "missing.md")
         assert result == ""
+
+    def test_empty_file_returns_empty_string_not_newline(self, client):
+        """An empty lines array returns '' rather than a bare newline
+        so callers can truthiness-check the result."""
+        with _mock_get(client, json_data={"lines": []}):
+            result = client.fetch_file("PROJ/repo", "empty.txt")
+        assert result == ""
+
+    def test_path_with_special_chars_is_url_encoded(self, client):
+        """URL-sensitive characters in the path must be percent-encoded
+        so they don't break routing."""
+        with _mock_get(client, json_data={"lines": [{"text": "x"}]}) as mock_get:
+            client.fetch_file("PROJ/repo", "docs/issue #42.md")
+        url = mock_get.call_args[0][0]
+        assert "#" not in url
+        assert "docs/issue%20%2342.md" in url
 
 
 # ------------------------------------------------------------------ #

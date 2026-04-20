@@ -13,11 +13,42 @@ os.environ.setdefault("RAVEN_WEBHOOK_SECRET", "testsecret")
 os.environ.setdefault("GITEA_WEBHOOK_SECRET", "testsecret")
 
 import raven.server as _server_mod
-from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _process_review_approved, _latest_review_per_user, _wait_for_ci, _should_skip_duplicate, _do_merge, _truncate_diff_for_comment, _extract_code_snippet, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
+from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _process_review_approved, _latest_review_per_user, _wait_for_ci, _should_skip_duplicate, _do_merge, _safe_do_merge, _truncate_diff_for_comment, _extract_code_snippet, _shutdown_executor, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
 from raven.providers import GitProvider, _providers
 
 
 SECRET = "testsecret"
+
+
+@pytest.fixture(autouse=True)
+def _inline_ci_wait_executor():
+    """Make ``ci_wait_executor.submit`` run tasks inline so existing
+    tests that assert ``merge_pr.assert_called_once()`` after
+    ``_process_pr`` keep working without the background thread race.
+
+    Tests that need to inspect the real executor (dispatch verification,
+    shutdown) override this by ``patch("raven.server.ci_wait_executor")``
+    — the patch wins over the fixture's module assignment."""
+    from concurrent.futures import Future
+
+    class _InlineExecutor:
+        def submit(self, fn, *args, **kwargs):
+            fut: Future = Future()
+            try:
+                fut.set_result(fn(*args, **kwargs))
+            except BaseException as exc:
+                fut.set_exception(exc)
+            return fut
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            pass
+
+    original = _server_mod.ci_wait_executor
+    _server_mod.ci_wait_executor = _InlineExecutor()
+    try:
+        yield
+    finally:
+        _server_mod.ci_wait_executor = original
 
 
 @pytest.fixture()
@@ -556,6 +587,36 @@ class TestProcessPr:
         _process_pr(mc, self._normalized_payload())
         assert "gitea:owner/repo#42" not in _srv._in_progress_prs
 
+    def test_best_effort_failures_increment_error_metric(self):
+        """add_self_as_reviewer, dismiss_previous_reviews, and
+        add_label_to_pr fail silently at warning level. Each branch now
+        also increments raven_errors_total with a distinct type so
+        operators can alert on sustained failures (e.g. token scope
+        revoked) without scraping logs."""
+        from raven.metrics import _counters
+        _counters.clear()
+        mc = self._make_provider()
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.add_self_as_reviewer.side_effect = RuntimeError("scope lost")
+            mc.dismiss_previous_reviews.side_effect = RuntimeError("admin only")
+            mc.add_label_to_pr.side_effect = RuntimeError("label missing")
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.get_commit_status.return_value = "success"
+            mc.merge_pr.return_value = True
+            self._setup_raven_only(mc)
+            mock_review.return_value = {"severity": "low", "summary": "OK", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+        keys = list(_counters.keys())
+        assert any("self_reviewer_failed" in k for k in keys), keys
+        assert any("dismiss_failed" in k for k in keys), keys
+        assert any("label_failed" in k for k in keys), keys
+
 
 class TestWaitForCi:
     def test_initial_delay_before_first_check(self):
@@ -603,6 +664,344 @@ class TestWaitForCi:
         assert result == "pending"
 
 
+class TestShutdownExecutor:
+    def test_shutdown_registered_via_atexit(self):
+        """Regression guard that actually catches deletion of the
+        ``_register_atexit(_shutdown_executor)`` line.
+
+        We can't inspect CPython's atexit registry (``_exithandlers``
+        doesn't exist in Python 3; ``unregister`` returns None and
+        doesn't decrement ``_ncallbacks`` — slots are nulled, not
+        removed). Instead server.py records its registrations in
+        ``_ATEXIT_HOOKS`` so tests can assert on exactly what was
+        handed to atexit.
+        """
+        import raven.server as _srv
+        assert _shutdown_executor in _srv._ATEXIT_HOOKS, (
+            "_shutdown_executor missing from _ATEXIT_HOOKS — the "
+            "_register_atexit(_shutdown_executor) line was removed"
+        )
+
+    def test_register_atexit_helper_calls_atexit_register(self):
+        """Membership in _ATEXIT_HOOKS is only useful if _register_atexit
+        actually hands the function to atexit as well. Asserts the
+        helper's contract directly so a refactor that drops the
+        atexit.register call (keeping only the list append) fails here."""
+        import atexit as _atexit
+        import raven.server as _srv
+        sentinel = lambda: None  # noqa: E731
+        with patch.object(_atexit, "register") as mock_register:
+            _srv._register_atexit(sentinel)
+        mock_register.assert_called_once_with(sentinel)
+        assert sentinel in _srv._ATEXIT_HOOKS
+        # Undo the append so we don't pollute state for later tests.
+        _srv._ATEXIT_HOOKS.remove(sentinel)
+
+    def test_shutdown_cancels_queued_futures(self):
+        """The actual behaviour we care about: ``cancel_futures=True``
+        drops work that hasn't started so it never runs during
+        interpreter shutdown. Exercises the code path by blocking the
+        single worker and queueing more tasks behind it, then asserting
+        the queued ones are marked cancelled."""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        import raven.server as _srv
+        real = _srv.executor
+        try:
+            _srv.executor = ThreadPoolExecutor(max_workers=1)
+            gate = threading.Event()
+            # Fill the single worker with a task blocked on the gate.
+            blocking = _srv.executor.submit(gate.wait, timeout=5)
+            # Queue several tasks behind it that should never start.
+            queued = [
+                _srv.executor.submit(lambda: "should not run")
+                for _ in range(3)
+            ]
+            _shutdown_executor()
+            # Let the blocking task finish so threads can join cleanly.
+            gate.set()
+            blocking.result(timeout=5)
+            # The queued tasks must all be cancelled.
+            for fut in queued:
+                assert fut.cancelled(), (
+                    f"expected queued future to be cancelled, got {fut!r}"
+                )
+            # And the pool must refuse new submissions.
+            import pytest
+            with pytest.raises(RuntimeError):
+                _srv.executor.submit(lambda: None)
+        finally:
+            _srv.executor = real
+
+    def test_shutdown_terminates_claude_subprocesses(self):
+        """The executor shutdown alone doesn't unblock workers that are
+        mid-Claude-call — those are stuck in proc.communicate(). The
+        shutdown hook must also terminate tracked Claude subprocesses so
+        gunicorn's graceful timeout isn't spent waiting for inference
+        whose result is discarded on exit."""
+        import raven.server as _srv
+        from concurrent.futures import ThreadPoolExecutor
+
+        real = _srv.executor
+        try:
+            _srv.executor = ThreadPoolExecutor(max_workers=1)
+            with patch("raven.server.terminate_active_processes") as mock_term:
+                _shutdown_executor()
+            mock_term.assert_called_once()
+        finally:
+            _srv.executor = real
+
+    def test_shutdown_drains_ci_wait_executor(self):
+        """CI-wait tasks (blocking on time.sleep between polls) must be
+        dropped on shutdown so gunicorn's graceful timeout isn't
+        consumed by polling work whose merge decision is no longer
+        relevant. Queued tasks are cancelled via cancel_futures=True."""
+        import raven.server as _srv
+        from concurrent.futures import ThreadPoolExecutor
+
+        real_main = _srv.executor
+        real_ci = _srv.ci_wait_executor
+        try:
+            _srv.executor = ThreadPoolExecutor(max_workers=1)
+            # Replace ci_wait_executor with a real pool that we can
+            # observe. Block its one worker so the queued tasks stay
+            # queued and we can verify they get cancelled.
+            _srv.ci_wait_executor = ThreadPoolExecutor(max_workers=1)
+            import threading as _th
+            gate = _th.Event()
+            blocking = _srv.ci_wait_executor.submit(gate.wait)
+            queued = [
+                _srv.ci_wait_executor.submit(lambda: "should not run")
+                for _ in range(3)
+            ]
+            with patch("raven.server.terminate_active_processes"):
+                _shutdown_executor()
+            gate.set()
+            blocking.result(timeout=5)
+            for fut in queued:
+                assert fut.cancelled(), f"expected cancelled future, got {fut!r}"
+            import pytest as _pt
+            with _pt.raises(RuntimeError):
+                _srv.ci_wait_executor.submit(lambda: None)
+        finally:
+            _srv.executor = real_main
+            _srv.ci_wait_executor = real_ci
+
+
+class TestCiWaitDispatch:
+    """The merge phase dispatches through ``ci_wait_executor`` so review
+    workers aren't pinned in time.sleep for the full CI wait. Verifies
+    the dispatch happens (rather than calling _do_merge inline) and
+    that unhandled exceptions in the wait pool are logged rather than
+    silently swallowed by the Future."""
+
+    def _make_provider(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_pr_diff.return_value = "diff --git a/x.py b/x.py\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.submit_review.return_value = {"id": 7}
+        mc.add_label_to_pr.return_value = None
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = []
+        mc.get_pr_requested_reviewers.return_value = []
+        return mc
+
+    def _payload(self):
+        return {
+            "repo": "owner/repo", "pr_number": 42, "pr_title": "x",
+            "pr_url": "http://x", "head_sha": "abc123",
+        }
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def test_process_pr_submits_merge_to_ci_wait_executor(self):
+        mc = self._make_provider()
+        with (
+            patch("raven.server.ci_wait_executor") as mock_exec,
+            patch("raven.server.review_diff", return_value={
+                "severity": "low", "summary": "ok", "findings": []}),
+            patch("raven.server.notify"),
+        ):
+            mock_exec.submit.return_value = MagicMock()
+            _process_pr(mc, self._payload())
+
+        # The merge must be submitted to the CI-wait pool, not called
+        # inline. First positional arg is the callable (_do_merge).
+        mock_exec.submit.assert_called_once()
+        call_args = mock_exec.submit.call_args[0]
+        assert call_args[0] is _safe_do_merge
+        assert call_args[2] == "owner/repo"
+        assert call_args[3] == 42
+        # Merge is NOT called on the provider here — it'll happen
+        # inside the wait-pool task when the pool actually runs it.
+        mc.merge_pr.assert_not_called()
+
+    def test_process_review_approved_submits_merge_to_ci_wait_executor(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_head_sha.return_value = "abc123"
+        payload = self._payload()
+
+        with (
+            patch("raven.server._AUTO_MERGE_ON_APPROVAL", True),
+            patch("raven.server.ci_wait_executor") as mock_exec,
+        ):
+            mock_exec.submit.return_value = MagicMock()
+            _process_review_approved(mc, payload)
+
+        mock_exec.submit.assert_called_once()
+        call_args = mock_exec.submit.call_args[0]
+        assert call_args[0] is _safe_do_merge
+        mc.merge_pr.assert_not_called()
+
+    def test_log_future_exception_surfaces_error_with_repo_label(self):
+        """An exception raised inside a ci_wait_executor task would
+        otherwise sit in the Future forever, since the caller never
+        reads the result. ``_log_future_exception`` is attached as a
+        done-callback to convert that into a log line + metric tagged
+        with the originating repo (passed via functools.partial at the
+        submit site) so operators can tell which repo's merges are
+        failing from ``raven_errors_total``."""
+        from concurrent.futures import Future
+        import raven.server as _srv
+
+        boom = RuntimeError("boom")
+        fut: Future = Future()
+        fut.set_exception(boom)
+
+        with patch("raven.server.logger") as mock_log, \
+             patch("raven.server.inc") as mock_inc:
+            _srv._log_future_exception(fut, repo="owner/repo")
+
+        mock_log.error.assert_called_once()
+        msg = mock_log.error.call_args[0][0]
+        assert "Unhandled exception" in msg
+        mock_inc.assert_called_once()
+        name, labels = mock_inc.call_args[0]
+        assert name == "raven_errors_total"
+        assert labels["repo"] == "owner/repo"
+
+    def test_log_future_exception_no_op_on_success(self):
+        from concurrent.futures import Future
+        import raven.server as _srv
+
+        fut: Future = Future()
+        fut.set_result("all good")
+
+        with patch("raven.server.logger") as mock_log, \
+             patch("raven.server.inc") as mock_inc:
+            _srv._log_future_exception(fut, repo="owner/repo")
+
+        mock_log.error.assert_not_called()
+        mock_inc.assert_not_called()
+
+    def test_log_future_exception_silent_on_cancelled_future(self):
+        """``fut.exception()`` on a cancelled future raises
+        ``CancelledError``, which is a ``BaseException`` subclass since
+        Python 3.8 and would escape ``except Exception``. Cancellation
+        fires whenever ``_shutdown_executor`` drains queued tasks via
+        ``cancel_futures=True`` — that's expected, not an error. The
+        ``fut.cancelled()`` guard avoids surfacing a scary traceback
+        every time the service shuts down cleanly."""
+        from concurrent.futures import Future
+        import raven.server as _srv
+
+        fut: Future = Future()
+        fut.cancel()
+        # Force the future to the CANCELLED state (not CANCELLED_AND_NOTIFIED).
+        # Either state returns True from fut.cancelled(); the guard handles both.
+
+        with patch("raven.server.logger") as mock_log, \
+             patch("raven.server.inc") as mock_inc:
+            _srv._log_future_exception(fut, repo="owner/repo")
+
+        mock_log.error.assert_not_called()
+        mock_inc.assert_not_called()
+
+
+class TestSafeDoMerge:
+    """``_safe_do_merge`` restores the user-visible error path that used
+    to live in ``_process_pr``'s outer try/except when the merge was
+    synchronous. Without it, dispatching ``_do_merge`` to
+    ``ci_wait_executor`` made unexpected merge-phase failures silent
+    from the user's perspective (review posted, but no indication that
+    the merge never happened)."""
+
+    def setup_method(self):
+        _recent_prs.clear()
+
+    def test_wraps_do_merge_on_success(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        review = {"severity": "low", "summary": "ok", "findings": []}
+
+        with patch("raven.server._do_merge") as mock_merge, \
+             patch("raven.server.inc") as mock_inc:
+            _safe_do_merge(mc, "owner/repo", 42, "t", "u", review, "abc", "squash")
+
+        mock_merge.assert_called_once()
+        mock_inc.assert_not_called()
+        mc.post_pr_comment.assert_not_called()
+
+    def test_unexpected_exception_posts_user_comment(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        review = {"severity": "low", "summary": "ok", "findings": []}
+
+        with patch("raven.server._do_merge", side_effect=RuntimeError("boom")), \
+             patch("raven.server.inc") as mock_inc, \
+             patch("raven.server.logger") as mock_log:
+            _safe_do_merge(mc, "owner/repo", 42, "t", "u", review, "abc", "squash")
+
+        # User-visible comment so reviewers see something went wrong
+        mc.post_pr_comment.assert_called_once()
+        comment_body = mc.post_pr_comment.call_args[0][2]
+        assert "Internal error during merge phase" in comment_body
+        # Metric tagged with the real repo, not "unknown"
+        name, labels = mock_inc.call_args[0]
+        assert name == "raven_errors_total"
+        assert labels["type"] == "merge_unhandled"
+        assert labels["repo"] == "owner/repo"
+        # Logged with exc_info so operators get a traceback
+        mock_log.error.assert_called_once()
+        assert mock_log.error.call_args[1].get("exc_info") is True
+
+    def test_unexpected_exception_clears_dedup_for_retry(self):
+        """Dedup entry must be cleared so a webhook retry can re-attempt
+        the review + merge. Matches the old _process_pr outer handler
+        behaviour."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        review = {"severity": "low", "summary": "ok", "findings": []}
+        # Simulate a pre-existing dedup entry for this PR
+        _recent_prs["gitea:owner/repo#42"] = 1.0
+
+        with patch("raven.server._do_merge", side_effect=RuntimeError("boom")):
+            _safe_do_merge(mc, "owner/repo", 42, "t", "u", review, "abc", "squash")
+
+        assert "gitea:owner/repo#42" not in _recent_prs
+
+    def test_post_comment_failure_does_not_mask_original_error(self):
+        """If the fallback ``post_pr_comment`` itself fails (e.g. API
+        outage), the safety wrapper must still return cleanly — the log
+        line and metric are already emitted."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.post_pr_comment.side_effect = Exception("API down")
+        review = {"severity": "low", "summary": "ok", "findings": []}
+
+        with patch("raven.server._do_merge", side_effect=RuntimeError("boom")), \
+             patch("raven.server.inc"):
+            # Must not raise
+            _safe_do_merge(mc, "owner/repo", 42, "t", "u", review, "abc", "squash")
+
+
 class TestHelpers:
     def test_bot_author_detected(self):
         assert _is_bot_author("dependabot") is True
@@ -613,6 +1012,23 @@ class TestHelpers:
 
     def test_bot_endswith_bot_no_longer_matches(self):
         assert _is_bot_author("jacobot") is False
+
+    def test_bot_affix_matches(self):
+        """Suffix ``-bot`` and prefix ``bot-`` identify bot-named accounts
+        without matching internal segments or standalone 'bot' word chars."""
+        assert _is_bot_author("alice-bot") is True
+        assert _is_bot_author("bot-worker") is True
+        assert _is_bot_author("bot") is True
+
+    def test_bot_affix_does_not_match_internal_segments(self):
+        """Previous heuristic used 'bot' in n.split('-') which flagged
+        real-human names whose middle segment happened to equal 'bot'.
+        Tighter affix check must NOT match these."""
+        assert _is_bot_author("alice-bot-fan") is False
+        assert _is_bot_author("user-bot-admin") is False
+        # Names that merely contain the letters 'bot' anywhere in a segment
+        # (but neither prefix nor suffix) must pass through.
+        assert _is_bot_author("rob-bot-the-human") is False
 
     def test_skipped_repo(self):
         with patch.dict(os.environ, {"SKIP_REPOS": "owner/private, owner/legacy"}):

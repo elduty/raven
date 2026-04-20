@@ -52,12 +52,12 @@ class TestLoadChannels:
 
 class TestNotify:
     def test_no_channels_returns_false(self):
-        with patch("raven.notifier._CHANNELS", []):
+        with patch("raven.notifier._load_channels", return_value=[]):
             result = notify("owner/repo", "PR #1", {"severity": "high", "summary": "test"})
         assert result is False
 
     def test_webhook_success(self):
-        with patch("raven.notifier._CHANNELS", [WEBHOOK_CHANNEL]):
+        with patch("raven.notifier._load_channels", return_value=[WEBHOOK_CHANNEL]):
             with patch("raven.notifier.requests.post") as mock_post:
                 mock_post.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
                 result = notify("owner/repo", "PR #1: Fix", {"severity": "high", "summary": "SQL injection"}, link="https://git/pr/1", action="needs_review")
@@ -67,7 +67,7 @@ class TestNotify:
         assert "SQL injection" in payload["text"]
 
     def test_bearer_token_sent(self):
-        with patch("raven.notifier._CHANNELS", [WEBHOOK_CHANNEL]):
+        with patch("raven.notifier._load_channels", return_value=[WEBHOOK_CHANNEL]):
             with patch("raven.notifier.requests.post") as mock_post:
                 mock_post.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
                 notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
@@ -76,7 +76,7 @@ class TestNotify:
 
     def test_no_token_no_auth_header(self):
         channel = {"type": "webhook", "url": "https://hook.test/hooks"}
-        with patch("raven.notifier._CHANNELS", [channel]):
+        with patch("raven.notifier._load_channels", return_value=[channel]):
             with patch("raven.notifier.requests.post") as mock_post:
                 mock_post.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
                 notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
@@ -84,7 +84,7 @@ class TestNotify:
         assert "Authorization" not in headers
 
     def test_global_channel_matches_all_repos(self):
-        with patch("raven.notifier._CHANNELS", [WEBHOOK_CHANNEL]):
+        with patch("raven.notifier._load_channels", return_value=[WEBHOOK_CHANNEL]):
             with patch("raven.notifier.requests.post") as mock_post:
                 mock_post.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
                 result = notify("any/repo", "ref", {"severity": "low", "summary": "ok"})
@@ -93,7 +93,7 @@ class TestNotify:
 
     def test_repos_filter_matches(self):
         channel = {**WEBHOOK_CHANNEL, "repos": ["owner/repo"]}
-        with patch("raven.notifier._CHANNELS", [channel]):
+        with patch("raven.notifier._load_channels", return_value=[channel]):
             with patch("raven.notifier.requests.post") as mock_post:
                 mock_post.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
                 result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
@@ -102,7 +102,7 @@ class TestNotify:
 
     def test_repos_filter_skips_non_matching(self):
         channel = {**WEBHOOK_CHANNEL, "repos": ["owner/other"]}
-        with patch("raven.notifier._CHANNELS", [channel]):
+        with patch("raven.notifier._load_channels", return_value=[channel]):
             with patch("raven.notifier.requests.post") as mock_post:
                 result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
         assert result is False
@@ -110,7 +110,7 @@ class TestNotify:
 
     def test_min_severity_filter_matches(self):
         channel = {**WEBHOOK_CHANNEL, "min_severity": "medium"}
-        with patch("raven.notifier._CHANNELS", [channel]):
+        with patch("raven.notifier._load_channels", return_value=[channel]):
             with patch("raven.notifier.requests.post") as mock_post:
                 mock_post.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
                 result = notify("owner/repo", "ref", {"severity": "high", "summary": "critical bug"})
@@ -119,14 +119,14 @@ class TestNotify:
 
     def test_min_severity_filter_skips_low(self):
         channel = {**WEBHOOK_CHANNEL, "min_severity": "medium"}
-        with patch("raven.notifier._CHANNELS", [channel]):
+        with patch("raven.notifier._load_channels", return_value=[channel]):
             with patch("raven.notifier.requests.post") as mock_post:
                 result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
         assert result is False
         mock_post.assert_not_called()
 
     def test_no_min_severity_notifies_all(self):
-        with patch("raven.notifier._CHANNELS", [WEBHOOK_CHANNEL]):
+        with patch("raven.notifier._load_channels", return_value=[WEBHOOK_CHANNEL]):
             with patch("raven.notifier.requests.post") as mock_post:
                 mock_post.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
                 result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
@@ -137,7 +137,7 @@ class TestNotify:
         import requests as req
         ch1 = {"type": "webhook", "url": "https://fail.test/hooks", "token": "a"}
         ch2 = {"type": "webhook", "url": "https://ok.test/hooks", "token": "b"}
-        with patch("raven.notifier._CHANNELS", [ch1, ch2]):
+        with patch("raven.notifier._load_channels", return_value=[ch1, ch2]):
             with patch("raven.notifier.requests.post") as mock_post:
                 fail_resp = MagicMock()
                 fail_resp.raise_for_status.side_effect = req.HTTPError("500")
@@ -149,26 +149,47 @@ class TestNotify:
 
     def test_http_error_returns_false(self):
         import requests as req
-        with patch("raven.notifier._CHANNELS", [WEBHOOK_CHANNEL]):
+        with patch("raven.notifier._load_channels", return_value=[WEBHOOK_CHANNEL]):
             with patch("raven.notifier.requests.post", side_effect=req.ConnectionError("down")):
                 result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
         assert result is False
 
     def test_unknown_channel_type_skipped(self):
         channel = {"type": "telegram", "url": "https://t.me/hook"}
-        with patch("raven.notifier._CHANNELS", [channel]):
+        with patch("raven.notifier._load_channels", return_value=[channel]):
             result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
         assert result is False
 
     def test_slack_channel(self):
         channel = {"type": "slack", "url": "https://hooks.slack.com/services/xxx"}
-        with patch("raven.notifier._CHANNELS", [channel]):
+        with patch("raven.notifier._load_channels", return_value=[channel]):
             with patch("raven.notifier.requests.post") as mock_post:
                 mock_post.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
                 result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
         assert result is True
         payload = mock_post.call_args[1]["json"]
         assert "text" in payload
+
+    def test_channels_reloaded_each_call(self):
+        """Changing NOTIFY_CHANNELS between calls takes effect without restart."""
+        first = {"type": "webhook", "url": "https://first.test/hook", "token": "a"}
+        second = {"type": "webhook", "url": "https://second.test/hook", "token": "b"}
+
+        with patch("raven.notifier.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
+
+            with patch.dict(os.environ, {"NOTIFY_CHANNELS": json.dumps([first])}):
+                notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
+            assert mock_post.call_args[0][0] == first["url"]
+
+            with patch.dict(os.environ, {"NOTIFY_CHANNELS": json.dumps([second])}):
+                notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
+            assert mock_post.call_args[0][0] == second["url"]
+
+            with patch.dict(os.environ, {"NOTIFY_CHANNELS": ""}):
+                result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
+            assert result is False
+            assert mock_post.call_count == 2
 
 
 class TestFormatMessage:

@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import logging
 import time
+from urllib.parse import quote
 
 import requests
 from flask import abort
@@ -159,7 +160,11 @@ class BitbucketDCProvider(GitProvider):
         BB DC browse endpoint returns JSON with a 'lines' array.
         """
         project, repo = _split_repo(repo_full_name)
-        url = f"{self.api_url}/projects/{project}/repos/{repo}/browse/{path}"
+        # Quote the path so names with '#', '?', ' ', or other URL-sensitive
+        # characters don't break routing or get mis-parsed as query strings.
+        # safe='/' preserves directory separators.
+        encoded_path = quote(path, safe="/")
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/browse/{encoded_path}"
         all_lines: list[str] = []
         start = 0
         max_pages = 20
@@ -174,7 +179,12 @@ class BitbucketDCProvider(GitProvider):
             if data.get("isLastPage", True):
                 break
             start = data.get("nextPageStart", start + 1000)
-        return "\n".join(all_lines)
+        if not all_lines:
+            return ""
+        # Trailing newline for parity with Gitea's fetch_file (and common
+        # file conventions) so downstream line-count/offset logic doesn't
+        # undercount by one on the last line.
+        return "\n".join(all_lines) + "\n"
 
     # ------------------------------------------------------------------ #
     #  Comments                                                           #

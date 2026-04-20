@@ -411,6 +411,25 @@ class TestFetchFile:
             result = client.fetch_file("owner/repo", "CLAUDE.md")
         assert result == ""
 
+    def test_path_with_special_chars_is_url_encoded(self, client):
+        """Paths with '#', '?', spaces must be quoted so they don't
+        break routing or get mis-parsed as query strings."""
+        content = base64.b64encode(b"x").decode()
+        with _mock_get(client, json_data={"content": content}) as mock_get:
+            client.fetch_file("owner/repo", "docs/issue #42.md", ref="main")
+        url = mock_get.call_args[0][0]
+        assert "#" not in url  # would be interpreted as fragment otherwise
+        assert "docs/issue%20%2342.md" in url
+
+    def test_path_with_subdirs_preserves_slashes(self, client):
+        """Directory separators must stay as '/' — only filename parts
+        should be percent-encoded."""
+        content = base64.b64encode(b"x").decode()
+        with _mock_get(client, json_data={"content": content}) as mock_get:
+            client.fetch_file("owner/repo", "src/pkg/file.py")
+        url = mock_get.call_args[0][0]
+        assert "/src/pkg/file.py" in url
+
 
 # ------------------------------------------------------------------ #
 #  Webhook parsing                                                    #

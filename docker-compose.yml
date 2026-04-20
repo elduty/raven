@@ -53,13 +53,23 @@ services:
       # ── Raven internals (defaults must match raven/server.py + raven/providers/gitea.py)
       - RAVEN_LABEL_NAME=${RAVEN_LABEL_NAME:-raven-reviewed}
       - RAVEN_MAX_WORKERS=${RAVEN_MAX_WORKERS:-16}
+      - RAVEN_CI_WAIT_WORKERS=${RAVEN_CI_WAIT_WORKERS:-32}
       - RAVEN_MAX_CONCURRENT_CLAUDE=${RAVEN_MAX_CONCURRENT_CLAUDE:-4}
       - RAVEN_MAX_CACHED_PRS=${RAVEN_MAX_CACHED_PRS:-200}
       # Cache dir must live on the named volume — override any .env value.
       - RAVEN_CACHE_DIR=/data/raven
     volumes:
-      - ./logs:/app/logs
       - raven-cache:/data/raven
+    # Use Docker's built-in json-file driver with rotation so the
+    # container's stdout/stderr doesn't fill the host disk over time.
+    # 10 MB per file × 5 files = ~50 MB ceiling per container. Operators
+    # needing centralised logging can override with a different driver
+    # (syslog, fluentd, etc.) via docker-compose.override.yml.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
       interval: 30s

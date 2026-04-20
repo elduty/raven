@@ -13,7 +13,12 @@ logger = logging.getLogger(__name__)
 # ── Channel registry ──────────────────────────────────────────────── #
 
 def _load_channels() -> list[dict]:
-    """Parse NOTIFY_CHANNELS JSON from env. Returns empty list if unset or invalid."""
+    """Parse NOTIFY_CHANNELS JSON from env. Returns empty list if unset or invalid.
+
+    Re-read on every notify() call so operators can update channel config without
+    restarting the container — notifications are rare (severity-matching reviews
+    only), so the parse cost is negligible compared to the HTTP call that follows.
+    """
     raw = os.environ.get("NOTIFY_CHANNELS", "")
     if not raw:
         return []
@@ -34,8 +39,6 @@ def _load_channels() -> list[dict]:
         return []
 
 
-_CHANNELS = _load_channels()
-
 # ── Public API ────────────────────────────────────────────────────── #
 
 def notify(repo_name: str, ref: str, review: dict, link: str = "", action: str = "") -> bool:
@@ -43,7 +46,8 @@ def notify(repo_name: str, ref: str, review: dict, link: str = "", action: str =
 
     Returns True if at least one channel succeeded, False otherwise.
     """
-    if not _CHANNELS:
+    channels = _load_channels()
+    if not channels:
         return False
 
     text = _format_message(repo_name, ref, review, link, action)
@@ -51,7 +55,7 @@ def notify(repo_name: str, ref: str, review: dict, link: str = "", action: str =
 
     severity = review.get("severity", "low")
 
-    for channel in _CHANNELS:
+    for channel in channels:
         # Per-repo filter
         repos = channel.get("repos")
         if repos and repo_name not in repos:

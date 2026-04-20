@@ -1,5 +1,8 @@
 """server.py — Flask app with webhook endpoints for git platform providers."""
 
+import atexit
+import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -18,7 +21,7 @@ from .providers import GitProvider, get_provider, register_provider, registered_
 from .providers.gitea import GiteaProvider
 from .metrics import inc, Timer, format_prometheus
 from .notifier import notify
-from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, MAX_DIFF_LINES
+from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, MAX_DIFF_LINES, terminate_active_processes
 
 _SEVERITY_NAME = {v: k for k, v in SEVERITY_ORDER.items()}
 
@@ -26,7 +29,101 @@ logger = logging.getLogger(__name__)
 
 _GITEA_AUTO_MERGE = os.environ.get("RAVEN_GITEA_AUTO_MERGE", "").lower() in ("1", "true", "yes")
 
-executor = ThreadPoolExecutor(max_workers=int(os.environ.get("RAVEN_MAX_WORKERS", "16")))
+executor = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("RAVEN_MAX_WORKERS", "16")),
+    thread_name_prefix="raven-review",
+)
+
+# Dedicated pool for the post-review wait-and-merge phase. CI polling
+# spends nearly all its time sleeping between status checks (up to
+# ``CI_WAIT_TIMEOUT``, default 300s). Running it on the main review
+# executor pins pool slots while doing no useful work, so during a burst
+# (team pushes a batch of PRs at release time) every new webhook queues
+# behind workers that are asleep. Give the wait phase its own larger,
+# sleep-heavy pool so review throughput is preserved.
+ci_wait_executor = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("RAVEN_CI_WAIT_WORKERS", "32")),
+    thread_name_prefix="raven-ci-wait",
+)
+
+
+def _log_future_exception(fut, repo: str = "unknown") -> None:
+    """Future.exception() hides exceptions until .result() is called.
+    The wait-pool tasks are fire-and-forget, so nobody calls .result()
+    — attach this as a done_callback to surface unhandled errors in
+    logs and metrics instead of silently losing them.
+
+    ``fut.cancelled()`` is checked first because ``Future.exception()``
+    on a cancelled future raises ``CancelledError``, which is a
+    ``BaseException`` (not ``Exception``) subclass since Python 3.8 and
+    would therefore escape the ``except Exception`` clause. Cancellation
+    during ``_shutdown_executor``'s drain is expected, not an error.
+    """
+    if fut.cancelled():
+        return
+    try:
+        exc = fut.exception()
+    except Exception:
+        return
+    if exc is not None:
+        logger.error("Unhandled exception in CI-wait task for %s: %s", repo, exc, exc_info=exc)
+        inc("raven_errors_total", {"type": "ci_wait_unhandled", "repo": repo})
+
+
+def _shutdown_executor() -> None:
+    """Cancel queued reviews and terminate in-flight Claude subprocesses.
+
+    Three steps:
+
+    1. ``executor.shutdown(cancel_futures=True, wait=False)`` drops
+       reviews still sitting in the queue so the pool doesn't pick them
+       up during interpreter shutdown.
+    2. ``ci_wait_executor`` is drained the same way, so queued
+       wait-and-merge tasks are dropped. Running wait tasks block in
+       ``time.sleep`` between polls; they'll exit within one poll
+       interval rather than consuming the full ``CI_WAIT_TIMEOUT``.
+    3. ``terminate_active_processes()`` sends SIGTERM (then SIGKILL) to
+       any Claude CLI subprocesses that are mid-call. Running reviews
+       that survive step 1 are almost always blocked in
+       ``proc.communicate()`` waiting for LLM inference; killing the
+       subprocess unblocks the worker thread so gunicorn's graceful
+       timeout isn't consumed by work whose result we'll throw away.
+
+    ``wait=False`` is cosmetic on its own — Python's own
+    ``concurrent.futures.thread._python_exit`` atexit handler joins
+    every live worker thread anyway. Step 3 is what actually shortens
+    shutdown: without it, a worker blocked in a Claude call could
+    still hold up exit for the full ``CLAUDE_TIMEOUT``.
+
+    Gunicorn's sync worker handles SIGTERM by calling ``sys.exit(0)``
+    (not via the OS default signal action), which raises SystemExit
+    and triggers atexit. SIGKILL bypasses atexit entirely.
+    """
+    # Guard against "I/O operation on closed file": the logging
+    # module's handlers may have already been torn down by the time
+    # atexit runs. atexit catches exceptions itself, but suppressing
+    # here avoids the traceback-on-stderr noise.
+    with contextlib.suppress(Exception):
+        logger.info("Shutting down review + CI-wait executors — cancelling queued work")
+    executor.shutdown(wait=False, cancel_futures=True)
+    ci_wait_executor.shutdown(wait=False, cancel_futures=True)
+    with contextlib.suppress(Exception):
+        terminate_active_processes()
+
+
+# Record what we hand to atexit so tests can assert registration
+# happened without relying on CPython internals (``_exithandlers``
+# doesn't exist; ``unregister`` returns None; ``_ncallbacks`` doesn't
+# decrement on unregister). Regression guards check membership here.
+_ATEXIT_HOOKS: list = []
+
+
+def _register_atexit(fn):
+    atexit.register(fn)
+    _ATEXIT_HOOKS.append(fn)
+
+
+_register_atexit(_shutdown_executor)
 
 # ── PR dedup: prevent concurrent reviews for the same PR ──────────── #
 _recent_prs: dict[str, float] = {}
@@ -369,6 +466,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             provider.add_self_as_reviewer(repo_full_name, pr_number)
         except Exception as e:
             logger.warning("Failed to add Raven as reviewer on PR #%d: %s", pr_number, e)
+            inc("raven_errors_total", {"type": "self_reviewer_failed", "repo": repo_full_name})
 
         # Fetch diff
         diff = provider.fetch_pr_diff(repo_full_name, pr_number)
@@ -496,6 +594,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                                                   exclude_id=new_review_id)
             except Exception as e:
                 logger.warning("Failed to dismiss old reviews on PR #%d: %s", pr_number, e)
+                inc("raven_errors_total", {"type": "dismiss_failed", "repo": repo_full_name})
 
         # Cache diff + per-file findings for incremental re-reviews
         # Use fresh_findings (pre-merge) to avoid duplicating carried findings
@@ -517,6 +616,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             provider.add_label_to_pr(repo_full_name, pr_number)
         except Exception as e:
             logger.warning("Failed to add label: %s", e)
+            inc("raven_errors_total", {"type": "label_failed", "repo": repo_full_name})
 
         if not approve:
             logger.info("PR #%d review=REQUEST_CHANGES — leaving open", pr_number)
@@ -532,9 +632,14 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             _notify_if_needed(repo_full_name, pr_number, pr_title, pr_url, review)
             return
 
-        # Raven is the only reviewer — merge
+        # Raven is the only reviewer — merge. Dispatched to the
+        # CI-wait pool so this review thread is freed immediately;
+        # otherwise the worker would sit in time.sleep for up to
+        # ``CI_WAIT_TIMEOUT`` and starve other incoming webhooks.
         merge_strategy = os.environ.get("MERGE_STRATEGY", "squash")
-        _do_merge(provider, repo_full_name, pr_number, pr_title, pr_url, review, head_sha, merge_strategy)
+        fut = ci_wait_executor.submit(_safe_do_merge, provider, repo_full_name, pr_number,
+                                       pr_title, pr_url, review, head_sha, merge_strategy)
+        fut.add_done_callback(functools.partial(_log_future_exception, repo=repo_full_name))
 
     except Exception as e:
         logger.error("Unhandled error processing PR: %s", e, exc_info=True)
@@ -696,6 +801,42 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
 #  Merge orchestration                                                 #
 # ------------------------------------------------------------------ #
 
+def _safe_do_merge(provider: GitProvider, repo_full_name: str, pr_number: int,
+                   pr_title: str, pr_url: str, review: dict,
+                   head_sha: str, merge_strategy: str) -> None:
+    """Wrap ``_do_merge`` with the outer error handler that used to live
+    in ``_process_pr`` when the merge was synchronous.
+
+    Dispatching to ``ci_wait_executor`` moved ``_do_merge`` out of
+    ``_process_pr``'s try/except, which previously logged with the real
+    repo label, cleared dedup so retries could reprocess, and posted a
+    user-visible "internal error" PR comment. Without this wrapper,
+    unexpected merge-phase failures (network error from ``merge_pr``,
+    unexpected shape from ``_wait_for_ci``) would surface only in the
+    metric — users would see the review posted but no indication that
+    the merge never happened.
+
+    ``_do_merge`` already handles *expected* failures inline (CI failed,
+    CI timed out, head-SHA drift, merge_pr returning False). This
+    wrapper is the safety net for truly unexpected exceptions.
+    """
+    try:
+        _do_merge(provider, repo_full_name, pr_number, pr_title, pr_url,
+                  review, head_sha, merge_strategy)
+    except Exception as e:
+        logger.error("Unhandled error in merge phase for PR #%d (%s): %s",
+                     pr_number, repo_full_name, e, exc_info=True)
+        inc("raven_errors_total", {"type": "merge_unhandled", "repo": repo_full_name})
+        # Clear dedup so a webhook retry can re-attempt the review + merge.
+        key = f"{provider.name}:{repo_full_name}#{pr_number}"
+        with _recent_prs_lock:
+            _recent_prs.pop(key, None)
+        with contextlib.suppress(Exception):
+            provider.post_pr_comment(repo_full_name, pr_number,
+                "🦅 **Raven Review**\n\n⚠️ Internal error during merge phase — "
+                "the review was posted but the merge could not be attempted.")
+
+
 def _do_merge(provider: GitProvider, repo_full_name: str, pr_number: int,
               pr_title: str, pr_url: str, review: dict,
               head_sha: str, merge_strategy: str) -> None:
@@ -816,8 +957,11 @@ def _process_review_approved(provider: GitProvider, payload: dict) -> None:
         # Construct a minimal review dict for notifications
         review = {"severity": "low", "summary": "Previously approved by Raven", "findings": []}
 
-        _do_merge(provider, repo_full_name, pr_number, pr_title, pr_url, review,
-                  current_sha, merge_strategy)
+        # Dispatched to the CI-wait pool so this handler returns
+        # quickly — same motivation as in _process_pr.
+        fut = ci_wait_executor.submit(_safe_do_merge, provider, repo_full_name, pr_number,
+                                       pr_title, pr_url, review, current_sha, merge_strategy)
+        fut.add_done_callback(functools.partial(_log_future_exception, repo=repo_full_name))
 
     except Exception as e:
         logger.error("Failed to process review_approved: %s", e, exc_info=True)
@@ -1186,6 +1330,16 @@ def _is_skipped_repo(repo_full_name: str) -> bool:
 
 
 def _is_bot_author(*names: str) -> bool:
+    """Return True if any name looks like a bot.
+
+    Matches exact names in ``default_bots`` or ``SKIP_AUTHORS``, the
+    GitHub ``user[bot]`` suffix, and clear ``-bot`` / ``bot-`` affixes.
+    Deliberately conservative on the dash-segment check: an earlier
+    version used ``"bot" in n.split("-")`` which also matched real
+    human names like ``rob-bot`` or ``turbo-bot``. Anyone who actually
+    uses such a name for a bot account should list it in
+    ``SKIP_AUTHORS``.
+    """
     skip_authors_raw = os.environ.get("SKIP_AUTHORS", "")
     default_bots = {"bot", "github-actions", "dependabot", "renovate", "gitea-actions"}
     skipped = default_bots | {a.strip().lower() for a in skip_authors_raw.split(",") if a.strip()}
@@ -1193,6 +1347,9 @@ def _is_bot_author(*names: str) -> bool:
         if not name:
             continue
         n = name.lower()
-        if n in skipped or n.endswith("[bot]") or "bot" in n.split("-"):
+        if n in skipped or n.endswith("[bot]"):
+            return True
+        if n == "bot" or n.endswith("-bot") or n.startswith("bot-"):
+            logger.info("Skipping bot author %r (matched affix heuristic)", name)
             return True
     return False

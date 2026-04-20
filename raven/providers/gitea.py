@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import logging
 import os
+from urllib.parse import quote
 
 import requests
 from flask import abort
@@ -320,7 +321,11 @@ class GiteaProvider(GitProvider):
     def fetch_file(self, repo_full_name: str, path: str, ref: str = "HEAD") -> str:
         """Return decoded file contents, or empty string if not found."""
         owner, repo = _split_repo(repo_full_name)
-        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/contents/{path}"
+        # Quote the path so names with '#', '?', ' ', or other URL-sensitive
+        # characters don't break routing or get mis-parsed as query strings.
+        # safe='/' preserves directory separators.
+        encoded_path = quote(path, safe="/")
+        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/contents/{encoded_path}"
         resp = self.session.get(url, params={"ref": ref}, timeout=15)
         if resp.status_code == 404:
             return ""

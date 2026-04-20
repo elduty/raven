@@ -137,7 +137,8 @@ All configuration is via environment variables. See `config.example.env` for the
 | `RAVEN_LABEL_NAME` | No | `raven-reviewed` | Label name added to reviewed PRs. |
 | `RAVEN_CACHE_DIR` | No | `/tmp/raven` | Directory for persistent findings cache. Use a Docker volume in production. |
 | `RAVEN_MAX_CACHED_PRS` | No | `200` | Max PR entries in the findings cache (LRU eviction). |
-| `RAVEN_MAX_WORKERS` | No | `16` | Thread pool size. Should exceed expected concurrent CI waits. |
+| `RAVEN_MAX_WORKERS` | No | `16` | Main review pool size (webhook dispatch, diff fetch, Claude CLI, review submission). |
+| `RAVEN_CI_WAIT_WORKERS` | No | `32` | Dedicated pool for the post-review CI-wait-and-merge phase. Sized larger than the main pool because these tasks spend nearly all their time sleeping. |
 | `RAVEN_MAX_CONCURRENT_CLAUDE` | No | `4` | Max concurrent Claude CLI subprocesses. Limits memory usage. |
 | `BITBUCKET_DC_URL` | BB DC | — | Bitbucket Data Center base URL. Enables BB DC provider when set with token + secret + username. |
 | `BITBUCKET_DC_TOKEN` | BB DC | — | BB DC personal access token (Repository Write + Pull Request Write). |
@@ -250,6 +251,7 @@ entrypoint.sh           Writes OAuth credentials, updates Claude CLI on start + 
 - **Cache invalidation**: findings cache wiped automatically on model or prompt change
 - **Error visibility**: unhandled exceptions post "internal error" comment and clear dedup entry
 - **Always 200**: all webhook responses return HTTP 200 to prevent retry loops
+- **Graceful shutdown**: on SIGTERM, queued reviews and CI-wait tasks are cancelled and in-flight Claude CLI subprocesses are SIGTERMed so gunicorn's graceful-shutdown window isn't consumed by discarded work
 
 ### Metrics
 
@@ -269,7 +271,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-327 tests across 6 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), both git providers, and the full PR flow including CI gating.
+367 tests across 6 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), Claude subprocess tracking and graceful-shutdown termination, both git providers, and the full PR flow including CI gating.
 
 ## CI
 
