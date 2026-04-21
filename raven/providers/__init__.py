@@ -33,6 +33,18 @@ class GitProvider(ABC):
         """Return comments as [{"user": {"login": str}, "body": str, "id": int}]."""
         ...
 
+    def get_pr_description(self, repo: str, pr_number: int) -> str:
+        """Return the PR's top-level description/body as plain text.
+
+        Used to feed author-supplied intent (design notes, "intentionally
+        skipping X because Y", referenced tickets) into the review prompt
+        so the model has the same context a human reviewer would. Default
+        returns an empty string — providers should override. Best-effort:
+        any API failure should return ``""`` rather than raise, since
+        review must proceed without it.
+        """
+        return ""
+
     @abstractmethod
     def get_comment_thread_authors(self, repo: str, pr_number: int,
                                    comment_id: int) -> list[str]:

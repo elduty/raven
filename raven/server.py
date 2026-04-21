@@ -523,9 +523,41 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # Fetch full file contents for all PR files (cross-file context even on incremental)
         file_contents = _fetch_changed_files(provider, repo_full_name, head_sha, clean_diff)
 
+        # Fetch PR description + recent comments so author intent and
+        # prior-reviewer context reach the prompt. Best-effort: any API
+        # failure degrades to empty context rather than blocking the review.
+        pr_description = ""
+        try:
+            pr_description = provider.get_pr_description(repo_full_name, pr_number)
+        except Exception as e:
+            logger.warning("Failed to fetch PR #%d description: %s", pr_number, e)
+
+        pr_comments: list[dict] = []
+        try:
+            pr_comments = provider.get_pr_comments(repo_full_name, pr_number)
+        except Exception as e:
+            logger.warning("Failed to fetch PR #%d comments: %s", pr_number, e)
+
+        # Resolve the bot's own login so the prompt-context filter can
+        # strip Raven's prior review comments (otherwise they re-enter
+        # the prompt as if they were new developer context). The login
+        # is deployment-specific (not always "raven"), so we ask the
+        # provider. get_authenticated_user() is cached — calling it
+        # here and again later for the sole-reviewer check is free.
+        bot_user = ""
+        try:
+            bot_user = provider.get_authenticated_user()
+        except Exception as e:
+            logger.warning("Failed to resolve bot user for PR #%d context filter: %s", pr_number, e)
+
         # Run review
         with Timer("raven_review_duration_seconds", {"repo": repo_full_name}):
-            review = review_diff(review_diff_text, repo_full_name, claude_md=claude_md, file_contents=file_contents)
+            review = review_diff(
+                review_diff_text, repo_full_name,
+                claude_md=claude_md, file_contents=file_contents,
+                pr_title=pr_title, pr_description=pr_description,
+                pr_comments=pr_comments, bot_user=bot_user,
+            )
         # Save original findings before merging carried ones (used for cache write)
         fresh_findings = list(review.get("findings", []))
         # Merge carried findings from unchanged files into the review

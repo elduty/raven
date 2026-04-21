@@ -97,6 +97,31 @@ class TestFetchPrDiff:
                 client.fetch_pr_diff("owner/repo", 7)
 
 
+class TestGetPrDescription:
+    def test_returns_body(self, client):
+        with _mock_get(client, json_data={"body": "Fixes #123\n\nApproach: ..."}):
+            assert client.get_pr_description("owner/repo", 7) == "Fixes #123\n\nApproach: ..."
+
+    def test_empty_body_returns_empty_string(self, client):
+        with _mock_get(client, json_data={"body": ""}):
+            assert client.get_pr_description("owner/repo", 7) == ""
+
+    def test_null_body_returns_empty_string(self, client):
+        """Gitea returns `null` (JSON) for PRs with no description, which
+        json.loads maps to Python None. The provider must return "" not
+        None so the caller can treat the result as a plain string."""
+        with _mock_get(client, json_data={"body": None}):
+            assert client.get_pr_description("owner/repo", 7) == ""
+
+    def test_http_error_returns_empty_string(self, client):
+        """Review must not block on an API hiccup. The reviewer degrades
+        gracefully to an empty PR-context section."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = requests.HTTPError("500")
+        with patch.object(client.session, "get", return_value=mock_resp):
+            assert client.get_pr_description("owner/repo", 7) == ""
+
+
 # ------------------------------------------------------------------ #
 #  PR comment posting                                                 #
 # ------------------------------------------------------------------ #

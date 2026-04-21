@@ -679,6 +679,27 @@ class TestGetPrHeadSha:
                 client.get_pr_head_sha("PROJ/repo", 7)
 
 
+class TestGetPrDescription:
+    def test_returns_description(self, client):
+        with _mock_get(client, json_data={"description": "Fixes DEV-123\n\nApproach: ..."}):
+            assert client.get_pr_description("PROJ/repo", 7) == "Fixes DEV-123\n\nApproach: ..."
+
+    def test_missing_description_returns_empty_string(self, client):
+        with _mock_get(client, json_data={}):
+            assert client.get_pr_description("PROJ/repo", 7) == ""
+
+    def test_null_description_returns_empty_string(self, client):
+        with _mock_get(client, json_data={"description": None}):
+            assert client.get_pr_description("PROJ/repo", 7) == ""
+
+    def test_http_error_returns_empty_string(self, client):
+        import requests
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = requests.HTTPError("500")
+        with patch.object(client.session, "get", return_value=mock_resp):
+            assert client.get_pr_description("PROJ/repo", 7) == ""
+
+
 # ------------------------------------------------------------------ #
 #  _json_diff_to_unified                                              #
 # ------------------------------------------------------------------ #

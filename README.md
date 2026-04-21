@@ -131,7 +131,10 @@ All configuration is via environment variables. See `config.example.env` for the
 | `CLAUDE_EFFORT` | No | `max` | Thinking effort on PR reviews (`low`, `medium`, `high`, `max`). |
 | `CLAUDE_EFFORT_COMMENT` | No | `medium` | Thinking effort on comment replies. Q&A rarely needs max. |
 | `CLAUDE_TIMEOUT` | No | `600` | Timeout in seconds for each Claude CLI invocation. |
-| `RAVEN_COMMENT_HISTORY` | No | `20` | Recent comments passed to Claude as conversation context. |
+| `RAVEN_COMMENT_HISTORY` | No | `20` | Recent comments passed to Claude as conversation context (for @mention replies). |
+| `RAVEN_REVIEW_COMMENT_CONTEXT` | No | `20` | Max non-bot PR comments included in the review prompt's "PR Conversation" section. `0` disables the subsection. |
+| `RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS` | No | `4000` | Per-item character cap applied to PR title, description, and each comment body before they're concatenated into the review prompt. Approximate — a truncation marker of ~30-40 chars is appended after the prefix. `0` disables truncation (keep full text). |
+| `RAVEN_REVIEW_PR_CONTEXT_TOTAL_CHARS` | No | `16000` | Global budget across the whole PR Context block (title + description + all included comments). Prevents discussion from dwarfing a small diff in the prompt. Comments are added newest-first until the budget is hit. `0` disables the global cap (per-item caps still apply). |
 | `RAVEN_GITEA_AUTO_MERGE` | No | `false` | Gitea-only. Queue the merge and let Gitea wait for CI. BB DC has no equivalent REST flag; its CI enforcement lives in repo-level merge checks, so this setting does nothing on BB DC. Default behaviour (poll CI, then merge) works on every provider. |
 | `RAVEN_AUTO_MERGE_ON_APPROVAL` | No | `false` | Auto-merge when a human approves a PR Raven already approved. |
 | `RAVEN_LABEL_NAME` | No | `raven-reviewed` | Label name added to reviewed PRs. |
@@ -271,7 +274,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-367 tests across 6 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), Claude subprocess tracking and graceful-shutdown termination, both git providers, and the full PR flow including CI gating.
+395 tests across 6 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, both git providers, and the full PR flow including CI gating.
 
 ## CI
 

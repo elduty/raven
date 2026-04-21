@@ -98,6 +98,18 @@ class BitbucketDCProvider(GitProvider):
             raise RuntimeError(f"Bitbucket DC returned empty head SHA for PR #{pr_number}")
         return sha
 
+    def get_pr_description(self, repo_full_name: str, pr_number: int) -> str:
+        """Return the PR description, or "" on any failure."""
+        project, repo = _split_repo(repo_full_name)
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}"
+        try:
+            resp = self.session.get(url, timeout=10)
+            resp.raise_for_status()
+            return resp.json().get("description", "") or ""
+        except Exception as e:
+            logger.warning("Failed to fetch PR #%d description: %s", pr_number, e)
+            return ""
+
     # ------------------------------------------------------------------ #
     #  Diff & file content                                                #
     # ------------------------------------------------------------------ #

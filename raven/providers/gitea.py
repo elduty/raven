@@ -94,6 +94,18 @@ class GiteaProvider(GitProvider):
             raise RuntimeError(f"Gitea returned empty diff for PR #{pr_number}")
         return resp.text
 
+    def get_pr_description(self, repo_full_name: str, pr_number: int) -> str:
+        """Return the PR body (description) as plain text, or "" on any failure."""
+        owner, repo = _split_repo(repo_full_name)
+        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}"
+        try:
+            resp = self.session.get(url, timeout=10)
+            resp.raise_for_status()
+            return resp.json().get("body", "") or ""
+        except Exception as e:
+            logger.warning("Failed to fetch PR #%d description: %s", pr_number, e)
+            return ""
+
     # ------------------------------------------------------------------ #
     #  Comment posting                                                     #
     # ------------------------------------------------------------------ #

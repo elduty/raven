@@ -50,6 +50,10 @@ services:
       - CLAUDE_TIMEOUT=${CLAUDE_TIMEOUT:-600}
       # ── Comment replies (default must match raven/server.py)
       - RAVEN_COMMENT_HISTORY=${RAVEN_COMMENT_HISTORY:-20}
+      # ── Review PR-conversation context (defaults must match raven/reviewer.py)
+      - RAVEN_REVIEW_COMMENT_CONTEXT=${RAVEN_REVIEW_COMMENT_CONTEXT:-20}
+      - RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS=${RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS:-4000}
+      - RAVEN_REVIEW_PR_CONTEXT_TOTAL_CHARS=${RAVEN_REVIEW_PR_CONTEXT_TOTAL_CHARS:-16000}
       # ── Raven internals (defaults must match raven/server.py + raven/providers/gitea.py)
       - RAVEN_LABEL_NAME=${RAVEN_LABEL_NAME:-raven-reviewed}
       - RAVEN_MAX_WORKERS=${RAVEN_MAX_WORKERS:-16}

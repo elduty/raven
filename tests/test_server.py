@@ -273,6 +273,101 @@ class TestProcessPr:
         mc.get_pr_requested_reviewers.return_value = []
         mc.get_pr_head_sha.return_value = "abc123"
 
+    def test_pr_description_and_comments_passed_to_review_diff(self):
+        """Author intent (PR body) and prior-reviewer context (comments)
+        reach review_diff so the model can see constraints like
+        "intentionally skipping X because Y". Bot login is resolved from
+        the provider and forwarded so review_diff can filter the bot's
+        own prior comments out of the prompt context."""
+        mc = self._make_provider()
+        mc.get_pr_description.return_value = "Fixes DEV-123. Intentionally skipping migration — handled in follow-up PR."
+        mc.get_pr_comments.return_value = [
+            {"user": {"login": "alice"}, "body": "Should this be behind a feature flag?"},
+        ]
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.merge_pr.return_value = True
+            mc.get_commit_status.return_value = "success"
+            self._setup_raven_only(mc)
+            mc.get_authenticated_user.return_value = "raven-bot"
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        kwargs = mock_review.call_args.kwargs
+        assert kwargs["pr_description"] == (
+            "Fixes DEV-123. Intentionally skipping migration — handled in follow-up PR."
+        )
+        assert kwargs["pr_comments"] == [
+            {"user": {"login": "alice"}, "body": "Should this be behind a feature flag?"},
+        ]
+        assert kwargs["pr_title"] == "PR #42"
+        assert kwargs["bot_user"] == "raven-bot"
+
+    def test_bot_user_resolve_failure_degrades_to_empty_filter(self):
+        """If get_authenticated_user blows up, we still want to review —
+        just with no bot-comment filter. Review must proceed."""
+        mc = self._make_provider()
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.get_authenticated_user.side_effect = [
+            Exception("500"),  # first call (context-filter resolve) fails
+            "raven-bot",       # subsequent calls succeed (e.g. sole-reviewer check)
+        ]
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.merge_pr.return_value = True
+            mc.get_commit_status.return_value = "success"
+            mc.get_pr_reviews.return_value = [{"user": {"login": "raven-bot"}, "state": "APPROVED"}]
+            mc.get_pr_requested_reviewers.return_value = []
+            mc.get_pr_head_sha.return_value = "abc123"
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        kwargs = mock_review.call_args.kwargs
+        assert kwargs["bot_user"] == ""
+        mock_review.assert_called_once()
+
+    def test_pr_context_fetch_failure_does_not_block_review(self):
+        """Description/comment fetch is best-effort — a provider API
+        hiccup must not abort the review. Reviewer gets empty context."""
+        mc = self._make_provider()
+        mc.get_pr_description.side_effect = Exception("500")
+        mc.get_pr_comments.side_effect = Exception("500")
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.merge_pr.return_value = True
+            mc.get_commit_status.return_value = "success"
+            self._setup_raven_only(mc)
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        kwargs = mock_review.call_args.kwargs
+        assert kwargs["pr_description"] == ""
+        assert kwargs["pr_comments"] == []
+        # Review still ran
+        mock_review.assert_called_once()
+
     def test_low_severity_merged_when_ci_passes(self):
         mc = self._make_provider()
         with (
