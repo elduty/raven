@@ -600,6 +600,90 @@ class TestFetchFile:
         assert "docs/issue%20%2342.md" in url
 
 
+class TestListDirectory:
+    def test_returns_file_paths(self, client):
+        data = {
+            "type": "DIRECTORY",
+            "children": {
+                "values": [
+                    {"type": "FILE", "path": {"toString": "security.md"}},
+                    {"type": "FILE", "path": {"toString": "style.md"}},
+                    {"type": "DIRECTORY", "path": {"toString": "nested"}},
+                ],
+                "isLastPage": True,
+            },
+        }
+        with _mock_get(client, json_data=data):
+            result = client.list_directory("PROJ/repo", ".claude/rules", ref="abc")
+        # Only FILE entries, with full repo-rooted paths
+        assert result == [".claude/rules/security.md", ".claude/rules/style.md"]
+
+    def test_missing_directory_returns_empty(self, client):
+        with _mock_get(client, status=404):
+            assert client.list_directory("PROJ/repo", ".claude/rules") == []
+
+    def test_http_error_returns_empty(self, client):
+        import requests
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = requests.HTTPError("500")
+        with patch.object(client.session, "get", return_value=mock_resp):
+            assert client.list_directory("PROJ/repo", ".claude/rules") == []
+
+    def test_passes_ref_to_api(self, client):
+        with _mock_get(client, json_data={"children": {"values": [], "isLastPage": True}}) as mock_get:
+            client.list_directory("PROJ/repo", ".claude/rules", ref="feature-sha")
+        assert mock_get.call_args[1]["params"]["at"] == "feature-sha"
+
+    def test_rejects_suspicious_child_names(self, client):
+        """BB DC's contract for a directory listing is that each child's
+        path component is just the filename. If a response includes a
+        ``/``, ``\\``, ``.``, or ``..`` in the child name (hostile or
+        upstream bug), drop it rather than stitch it into a weird path
+        that flows into fetch_file."""
+        data = {
+            "type": "DIRECTORY",
+            "children": {
+                "values": [
+                    {"type": "FILE", "path": {"toString": "good.md"}},
+                    {"type": "FILE", "path": {"toString": "../../etc/passwd"}},
+                    {"type": "FILE", "path": {"toString": "nested/escaped.md"}},
+                    {"type": "FILE", "path": {"toString": "."}},
+                    {"type": "FILE", "path": {"toString": ".."}},
+                ],
+                "isLastPage": True,
+            },
+        }
+        with _mock_get(client, json_data=data):
+            result = client.list_directory("PROJ/repo", ".claude/rules")
+        assert result == [".claude/rules/good.md"]
+
+    def test_pagination(self, client):
+        """BB DC paginates via isLastPage / nextPageStart — walk pages
+        until isLastPage is True."""
+        page1 = {
+            "children": {
+                "values": [{"type": "FILE", "path": {"toString": "a.md"}}],
+                "isLastPage": False,
+                "nextPageStart": 1,
+            }
+        }
+        page2 = {
+            "children": {
+                "values": [{"type": "FILE", "path": {"toString": "b.md"}}],
+                "isLastPage": True,
+            }
+        }
+        resp1 = MagicMock(status_code=200, headers={})
+        resp1.json.return_value = page1
+        resp1.raise_for_status = MagicMock()
+        resp2 = MagicMock(status_code=200, headers={})
+        resp2.json.return_value = page2
+        resp2.raise_for_status = MagicMock()
+        with patch.object(client.session, "get", side_effect=[resp1, resp2]):
+            result = client.list_directory("PROJ/repo", ".claude/rules")
+        assert result == [".claude/rules/a.md", ".claude/rules/b.md"]
+
+
 # ------------------------------------------------------------------ #
 #  Post comment                                                       #
 # ------------------------------------------------------------------ #

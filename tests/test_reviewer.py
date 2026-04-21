@@ -604,6 +604,102 @@ class TestActiveProcessTracking:
         assert count == 2
         live.terminate.assert_called_once()
 
+    def test_build_rules_empty_returns_empty_string(self):
+        """Nothing to inject → no section header either."""
+        from raven.reviewer import _build_rules_section
+        assert _build_rules_section(None, "deadbeef") == ""
+        assert _build_rules_section({}, "deadbeef") == ""
+
+    def test_build_rules_renders_each_file_wrapped(self):
+        from raven.reviewer import _build_rules_section
+        rules = {
+            ".claude/rules/security.md": "Always parameterize SQL.",
+            ".claude/rules/style.md": "Use PEP 8.",
+        }
+        section = _build_rules_section(rules, "cafef00d")
+        assert "Repository Rules" in section
+        assert ".claude/rules/security.md" in section
+        assert ".claude/rules/style.md" in section
+        assert "Always parameterize SQL." in section
+        # Every rule file wrapped in the randomised untrusted-input tag
+        assert '<untrusted_input_cafef00d type="repo_file">' in section
+
+    def test_build_rules_truncates_oversized_file(self):
+        """A single huge rule file mustn't blow past the per-item cap."""
+        import raven.reviewer as rev
+        original = rev.REVIEW_PR_CONTEXT_ITEM_CHARS
+        rev.REVIEW_PR_CONTEXT_ITEM_CHARS = 50
+        try:
+            rules = {".claude/rules/big.md": "x" * 200}
+            section = rev._build_rules_section(rules, "cafef00d")
+        finally:
+            rev.REVIEW_PR_CONTEXT_ITEM_CHARS = original
+        assert "x" * 50 in section
+        assert "x" * 200 not in section
+        assert "truncated" in section
+
+    def test_build_rules_respects_global_budget(self):
+        """Total cap across all rule files; later files dropped when
+        budget exhausted."""
+        import raven.reviewer as rev
+        original_total = rev.REVIEW_RULES_TOTAL_CHARS
+        original_item = rev.REVIEW_PR_CONTEXT_ITEM_CHARS
+        rev.REVIEW_RULES_TOTAL_CHARS = 200
+        rev.REVIEW_PR_CONTEXT_ITEM_CHARS = 10_000
+        try:
+            rules = {
+                ".claude/rules/a.md": "A" * 150,  # fits
+                ".claude/rules/b.md": "B" * 100,  # chopped to fit budget
+                ".claude/rules/c.md": "C" * 100,  # dropped entirely
+            }
+            section = rev._build_rules_section(rules, "cafef00d")
+        finally:
+            rev.REVIEW_RULES_TOTAL_CHARS = original_total
+            rev.REVIEW_PR_CONTEXT_ITEM_CHARS = original_item
+        assert "A" * 150 in section
+        assert ".claude/rules/a.md" in section
+        # b.md present with some of its content + marker
+        assert ".claude/rules/b.md" in section
+        assert "truncated at global cap" in section
+        # c.md dropped — budget was exhausted
+        assert ".claude/rules/c.md" not in section
+        assert "C" * 100 not in section
+
+    def test_build_rules_zero_total_disables_global_cap(self):
+        """Symmetric with REVIEW_PR_CONTEXT_TOTAL_CHARS=0: zero means
+        "no global cap" (per-file cap still applies)."""
+        import raven.reviewer as rev
+        original = rev.REVIEW_RULES_TOTAL_CHARS
+        rev.REVIEW_RULES_TOTAL_CHARS = 0
+        try:
+            rules = {f".claude/rules/{n}.md": f"content-{n}" for n in range(5)}
+            section = rev._build_rules_section(rules, "cafef00d")
+        finally:
+            rev.REVIEW_RULES_TOTAL_CHARS = original
+        for n in range(5):
+            assert f"content-{n}" in section
+
+    def test_review_diff_forwards_rules_to_prompt(self):
+        """End-to-end: rules reach the CLI prompt payload."""
+        import raven.reviewer as rev
+        review_json = json.dumps({"severity": "low", "summary": "ok", "findings": []})
+
+        fake_proc = MagicMock()
+        fake_proc.__enter__.return_value = fake_proc
+        fake_proc.__exit__.return_value = None
+        fake_proc.returncode = 0
+        fake_proc.communicate.return_value = (review_json, "")
+
+        with patch("raven.reviewer.subprocess.Popen", return_value=fake_proc):
+            rev.review_diff(
+                "diff --git a/x.py b/x.py\n+line\n", "owner/repo",
+                rules={".claude/rules/security.md": "UNIQUE-RULE-MARKER"},
+            )
+
+        prompt = fake_proc.communicate.call_args[1]["input"]
+        assert "Repository Rules" in prompt
+        assert "UNIQUE-RULE-MARKER" in prompt
+
     def test_build_pr_context_empty_returns_empty_string(self):
         """Nothing to say → no section header either. Keeps the prompt
         lean on PRs that open without a description and no comments."""

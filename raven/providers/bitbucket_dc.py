@@ -198,6 +198,68 @@ class BitbucketDCProvider(GitProvider):
         # undercount by one on the last line.
         return "\n".join(all_lines) + "\n"
 
+    def list_directory(self, repo_full_name: str, path: str, ref: str = "HEAD") -> list[str]:
+        """List regular files directly under ``path`` at ``ref`` (flat).
+
+        BB DC's ``/browse`` endpoint serves both files and directories:
+        ``{type: "DIRECTORY", children: {values: [{type, path: {...}}]}}``
+        for a directory hit, ``{type: "FILE", lines: [...]}`` for a file
+        hit. We page through ``children`` and return full paths for
+        entries whose ``type == "FILE"``.
+
+        Missing directories (404) and any other transport error return
+        [] so the review flow degrades gracefully rather than blocks.
+        """
+        project, repo = _split_repo(repo_full_name)
+        encoded_path = quote(path, safe="/")
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/browse/{encoded_path}"
+        files: list[str] = []
+        start = 0
+        max_pages = 10
+        try:
+            for _ in range(max_pages):
+                resp = self.session.get(url, params={"at": ref, "start": start, "limit": 500}, timeout=15)
+                if resp.status_code == 404:
+                    return []
+                resp.raise_for_status()
+                data = resp.json()
+                children = data.get("children") or {}
+                values = children.get("values") or []
+                for entry in values:
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("type") != "FILE":
+                        continue
+                    # BB DC returns the child name in path.toString or
+                    # path.components[-1]; prepend the parent path so the
+                    # return value is repo-rooted like Gitea's.
+                    entry_path = (entry.get("path") or {}).get("toString")
+                    if not entry_path:
+                        components = (entry.get("path") or {}).get("components") or []
+                        entry_path = components[-1] if components else None
+                    if not entry_path or not isinstance(entry_path, str):
+                        continue
+                    # BB DC's contract for a directory listing is that
+                    # each child's path component is just the filename,
+                    # not a nested/escaping path. Enforce it explicitly
+                    # — rejects both hostile responses and surprising
+                    # upstream API changes. Matches Gitea's "direct
+                    # children only" guard.
+                    if "/" in entry_path or "\\" in entry_path or entry_path in (".", ".."):
+                        logger.warning(
+                            "BB DC list_directory returned suspicious child name: %r — skipping",
+                            entry_path,
+                        )
+                        continue
+                    files.append(f"{path.rstrip('/')}/{entry_path}")
+                if children.get("isLastPage", True):
+                    break
+                start = children.get("nextPageStart", start + 500)
+        except Exception as e:
+            logger.warning("Failed to list %s@%s: %s", path, ref, e)
+            return []
+        return files
+
     # ------------------------------------------------------------------ #
     #  Comments                                                           #
     # ------------------------------------------------------------------ #

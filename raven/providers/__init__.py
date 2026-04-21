@@ -28,6 +28,23 @@ class GitProvider(ABC):
     @abstractmethod
     def fetch_file(self, repo: str, path: str, ref: str = "HEAD") -> str: ...
 
+    def list_directory(self, repo: str, path: str, ref: str = "HEAD") -> list[str]:
+        """List file paths directly under ``path`` at ``ref`` (flat, not
+        recursive). Used by the review flow to discover repo-supplied
+        rule files under ``.claude/rules/``.
+
+        Returned entries are relative to the repo root (e.g.
+        ``.claude/rules/security.md``). Only regular files are included;
+        subdirectories are skipped since rule loading is flat.
+
+        Default returns ``[]`` — providers that don't implement it
+        simply disable the rules feature gracefully. Real implementations
+        must be tolerant: any API failure (404, auth, transport) should
+        return ``[]`` rather than raise, since a missing directory is
+        the common case and must not block the review.
+        """
+        return []
+
     @abstractmethod
     def get_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
         """Return comments as [{"user": {"login": str}, "body": str, "id": int}]."""

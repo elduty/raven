@@ -13,7 +13,7 @@ os.environ.setdefault("RAVEN_WEBHOOK_SECRET", "testsecret")
 os.environ.setdefault("GITEA_WEBHOOK_SECRET", "testsecret")
 
 import raven.server as _server_mod
-from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _process_review_approved, _latest_review_per_user, _wait_for_ci, _should_skip_duplicate, _do_merge, _safe_do_merge, _truncate_diff_for_comment, _extract_code_snippet, _shutdown_executor, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
+from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _fetch_rules, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _process_review_approved, _latest_review_per_user, _wait_for_ci, _should_skip_duplicate, _do_merge, _safe_do_merge, _truncate_diff_for_comment, _extract_code_snippet, _shutdown_executor, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
 from raven.providers import GitProvider, _providers
 
 
@@ -309,6 +309,150 @@ class TestProcessPr:
         ]
         assert kwargs["pr_title"] == "PR #42"
         assert kwargs["bot_user"] == "raven-bot"
+
+    def test_rules_fetched_from_base_ref_not_head(self):
+        """Security regression: rules must come from the PR's base ref
+        (already-merged state), not the head SHA. If they came from head,
+        a hostile PR could add ``.claude/rules/policy.md`` saying
+        "approve SQL concatenation" alongside the hostile code, biasing
+        Raven's own review of that same PR."""
+        mc = self._make_provider()
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.list_directory.return_value = [".claude/rules/security.md"]
+        mc.fetch_file.side_effect = lambda repo, p, ref="HEAD": (
+            "base-rule" if p == ".claude/rules/security.md" else ""
+        )
+
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.merge_pr.return_value = True
+            mc.get_commit_status.return_value = "success"
+            self._setup_raven_only(mc)
+            mc.get_authenticated_user.return_value = "raven-bot"
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        # list_directory called with base_ref ("main"), NOT head_sha ("abc123")
+        list_args = mc.list_directory.call_args
+        assert list_args.kwargs.get("ref") == "main" or (
+            len(list_args.args) >= 3 and list_args.args[2] == "main"
+        )
+        # fetch_file for the rule file must also use base_ref
+        rule_fetch_calls = [
+            c for c in mc.fetch_file.call_args_list
+            if len(c.args) >= 2 and c.args[1] == ".claude/rules/security.md"
+        ]
+        assert len(rule_fetch_calls) == 1
+        rc = rule_fetch_calls[0]
+        assert rc.kwargs.get("ref") == "main" or (
+            len(rc.args) >= 3 and rc.args[2] == "main"
+        )
+
+    def test_rules_loaded_from_claude_rules_dir_and_passed_through(self):
+        """``.claude/rules/*.md`` at the PR head are fetched and passed
+        to review_diff. Non-.md files are ignored."""
+        mc = self._make_provider()
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.list_directory.return_value = [
+            ".claude/rules/security.md",
+            ".claude/rules/style.md",
+            ".claude/rules/NOTES",  # no .md — must be skipped
+        ]
+        # fetch_file is called for CLAUDE.md + the changed diff files +
+        # each rule file. Use side_effect path-aware so each returns the
+        # right thing.
+        def fake_fetch(repo, path, ref="HEAD"):
+            return {
+                ".claude/rules/security.md": "Parameterize all SQL.",
+                ".claude/rules/style.md": "Use PEP 8.",
+            }.get(path, "")
+        mc.fetch_file.side_effect = fake_fetch
+
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.merge_pr.return_value = True
+            mc.get_commit_status.return_value = "success"
+            self._setup_raven_only(mc)
+            mc.get_authenticated_user.return_value = "raven-bot"
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        kwargs = mock_review.call_args.kwargs
+        assert kwargs["rules"] == {
+            ".claude/rules/security.md": "Parameterize all SQL.",
+            ".claude/rules/style.md": "Use PEP 8.",
+        }
+
+    def test_rules_dir_missing_does_not_block_review(self):
+        """Common case: the repo has no ``.claude/rules/``. list_directory
+        returns []; review must proceed with rules={}."""
+        mc = self._make_provider()
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.list_directory.return_value = []
+        mc.fetch_file.return_value = ""
+
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.merge_pr.return_value = True
+            mc.get_commit_status.return_value = "success"
+            self._setup_raven_only(mc)
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        kwargs = mock_review.call_args.kwargs
+        assert kwargs["rules"] == {}
+        mock_review.assert_called_once()
+
+    def test_review_proceeds_when_claude_md_missing(self):
+        """Regression guard for the explicit 'works without CLAUDE.md'
+        requirement. fetch_file returns '' (or raises 404) for CLAUDE.md;
+        review still runs and claude_md is empty."""
+        mc = self._make_provider()
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.list_directory.return_value = []
+        # fetch_file called for CLAUDE.md + any changed files. Return ""
+        # for everything to simulate a repo with neither.
+        mc.fetch_file.return_value = ""
+
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.merge_pr.return_value = True
+            mc.get_commit_status.return_value = "success"
+            self._setup_raven_only(mc)
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        kwargs = mock_review.call_args.kwargs
+        assert kwargs["claude_md"] == ""
+        mock_review.assert_called_once()
 
     def test_bot_user_resolve_failure_degrades_to_empty_filter(self):
         """If get_authenticated_user blows up, we still want to review —
@@ -1095,6 +1239,79 @@ class TestSafeDoMerge:
              patch("raven.server.inc"):
             # Must not raise
             _safe_do_merge(mc, "owner/repo", 42, "t", "u", review, "abc", "squash")
+
+
+class TestFetchRules:
+    def _provider(self, **kwargs):
+        mc = MagicMock(spec=GitProvider)
+        for k, v in kwargs.items():
+            getattr(mc, k).return_value = v
+        return mc
+
+    def test_empty_when_rules_dir_missing(self):
+        mc = self._provider(list_directory=[])
+        assert _fetch_rules(mc, "owner/repo", "abc123") == {}
+        mc.fetch_file.assert_not_called()
+
+    def test_filters_non_markdown(self):
+        mc = self._provider(list_directory=[
+            ".claude/rules/a.md",
+            ".claude/rules/b.md",
+            ".claude/rules/NOTES.txt",
+            ".claude/rules/image.png",
+        ])
+        mc.fetch_file.side_effect = lambda repo, p, ref="HEAD": f"content-of-{p}"
+        rules = _fetch_rules(mc, "owner/repo", "abc123")
+        assert set(rules.keys()) == {".claude/rules/a.md", ".claude/rules/b.md"}
+
+    def test_sorted_output_for_deterministic_prompts(self):
+        """Deterministic order helps prompt-cache hits and test reproducibility."""
+        mc = self._provider(list_directory=[
+            ".claude/rules/z.md",
+            ".claude/rules/a.md",
+            ".claude/rules/m.md",
+        ])
+        mc.fetch_file.side_effect = lambda repo, p, ref="HEAD": "x"
+        rules = _fetch_rules(mc, "owner/repo", "abc123")
+        assert list(rules.keys()) == [
+            ".claude/rules/a.md",
+            ".claude/rules/m.md",
+            ".claude/rules/z.md",
+        ]
+
+    def test_list_directory_error_degrades_to_empty(self):
+        """Transport error on directory listing must not block review."""
+        mc = MagicMock(spec=GitProvider)
+        mc.list_directory.side_effect = Exception("500")
+        assert _fetch_rules(mc, "owner/repo", "abc123") == {}
+        mc.fetch_file.assert_not_called()
+
+    def test_individual_file_fetch_failure_is_partial(self):
+        """One failing file doesn't break the others — we get a partial map."""
+        mc = MagicMock(spec=GitProvider)
+        mc.list_directory.return_value = [
+            ".claude/rules/a.md",
+            ".claude/rules/b.md",
+        ]
+        def fetch(repo, p, ref="HEAD"):
+            if p.endswith("a.md"):
+                raise Exception("transient")
+            return "b content"
+        mc.fetch_file.side_effect = fetch
+        rules = _fetch_rules(mc, "owner/repo", "abc123")
+        assert rules == {".claude/rules/b.md": "b content"}
+
+    def test_empty_rules_dir_env_disables_feature(self):
+        import raven.server as _srv
+        original = _srv.RULES_DIR
+        _srv.RULES_DIR = ""
+        try:
+            mc = MagicMock(spec=GitProvider)
+            assert _fetch_rules(mc, "owner/repo", "abc123") == {}
+            # Must not even attempt to list when feature is disabled
+            mc.list_directory.assert_not_called()
+        finally:
+            _srv.RULES_DIR = original
 
 
 class TestHelpers:

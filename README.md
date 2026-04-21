@@ -30,7 +30,12 @@ push to branch
           -> severity high/medium -> Slack/webhook alert, PR stays open
 ```
 
-Reviews typically complete in 10-30 seconds. Diffs up to 3000 lines are reviewed as a single full-context pass; larger diffs are split by file and reviewed chunk-by-chunk. Repos with a `CLAUDE.md` get richer reviews — the file contents are passed as context to the model.
+Reviews typically complete in 10-30 seconds. Diffs up to 3000 lines are reviewed as a single full-context pass; larger diffs are split by file and reviewed chunk-by-chunk. Repos can tune reviews via two optional inputs:
+
+- **`CLAUDE.md`** at the repo root — free-form project guidance. Injected as "Repository Context".
+- **`.claude/rules/*.md`** — one file per rule category (e.g. `security.md`, `style.md`, `testing.md`). Injected as "Repository Rules" and the model is instructed to apply them as review criteria. Flat directory, `.md` only. **Fetched from the PR's base branch** (already-merged state) so a PR can't add or modify rules to bias its own review — new rules only take effect after they've been merged through a review of their own.
+
+Both are optional and independent; missing files are skipped silently.
 
 Pushing new commits to a PR branch triggers an incremental re-review (only changed files). Findings from unchanged files are carried forward and included in the consolidated verdict. Clicking "re-request review" or adding Raven as a reviewer also triggers a fresh review.
 
@@ -72,7 +77,9 @@ docker compose up -d
    - Name: `raven-reviewed`
    - Color: `#7B68EE` (purple)
 
-4. **Optional**: Add a `CLAUDE.md` to any repo to give Raven codebase context.
+4. **Optional**: Add a `CLAUDE.md` at the repo root for project-wide guidance, and/or `.claude/rules/*.md` files for focused review criteria.
+   - `CLAUDE.md` is read from the **PR head** — documentation changes land atomically with the code they describe.
+   - `.claude/rules/*.md` are read from the **PR base branch** (already-merged state) so a PR can't add or modify its own review criteria. New or updated rules only take effect after they've been merged.
 
 ### Bitbucket Data Center setup
 
@@ -119,7 +126,8 @@ All configuration is via environment variables. See `config.example.env` for the
 | `RAVEN_WEBHOOK_SECRET` | — | — | Deprecated alias for `GITEA_WEBHOOK_SECRET`. Still works for backward compat. |
 | `GITEA_URL` | Gitea | — | Base URL of the Gitea instance. |
 | `GITEA_TOKEN` | Gitea | — | Gitea personal access token. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Yes | — | Claude Code OAuth token (JSON blob from `claude setup-token`). |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Yes | — | Claude Code OAuth token (JSON blob from `claude setup-token`, or a bare access token). |
+| `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` | No | — | Only needed if `CLAUDE_CODE_OAUTH_TOKEN` is a bare token string (not a JSON blob). Enables automatic token refresh. |
 | `NOTIFY_CHANNELS` | No | — | JSON array of notification channels (see below). |
 | `REVIEW_APPROVE_MAX_SEVERITY` | No | `low` | Approve PRs at or below this severity (`low`, `medium`, `high`). |
 | `MERGE_STRATEGY` | No | `squash` | Merge method (`squash`, `merge`, `rebase`). |
@@ -135,6 +143,8 @@ All configuration is via environment variables. See `config.example.env` for the
 | `RAVEN_REVIEW_COMMENT_CONTEXT` | No | `20` | Max non-bot PR comments included in the review prompt's "PR Conversation" section. `0` disables the subsection. |
 | `RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS` | No | `4000` | Per-item character cap applied to PR title, description, and each comment body before they're concatenated into the review prompt. Approximate — a truncation marker of ~30-40 chars is appended after the prefix. `0` disables truncation (keep full text). |
 | `RAVEN_REVIEW_PR_CONTEXT_TOTAL_CHARS` | No | `16000` | Global budget across the whole PR Context block (title + description + all included comments). Prevents discussion from dwarfing a small diff in the prompt. Comments are added newest-first until the budget is hit. `0` disables the global cap (per-item caps still apply). |
+| `RAVEN_RULES_DIR` | No | `.claude/rules` | Repository directory whose `*.md` files are injected into every review prompt as "Repository Rules" context. Flat listing — subdirectories are ignored. Set to empty string to disable the feature. |
+| `RAVEN_REVIEW_RULES_TOTAL_CHARS` | No | `16000` | Global budget across all rule files concatenated into the prompt. Per-file truncation uses `RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS`. `0` disables the global cap. |
 | `RAVEN_GITEA_AUTO_MERGE` | No | `false` | Gitea-only. Queue the merge and let Gitea wait for CI. BB DC has no equivalent REST flag; its CI enforcement lives in repo-level merge checks, so this setting does nothing on BB DC. Default behaviour (poll CI, then merge) works on every provider. |
 | `RAVEN_AUTO_MERGE_ON_APPROVAL` | No | `false` | Auto-merge when a human approves a PR Raven already approved. |
 | `RAVEN_LABEL_NAME` | No | `raven-reviewed` | Label name added to reviewed PRs. |
@@ -274,7 +284,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-395 tests across 6 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, both git providers, and the full PR flow including CI gating.
+423 tests across 6 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, both git providers, and the full PR flow including CI gating.
 
 ## CI
 

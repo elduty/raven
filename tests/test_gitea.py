@@ -456,6 +456,60 @@ class TestFetchFile:
         assert "/src/pkg/file.py" in url
 
 
+class TestListDirectory:
+    def test_returns_file_paths(self, client):
+        data = [
+            {"type": "file", "path": ".claude/rules/security.md"},
+            {"type": "file", "path": ".claude/rules/style.md"},
+            {"type": "dir",  "path": ".claude/rules/nested"},
+        ]
+        with _mock_get(client, json_data=data):
+            result = client.list_directory("owner/repo", ".claude/rules", ref="abc123")
+        # Only regular files, not subdirs
+        assert result == [".claude/rules/security.md", ".claude/rules/style.md"]
+
+    def test_missing_directory_returns_empty(self, client):
+        """The common case — no .claude/rules/ in the repo. Must not
+        raise so the review continues with no rules context."""
+        with _mock_get(client, status=404):
+            assert client.list_directory("owner/repo", ".claude/rules") == []
+
+    def test_http_error_returns_empty(self, client):
+        """Transport error must not block the review either."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = requests.HTTPError("500")
+        with patch.object(client.session, "get", return_value=mock_resp):
+            assert client.list_directory("owner/repo", ".claude/rules") == []
+
+    def test_path_is_a_file_returns_empty(self, client):
+        """Gitea returns an object (not a list) when the path resolves
+        to a file rather than a directory. Treat that as "not a directory"."""
+        with _mock_get(client, json_data={"type": "file", "path": "README.md"}):
+            assert client.list_directory("owner/repo", "README.md") == []
+
+    def test_passes_ref_to_api(self, client):
+        with _mock_get(client, json_data=[]) as mock_get:
+            client.list_directory("owner/repo", ".claude/rules", ref="deadbeef")
+        assert mock_get.call_args[1]["params"]["ref"] == "deadbeef"
+
+    def test_rejects_entries_outside_requested_directory(self):
+        """Sanity guard: Gitea's contract says returned entries are
+        repo-rooted paths under the requested directory. If a hostile
+        response (or future API change) returns paths that escape — e.g.
+        ``../../../etc/passwd`` or nested subdirs — drop them rather than
+        trust blindly and feed surprising paths into ``fetch_file``."""
+        client = GiteaProvider(base_url=GITEA_BASE, token="test-token", webhook_secret="testsecret")
+        entries = [
+            {"type": "file", "path": ".claude/rules/good.md"},      # legit
+            {"type": "file", "path": ".claude/other/evil.md"},      # sibling dir — reject
+            {"type": "file", "path": "../../etc/passwd"},           # escape — reject
+            {"type": "file", "path": ".claude/rules/nested/x.md"},  # nested — reject (flat only)
+        ]
+        with _mock_get(client, json_data=entries):
+            result = client.list_directory("owner/repo", ".claude/rules")
+        assert result == [".claude/rules/good.md"]
+
+
 # ------------------------------------------------------------------ #
 #  Webhook parsing                                                    #
 # ------------------------------------------------------------------ #

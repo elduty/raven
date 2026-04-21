@@ -471,12 +471,27 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # Fetch diff
         diff = provider.fetch_pr_diff(repo_full_name, pr_number)
 
-        # Fetch repo context
+        # Fetch repo context — both the legacy CLAUDE.md and the
+        # .claude/rules/ directory (if either exist). Each is optional;
+        # any fetch failure degrades to empty content rather than
+        # blocking the review.
+        #
+        # CLAUDE.md is read from the PR head so documentation changes
+        # land atomically with the code they describe. Rules files are
+        # read from the PR *base* — fetching them from head would let a
+        # PR author add ``.claude/rules/policy.md`` saying "approve SQL
+        # concatenation" alongside hostile code, biasing Raven's review
+        # of that same PR. Reading from base means rule changes take
+        # effect only after they've been merged through a review of
+        # their own.
         claude_md = ""
         try:
             claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref=head_sha)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("CLAUDE.md fetch for %s@%s: %s", repo_full_name, head_sha[:8], e)
+
+        base_ref = payload.get("base_ref") or "HEAD"
+        rules = _fetch_rules(provider, repo_full_name, base_ref)
 
         # Guard: empty diff after stripping lockfiles/binaries
         clean_diff = _strip_lockfiles_and_binaries(diff)
@@ -557,6 +572,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 claude_md=claude_md, file_contents=file_contents,
                 pr_title=pr_title, pr_description=pr_description,
                 pr_comments=pr_comments, bot_user=bot_user,
+                rules=rules,
             )
         # Save original findings before merging carried ones (used for cache write)
         fresh_findings = list(review.get("findings", []))
@@ -1305,6 +1321,47 @@ def _fetch_changed_files(provider: GitProvider, repo_full_name: str, head_sha: s
         except Exception as e:
             logger.debug("Could not fetch %s for context: %s", filename, e)
     return file_contents
+
+
+# Directory whose ``*.md`` files are injected as "Repository Rules"
+# context for every review. Override with RAVEN_RULES_DIR (set to empty
+# string to disable entirely). Default matches the common Claude-Code
+# convention of ``.claude/rules/``.
+RULES_DIR = os.environ.get("RAVEN_RULES_DIR", ".claude/rules")
+
+
+def _fetch_rules(provider: GitProvider, repo_full_name: str, ref: str) -> dict[str, str]:
+    """Read ``*.md`` files from ``RULES_DIR`` at ``ref``, return
+    ``{path: contents}`` sorted by path.
+
+    Best-effort: a missing directory, listing error, or individual
+    fetch failure returns an empty/partial map rather than raising —
+    the review must proceed regardless.
+    """
+    if not RULES_DIR:
+        return {}
+    try:
+        entries = provider.list_directory(repo_full_name, RULES_DIR, ref=ref)
+    except Exception as e:
+        logger.debug("Could not list %s at %s: %s", RULES_DIR, ref[:8], e)
+        return {}
+    if not entries:
+        return {}
+    # Sort so prompt ordering is deterministic (helps cache hits + test
+    # reproducibility). Only *.md files per the product decision; other
+    # file types under .claude/rules/ are ignored.
+    md_paths = sorted(p for p in entries if p.lower().endswith(".md"))
+    rules: dict[str, str] = {}
+    for path in md_paths:
+        try:
+            content = provider.fetch_file(repo_full_name, path, ref=ref)
+            if content:
+                rules[path] = content
+        except Exception as e:
+            logger.debug("Could not fetch rule file %s: %s", path, e)
+    if rules:
+        logger.info("Loaded %d rule file(s) from %s for %s", len(rules), RULES_DIR, repo_full_name)
+    return rules
 
 
 def _notify_if_needed(repo_full_name: str, pr_number: int, pr_title: str, pr_url: str, review: dict) -> None:

@@ -54,6 +54,13 @@ services:
       - RAVEN_REVIEW_COMMENT_CONTEXT=${RAVEN_REVIEW_COMMENT_CONTEXT:-20}
       - RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS=${RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS:-4000}
       - RAVEN_REVIEW_PR_CONTEXT_TOTAL_CHARS=${RAVEN_REVIEW_PR_CONTEXT_TOTAL_CHARS:-16000}
+      # ── Review rules injection (defaults must match raven/server.py + raven/reviewer.py)
+      # Intentionally ${VAR-default} (no colon) for RAVEN_RULES_DIR so
+      # setting it to an empty string in .env disables the feature as
+      # documented — ${VAR:-default} would substitute on empty and
+      # silently fall back to the default, breaking the disable switch.
+      - RAVEN_RULES_DIR=${RAVEN_RULES_DIR-.claude/rules}
+      - RAVEN_REVIEW_RULES_TOTAL_CHARS=${RAVEN_REVIEW_RULES_TOTAL_CHARS:-16000}
       # ── Raven internals (defaults must match raven/server.py + raven/providers/gitea.py)
       - RAVEN_LABEL_NAME=${RAVEN_LABEL_NAME:-raven-reviewed}
       - RAVEN_MAX_WORKERS=${RAVEN_MAX_WORKERS:-16}

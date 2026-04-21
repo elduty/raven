@@ -348,6 +348,52 @@ class GiteaProvider(GitProvider):
             return base64.b64decode(content_b64).decode("utf-8", errors="replace")
         return ""
 
+    def list_directory(self, repo_full_name: str, path: str, ref: str = "HEAD") -> list[str]:
+        """List regular files directly under ``path`` at ``ref`` (flat).
+
+        Returns [] for missing directories (404) and any other API error
+        so a missing ``.claude/rules/`` degrades gracefully rather than
+        blocking the review.
+        """
+        owner, repo = _split_repo(repo_full_name)
+        encoded_path = quote(path, safe="/")
+        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/contents/{encoded_path}"
+        try:
+            resp = self.session.get(url, params={"ref": ref}, timeout=15)
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            entries = resp.json()
+        except Exception as e:
+            logger.warning("Failed to list %s@%s: %s", path, ref, e)
+            return []
+        if not isinstance(entries, list):
+            # Gitea returns an object (not a list) when ``path`` is a file,
+            # not a directory. Treat that as "no directory here".
+            return []
+        # Gitea returns full repo-rooted paths. Trust the server but add
+        # a sanity guard that the returned entry is actually a direct
+        # child of ``path`` — rejects surprising API changes or hostile
+        # responses whose 'path' escapes the requested directory
+        # (e.g. ``..\\..\\etc\\passwd``).
+        expected_prefix = path.rstrip("/") + "/"
+        result: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("type") != "file":
+                continue
+            entry_path = entry.get("path")
+            if not entry_path or not isinstance(entry_path, str):
+                continue
+            if not entry_path.startswith(expected_prefix):
+                logger.warning("Gitea list_directory returned entry outside %s: %r — skipping", path, entry_path)
+                continue
+            tail = entry_path[len(expected_prefix):]
+            if "/" in tail or tail in ("", ".", ".."):
+                # Direct children only; no further path separators allowed.
+                continue
+            result.append(entry_path)
+        return result
+
     # ------------------------------------------------------------------ #
     #  Webhook handling                                                    #
     # ------------------------------------------------------------------ #
