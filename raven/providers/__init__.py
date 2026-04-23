@@ -23,6 +23,16 @@ class GitProvider(ABC):
     def get_pr_head_sha(self, repo: str, pr_number: int) -> str: ...
 
     @abstractmethod
+    def get_pr_base_ref(self, repo: str, pr_number: int) -> str:
+        """Return the PR's base branch name (e.g. ``"main"``).
+
+        Used to fetch base-branch-pinned configuration such as
+        ``.claude/rules/`` and prompt overrides. Raises on fetch error or
+        missing value — callers should catch and fall back.
+        """
+        ...
+
+    @abstractmethod
     def fetch_pr_diff(self, repo: str, pr_number: int) -> str: ...
 
     @abstractmethod
@@ -108,7 +118,16 @@ class GitProvider(ABC):
 
     @abstractmethod
     def get_pr_reviews(self, repo: str, pr_number: int) -> list[dict]:
-        """Return reviews as [{"user": {"login": str}, "state": "APPROVED"|"REQUEST_CHANGES"|"COMMENT"}]."""
+        """Return the list of reviews submitted on the PR.
+
+        Each review dict has the shape::
+
+            {"user": {"login": str}, "state": str}
+
+        ``state`` is one of ``"APPROVED"``, ``"REQUEST_CHANGES"``,
+        ``"COMMENTED"``, or provider-specific values. Providers normalise
+        their native review shapes into this common form.
+        """
         ...
 
     @abstractmethod

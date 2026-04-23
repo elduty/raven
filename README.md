@@ -30,14 +30,18 @@ push to branch
           -> severity high/medium -> Slack/webhook alert, PR stays open
 ```
 
-Reviews typically complete in 10-30 seconds. Diffs up to 3000 lines are reviewed as a single full-context pass; larger diffs are split by file and reviewed chunk-by-chunk. Repos can tune reviews via two optional inputs:
+Reviews typically complete in 10-30 seconds. Diffs up to 3000 lines are reviewed as a single full-context pass; larger diffs are split by file and reviewed chunk-by-chunk. Repos can tune reviews via a few optional inputs:
 
 - **`CLAUDE.md`** at the repo root — free-form project guidance. Injected as "Repository Context".
 - **`.claude/rules/*.md`** — one file per rule category (e.g. `security.md`, `style.md`, `testing.md`). Injected as "Repository Rules" and the model is instructed to apply them as review criteria. Flat directory, `.md` only. **Fetched from the PR's base branch** (already-merged state) so a PR can't add or modify rules to bias its own review — new rules only take effect after they've been merged through a review of their own.
 
-Both are optional and independent; missing files are skipped silently.
+- **`.claude/rules/raven/prompts/review.md`** and **`.claude/rules/raven/prompts/respond.md`** — optional overrides that **completely replace** Raven's built-in review / respond prompt for this repo. Fetched from the **PR base branch** (same security model as `.claude/rules/*.md`) — new prompts only take effect after being merged through a review of their own. To start, copy `prompts/review.md` or `prompts/respond.md` from this repo into `.claude/rules/raven/prompts/` and edit from there. Gated on `RAVEN_RULES_DIR`: setting it to empty string disables prompt overrides as well as rule injection.
+
+All of the above are optional and independent; missing files are skipped silently.
 
 Pushing new commits to a PR branch triggers an incremental re-review (only changed files). Findings from unchanged files are carried forward and included in the consolidated verdict. Clicking "re-request review" or adding Raven as a reviewer also triggers a fresh review.
+
+**Reviewer assignment**: by default Raven auto-adds itself to every PR it receives a webhook for and reviews it. It will auto-merge only PRs where it's the only reviewer; PRs with humans reviewing are reviewed but left for humans to merge. Set `RAVEN_REVIEW_ALL_PRS=false` for fill-gap mode — Raven only auto-adds on PRs with no other reviewer. Either way, adding Raven as a reviewer manually always triggers a fresh review.
 
 ### Conversational follow-up
 
@@ -80,6 +84,7 @@ docker compose up -d
 4. **Optional**: Add a `CLAUDE.md` at the repo root for project-wide guidance, and/or `.claude/rules/*.md` files for focused review criteria.
    - `CLAUDE.md` is read from the **PR head** — documentation changes land atomically with the code they describe.
    - `.claude/rules/*.md` are read from the **PR base branch** (already-merged state) so a PR can't add or modify its own review criteria. New or updated rules only take effect after they've been merged.
+   - `.claude/rules/raven/prompts/{review,respond}.md` are read from the **PR base branch** and completely replace Raven's built-in prompts for this repo. Same merge-first security property as rules.
 
 ### Bitbucket Data Center setup
 
@@ -143,10 +148,10 @@ All configuration is via environment variables. See `config.example.env` for the
 | `RAVEN_REVIEW_COMMENT_CONTEXT` | No | `20` | Max non-bot PR comments included in the review prompt's "PR Conversation" section. `0` disables the subsection. |
 | `RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS` | No | `4000` | Per-item character cap applied to PR title, description, and each comment body before they're concatenated into the review prompt. Approximate — a truncation marker of ~30-40 chars is appended after the prefix. `0` disables truncation (keep full text). |
 | `RAVEN_REVIEW_PR_CONTEXT_TOTAL_CHARS` | No | `16000` | Global budget across the whole PR Context block (title + description + all included comments). Prevents discussion from dwarfing a small diff in the prompt. Comments are added newest-first until the budget is hit. `0` disables the global cap (per-item caps still apply). |
-| `RAVEN_RULES_DIR` | No | `.claude/rules` | Repository directory whose `*.md` files are injected into every review prompt as "Repository Rules" context. Flat listing — subdirectories are ignored. Set to empty string to disable the feature. |
+| `RAVEN_RULES_DIR` | No | `.claude/rules` | Repository directory whose top-level `*.md` files are injected into every review prompt as "Repository Rules" context (flat listing — subdirectories are ignored for rules). Also hosts optional prompt overrides at `<RAVEN_RULES_DIR>/raven/prompts/{review,respond}.md`. Set to empty string to disable both rule injection and prompt overrides. |
 | `RAVEN_REVIEW_RULES_TOTAL_CHARS` | No | `16000` | Global budget across all rule files concatenated into the prompt. Per-file truncation uses `RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS`. `0` disables the global cap. |
 | `RAVEN_GITEA_AUTO_MERGE` | No | `false` | Gitea-only. Queue the merge and let Gitea wait for CI. BB DC has no equivalent REST flag; its CI enforcement lives in repo-level merge checks, so this setting does nothing on BB DC. Default behaviour (poll CI, then merge) works on every provider. |
-| `RAVEN_AUTO_MERGE_ON_APPROVAL` | No | `false` | Auto-merge when a human approves a PR Raven already approved. |
+| `RAVEN_REVIEW_ALL_PRS` | No | `true` | Whether Raven auto-adds itself to every PR (default) or only to PRs with no other reviewer. Set to `false` (or `0` / `no`) for fill-gap behaviour — Raven stays out of human-reviewed PRs. |
 | `RAVEN_LABEL_NAME` | No | `raven-reviewed` | Label name added to reviewed PRs. |
 | `RAVEN_CACHE_DIR` | No | `/tmp/raven` | Directory for persistent findings cache. Use a Docker volume in production. |
 | `RAVEN_MAX_CACHED_PRS` | No | `200` | Max PR entries in the findings cache (LRU eviction). |
@@ -176,13 +181,16 @@ Notifications are opt-in. Configure via `NOTIFY_CHANNELS` JSON array:
 
 ### Auto-merge behaviour
 
-Raven auto-merges a PR only when ALL of these are true:
-1. Raven submitted an APPROVED review (severity at or below `REVIEW_APPROVE_MAX_SEVERITY`)
-2. No other human has reviewed the PR
-3. No human is requested as reviewer
-4. CI passes (or no CI configured)
-5. Head SHA hasn't changed since CI check (force-push protection)
-6. The consolidated verdict (including carried findings from unchanged files) meets the threshold
+Raven auto-merges a PR when all of these are true:
+
+1. Raven is a listed reviewer of the PR (auto-added or manually added).
+2. No other reviewer or requested reviewer is listed — Raven is the only reviewer.
+3. Raven submitted an `APPROVED` review with severity ≤ `REVIEW_APPROVE_MAX_SEVERITY`.
+4. The consolidated verdict (including carried findings from unchanged files) meets the threshold.
+5. CI passes, or CI_WAIT_TIMEOUT is configured to skip CI.
+6. Head SHA hasn't changed since CI was checked (force-push protection).
+
+No other merge path exists. Raven never merges a PR that has any other reviewer or requested reviewer listed — that case is left for humans.
 
 ## Review format
 
@@ -284,7 +292,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-423 tests across 6 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, both git providers, and the full PR flow including CI gating.
+450 tests across 6 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, both git providers, and the full PR flow including CI gating.
 
 ## CI
 

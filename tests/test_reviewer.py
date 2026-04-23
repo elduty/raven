@@ -700,6 +700,45 @@ class TestActiveProcessTracking:
         assert "Repository Rules" in prompt
         assert "UNIQUE-RULE-MARKER" in prompt
 
+    def test_rules_appear_after_prompt_template(self, mocker):
+        """Recency: rules are positioned between the prompt template and
+        the diff so they are the last guidance Claude reads before the
+        review target. Together with the explicit 'take precedence'
+        header, this makes rules beat conflicting prompt-template text."""
+        captured = {}
+
+        def fake(args, *, prompt, timeout):
+            captured["prompt"] = prompt
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = '{"severity":"low","summary":"ok","findings":[]}'
+            m.stderr = ""
+            return m
+
+        mocker.patch("raven.reviewer._run_claude_cli", side_effect=fake)
+        from raven.reviewer import review_diff
+        review_diff(
+            "diff --git a/x b/x\n+line\n",
+            "owner/repo",
+            rules={".claude/rules/sec.md": "UNIQUE-RULE-MARKER"},
+            prompt_override="UNIQUE-PROMPT-TEMPLATE-MARKER",
+        )
+        prompt = captured["prompt"]
+        idx_template = prompt.find("UNIQUE-PROMPT-TEMPLATE-MARKER")
+        idx_rules = prompt.find("UNIQUE-RULE-MARKER")
+        idx_diff = prompt.find("## Diff to Review")
+        assert idx_template != -1 and idx_rules != -1 and idx_diff != -1
+        assert idx_template < idx_rules < idx_diff
+
+    def test_rules_section_header_states_precedence(self):
+        """Rules header explicitly claims precedence over the prompt so
+        the model knows which side wins in a conflict."""
+        from raven.reviewer import _build_rules_section
+        section = _build_rules_section(
+            {".claude/rules/security.md": "content"}, "cafef00d",
+        )
+        assert "precedence" in section.lower()
+
     def test_build_pr_context_empty_returns_empty_string(self):
         """Nothing to say → no section header either. Keeps the prompt
         lean on PRs that open without a description and no comments."""
@@ -1127,3 +1166,133 @@ class TestActiveProcessTracking:
         assert count == 2
         # The non-timeout error did NOT stop the loop — stuck still got SIGKILLed.
         stuck.kill.assert_called_once()
+
+
+# ------------------------------------------------------------------ #
+#  review_diff prompt_override                                         #
+# ------------------------------------------------------------------ #
+
+class TestReviewDiffPromptOverride:
+    """Override replaces the built-in review prompt template when non-empty."""
+
+    def _make_result(self, stdout, returncode=0):
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = stdout
+        m.stderr = ""
+        return m
+
+    def _run(self, mocker, prompt_override):
+        """Helper: run review_diff with a mocked Claude CLI, return the
+        prompt string that was passed to Claude.
+
+        Adaptation note: _run_claude_cli uses keyword arg `prompt` (not
+        `stdin_input`), so we capture kwargs["prompt"] via the side_effect.
+        """
+        captured = {}
+
+        def fake_run_claude_cli(args, *, prompt, timeout):
+            captured["prompt"] = prompt
+            return self._make_result(
+                '{"severity":"low","summary":"ok","findings":[]}'
+            )
+
+        mocker.patch("raven.reviewer._run_claude_cli", side_effect=fake_run_claude_cli)
+        review_diff(
+            "diff --git a/foo b/foo\n+new line\n",
+            "owner/repo",
+            prompt_override=prompt_override,
+        )
+        return captured["prompt"]
+
+    def test_override_string_replaces_default(self, mocker):
+        override = "YOU ARE A TEST PROMPT — return {\"severity\":\"low\"}"
+        prompt = self._run(mocker, prompt_override=override)
+        assert override in prompt
+
+    def test_default_prompt_absent_when_override_used(self, mocker):
+        from raven.reviewer import _REVIEW_PROMPT_TEMPLATE
+        override = "OVERRIDE PROMPT BODY"
+        prompt = self._run(mocker, prompt_override=override)
+        if _REVIEW_PROMPT_TEMPLATE.strip():
+            sample_line = next(
+                (ln for ln in _REVIEW_PROMPT_TEMPLATE.splitlines() if len(ln) > 40),
+                None,
+            )
+            if sample_line:
+                assert sample_line not in prompt
+
+    def test_none_override_uses_default(self, mocker):
+        from raven.reviewer import _REVIEW_PROMPT_TEMPLATE
+        prompt = self._run(mocker, prompt_override=None)
+        if _REVIEW_PROMPT_TEMPLATE.strip():
+            assert _REVIEW_PROMPT_TEMPLATE[:60] in prompt
+
+    def test_empty_string_override_uses_default(self, mocker):
+        from raven.reviewer import _REVIEW_PROMPT_TEMPLATE
+        prompt = self._run(mocker, prompt_override="")
+        if _REVIEW_PROMPT_TEMPLATE.strip():
+            assert _REVIEW_PROMPT_TEMPLATE[:60] in prompt
+
+    def test_whitespace_only_override_uses_default(self, mocker):
+        from raven.reviewer import _REVIEW_PROMPT_TEMPLATE
+        prompt = self._run(mocker, prompt_override="   \n\t\n  ")
+        if _REVIEW_PROMPT_TEMPLATE.strip():
+            assert _REVIEW_PROMPT_TEMPLATE[:60] in prompt
+
+
+class TestRespondToCommentPromptOverride:
+    """Override replaces the built-in respond prompt template when non-empty."""
+
+    def _make_result(self, stdout, returncode=0):
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = stdout
+        m.stderr = ""
+        return m
+
+    def _run(self, mocker, prompt_override):
+        """Helper: run respond_to_comment with a mocked Claude CLI, return the
+        prompt string that was passed to Claude.
+
+        Adaptation note: _run_claude_cli uses keyword arg `prompt` (not
+        `stdin_input`), so we capture kwargs["prompt"] via the side_effect.
+        """
+        captured = {}
+
+        def fake_run_claude_cli(args, *, prompt, timeout):
+            captured["prompt"] = prompt
+            return self._make_result("A response body")
+
+        mocker.patch("raven.reviewer._run_claude_cli", side_effect=fake_run_claude_cli)
+        respond_to_comment(
+            comment_body="please elaborate",
+            conversation=[],
+            diff="diff --git a/foo b/foo\n+new line\n",
+            repo_name="owner/repo",
+            prompt_override=prompt_override,
+        )
+        return captured["prompt"]
+
+    def test_override_replaces_default(self, mocker):
+        override = "YOU ARE A TEST RESPOND PROMPT"
+        prompt = self._run(mocker, prompt_override=override)
+        assert override in prompt
+
+    def test_none_override_uses_default(self, mocker):
+        from raven.reviewer import _RESPOND_PROMPT_TEMPLATE
+        prompt = self._run(mocker, prompt_override=None)
+        if _RESPOND_PROMPT_TEMPLATE.strip():
+            assert _RESPOND_PROMPT_TEMPLATE[:60] in prompt
+
+    def test_empty_override_uses_default(self, mocker):
+        from raven.reviewer import _RESPOND_PROMPT_TEMPLATE
+        prompt = self._run(mocker, prompt_override="")
+        if _RESPOND_PROMPT_TEMPLATE.strip():
+            assert _RESPOND_PROMPT_TEMPLATE[:60] in prompt
+
+    def test_whitespace_only_override_uses_default(self, mocker):
+        from raven.reviewer import _RESPOND_PROMPT_TEMPLATE
+        prompt = self._run(mocker, prompt_override="   \n  ")
+        if _RESPOND_PROMPT_TEMPLATE.strip():
+            assert _RESPOND_PROMPT_TEMPLATE[:60] in prompt

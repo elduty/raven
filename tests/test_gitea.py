@@ -71,6 +71,24 @@ class TestGetPrHeadSha:
                 client.get_pr_head_sha("owner/repo", 7)
 
 
+class TestGetPrBaseRef:
+    def test_returns_base_ref(self, client):
+        with _mock_get(client, json_data={"base": {"ref": "main"}}):
+            assert client.get_pr_base_ref("owner/repo", 7) == "main"
+
+    def test_url_contains_pr_number(self, client):
+        with _mock_get(client, json_data={"base": {"ref": "main"}}) as mock_get:
+            client.get_pr_base_ref("owner/repo", 42)
+        url = mock_get.call_args[0][0]
+        assert "/pulls/42" in url
+        assert ".diff" not in url
+
+    def test_missing_base_ref_raises(self, client):
+        with _mock_get(client, json_data={}):
+            with pytest.raises(RuntimeError, match="empty base ref"):
+                client.get_pr_base_ref("owner/repo", 7)
+
+
 class TestFetchPrDiff:
     def test_success(self, client):
         diff_text = "diff --git a/bar b/bar\n+added line\n"

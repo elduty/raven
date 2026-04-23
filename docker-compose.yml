@@ -42,7 +42,7 @@ services:
       - SKIP_AUTHORS=${SKIP_AUTHORS:-}
       # Toggles: empty = off. server.py parses (".lower() in 1|true|yes").
       - RAVEN_GITEA_AUTO_MERGE=${RAVEN_GITEA_AUTO_MERGE:-}
-      - RAVEN_AUTO_MERGE_ON_APPROVAL=${RAVEN_AUTO_MERGE_ON_APPROVAL:-}
+      - RAVEN_REVIEW_ALL_PRS=${RAVEN_REVIEW_ALL_PRS:-true}
       # ── Claude CLI (defaults must match raven/reviewer.py)
       - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-opus-4-6}
       - CLAUDE_EFFORT=${CLAUDE_EFFORT:-max}

@@ -13,7 +13,7 @@ os.environ.setdefault("RAVEN_WEBHOOK_SECRET", "testsecret")
 os.environ.setdefault("GITEA_WEBHOOK_SECRET", "testsecret")
 
 import raven.server as _server_mod
-from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _fetch_rules, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _process_review_approved, _latest_review_per_user, _wait_for_ci, _should_skip_duplicate, _do_merge, _safe_do_merge, _truncate_diff_for_comment, _extract_code_snippet, _shutdown_executor, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
+from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _fetch_rules, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _wait_for_ci, _should_skip_duplicate, _do_merge, _safe_do_merge, _truncate_diff_for_comment, _extract_code_snippet, _shutdown_executor, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
 from raven.providers import GitProvider, _providers
 
 
@@ -297,6 +297,9 @@ class TestProcessPr:
             mc.get_commit_status.return_value = "success"
             self._setup_raven_only(mc)
             mc.get_authenticated_user.return_value = "raven-bot"
+            # Gate uses get_authenticated_user() to resolve "raven-bot" and looks
+            # in get_pr_reviews for that login — update to match the overridden user.
+            mc.get_pr_reviews.return_value = [{"user": {"login": "raven-bot"}, "state": "APPROVED"}]
             mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
             _process_pr(mc, self._normalized_payload())
 
@@ -336,6 +339,9 @@ class TestProcessPr:
             mc.get_commit_status.return_value = "success"
             self._setup_raven_only(mc)
             mc.get_authenticated_user.return_value = "raven-bot"
+            # Gate uses get_authenticated_user() to resolve "raven-bot" and looks
+            # in get_pr_reviews for that login — update to match the overridden user.
+            mc.get_pr_reviews.return_value = [{"user": {"login": "raven-bot"}, "state": "APPROVED"}]
             mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
             _process_pr(mc, self._normalized_payload())
 
@@ -388,6 +394,9 @@ class TestProcessPr:
             mc.get_commit_status.return_value = "success"
             self._setup_raven_only(mc)
             mc.get_authenticated_user.return_value = "raven-bot"
+            # Gate uses get_authenticated_user() to resolve "raven-bot" and looks
+            # in get_pr_reviews for that login — update to match the overridden user.
+            mc.get_pr_reviews.return_value = [{"user": {"login": "raven-bot"}, "state": "APPROVED"}]
             mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
             _process_pr(mc, self._normalized_payload())
 
@@ -424,6 +433,63 @@ class TestProcessPr:
         assert kwargs["rules"] == {}
         mock_review.assert_called_once()
 
+    def test_review_prompt_override_threaded_to_review_diff(self):
+        """When .claude/rules/raven/prompts/review.md exists on the base
+        branch, its contents are passed to review_diff as prompt_override."""
+        mc = self._make_provider()
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.list_directory.return_value = []
+
+        def fetch_file(repo, path, ref="HEAD"):
+            if path == ".claude/rules/raven/prompts/review.md":
+                assert ref == "main"  # fetched from base branch
+                return "REPO-SPECIFIC REVIEW PROMPT"
+            return ""
+
+        mc.fetch_file.side_effect = fetch_file
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.submit_review.return_value = {"id": 1}
+        mc.merge_pr.return_value = True
+        mc.get_commit_status.return_value = "success"
+        self._setup_raven_only(mc)
+
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        kwargs = mock_review.call_args.kwargs
+        assert kwargs.get("prompt_override") == "REPO-SPECIFIC REVIEW PROMPT"
+
+    def test_review_prompt_override_none_when_file_missing(self):
+        """When the override file doesn't exist, prompt_override is None
+        (helper swallows the FileNotFoundError)."""
+        mc = self._make_provider()
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.list_directory.return_value = []
+        mc.fetch_file.side_effect = FileNotFoundError()
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.submit_review.return_value = {"id": 1}
+        mc.merge_pr.return_value = True
+        mc.get_commit_status.return_value = "success"
+        self._setup_raven_only(mc)
+
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        kwargs = mock_review.call_args.kwargs
+        assert kwargs.get("prompt_override") is None
+
     def test_review_proceeds_when_claude_md_missing(self):
         """Regression guard for the explicit 'works without CLAUDE.md'
         requirement. fetch_file returns '' (or raises 404) for CLAUDE.md;
@@ -456,13 +522,23 @@ class TestProcessPr:
 
     def test_bot_user_resolve_failure_degrades_to_empty_filter(self):
         """If get_authenticated_user blows up, we still want to review —
-        just with no bot-comment filter. Review must proceed."""
+        just with no bot-comment filter. Review must proceed.
+
+        _process_pr calls get_authenticated_user multiple times (auto-add
+        check, reviewer-status gate, PR-context filter, dismiss-previous,
+        sole-reviewer check). Real providers cache, but MagicMock doesn't
+        — side_effect needs to cover every call. The test's concern is the
+        PR-context-filter call: position it third (after auto-add check and
+        gate) and assert that bot_user ends up empty."""
         mc = self._make_provider()
         mc.get_pr_description.return_value = ""
         mc.get_pr_comments.return_value = []
         mc.get_authenticated_user.side_effect = [
-            Exception("500"),  # first call (context-filter resolve) fails
-            "raven-bot",       # subsequent calls succeed (e.g. sole-reviewer check)
+            "raven-bot",       # auto-add check
+            "raven-bot",       # reviewer-status gate
+            Exception("500"),  # PR-context filter resolve — the one we're testing
+            "raven-bot",       # dismiss-previous
+            "raven-bot",       # sole-reviewer check
         ]
         with (
             patch("raven.server.review_diff") as mock_review,
@@ -570,6 +646,7 @@ class TestProcessPr:
 
     def test_medium_severity_not_merged(self):
         mc = self._make_provider()
+        self._setup_raven_only(mc)
         with (
             patch("raven.server.review_diff") as mock_review,
             patch("raven.server.notify") as mock_notify,
@@ -656,6 +733,7 @@ class TestProcessPr:
             "+new dep\n"
         )
         mc = self._make_provider()
+        self._setup_raven_only(mc)
         with (
             patch("raven.server.review_diff") as mock_review,
             patch("raven.server.notify"),
@@ -671,6 +749,7 @@ class TestProcessPr:
 
     def test_review_submit_failure_blocks_merge(self):
         mc = self._make_provider()
+        self._setup_raven_only(mc)
         with (
             patch("raven.server.review_diff") as mock_review,
             patch("raven.server.notify") as mock_notify,
@@ -753,11 +832,107 @@ class TestProcessPr:
             mc.add_label_to_pr.return_value = None
             mc.get_commit_status.return_value = "success"
             mc.merge_pr.return_value = True
-            self._setup_raven_only(mc)
+            # Raven not yet listed — default review-all mode will add it.
+            # Gate (second get_pr_reviews call) sees Raven after auto-add.
+            mc.get_authenticated_user.return_value = "Raven"
+            mc.get_pr_reviews.side_effect = [
+                [],                                                            # auto-add check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],          # gate check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],          # sole-reviewer check
+            ]
+            mc.get_pr_requested_reviewers.return_value = []
+            mc.get_pr_head_sha.return_value = "abc123"
             mock_review.return_value = {"severity": "low", "summary": "OK", "findings": []}
             _process_pr(mc, self._normalized_payload())
         mc.add_self_as_reviewer.assert_called_once_with("owner/repo", 42)
         assert call_order.index("add_self") < call_order.index("fetch_diff")
+
+    def test_does_not_auto_add_when_human_already_reviewing(self):
+        """In fill-gap mode, if a human has reviewed (or is set to review),
+        Raven must not claim the reviewer slot AND must not review — the
+        reviewer-status gate blocks the review since Raven is not listed.
+        The auto-add step is skipped and the PR is left to its human reviewers."""
+        mc = self._make_provider()
+        # Human reviewer already posted a review
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [
+            {"user": {"login": "alice"}, "state": "COMMENT",
+             "commit_id": "abc123", "stale": False},
+        ]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_head_sha.return_value = "abc123"
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+            patch("raven.server.RAVEN_REVIEW_ALL_PRS", False),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        mc.add_self_as_reviewer.assert_not_called()
+        # Reviewer-status gate blocks review — Raven is not listed as a reviewer
+        mock_review.assert_not_called()
+        mc.submit_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+
+    def test_does_not_auto_add_when_human_requested(self):
+        """In fill-gap mode, a human pending-reviewer slot keeps Raven out
+        of the way. Reviewer-status gate also blocks the review since Raven
+        is not listed as a reviewer."""
+        mc = self._make_provider()
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = []
+        mc.get_pr_requested_reviewers.return_value = ["alice"]
+        mc.get_pr_head_sha.return_value = "abc123"
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+            patch("raven.server.RAVEN_REVIEW_ALL_PRS", False),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        mc.add_self_as_reviewer.assert_not_called()
+        # Reviewer-status gate blocks review — Raven is not a listed reviewer
+        mock_review.assert_not_called()
+
+    def test_does_not_re_add_when_raven_is_sole_existing_reviewer(self):
+        """Re-review case: Raven was added in a previous run. The
+        idempotency gate detects Raven is already listed and skips the
+        add — both in review-all and fill-gap mode."""
+        mc = self._make_provider()
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [
+            {"user": {"login": "Raven"}, "state": "APPROVED",
+             "commit_id": "abc123", "stale": False},
+        ]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_head_sha.return_value = "abc123"
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.merge_pr.return_value = True
+            mc.get_commit_status.return_value = "success"
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        mc.add_self_as_reviewer.assert_not_called()
 
     def test_add_self_as_reviewer_failure_does_not_block_review(self):
         """If add_self_as_reviewer fails, the review should still proceed."""
@@ -848,7 +1023,17 @@ class TestProcessPr:
             mc.submit_review.return_value = {"id": 1}
             mc.get_commit_status.return_value = "success"
             mc.merge_pr.return_value = True
-            self._setup_raven_only(mc)
+            # Raven not yet listed — add is attempted (and fails) so metric fires.
+            # Gate check (second get_pr_reviews call) returns Raven so that the
+            # review still runs and dismiss/label failures can also be exercised.
+            mc.get_authenticated_user.return_value = "Raven"
+            mc.get_pr_reviews.side_effect = [
+                [],                                                                # auto-add decision
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],              # gate check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],              # sole-reviewer check
+            ]
+            mc.get_pr_requested_reviewers.return_value = []
+            mc.get_pr_head_sha.return_value = "abc123"
             mock_review.return_value = {"severity": "low", "summary": "OK", "findings": []}
             _process_pr(mc, self._normalized_payload())
         keys = list(_counters.keys())
@@ -856,15 +1041,109 @@ class TestProcessPr:
         assert any("dismiss_failed" in k for k in keys), keys
         assert any("label_failed" in k for k in keys), keys
 
+    def test_skips_review_when_raven_not_a_reviewer(self):
+        """Reviewer-status gate: if Raven isn't listed as a reviewer
+        after the auto-add decision, the review doesn't run. Happens
+        in fill-gap mode on PRs with existing human reviewers."""
+        mc = self._make_provider()
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [{"user": {"login": "alice"}, "state": "COMMENTED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.fetch_file.return_value = ""
+
+        with (
+            patch("raven.server.RAVEN_REVIEW_ALL_PRS", False),
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        mock_review.assert_not_called()
+        mc.submit_review.assert_not_called()
+
+    def test_runs_review_when_raven_is_reviewer(self):
+        """When Raven is already a listed reviewer, review runs even in
+        fill-gap mode with humans present (someone manually added
+        Raven)."""
+        mc = self._make_provider()
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [
+            {"user": {"login": "alice"}, "state": "COMMENTED"},
+            {"user": {"login": "Raven"}, "state": "COMMENTED"},
+        ]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.submit_review.return_value = {"id": 1}
+
+        with (
+            patch("raven.server.RAVEN_REVIEW_ALL_PRS", False),
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        mock_review.assert_called_once()
+
+    def test_runs_review_when_all_prs_mode_auto_adds_raven(self):
+        """In RAVEN_REVIEW_ALL_PRS=true mode, Raven auto-adds itself
+        even with human reviewers — so the gate passes after auto-add."""
+        mc = self._make_provider()
+        mc.get_authenticated_user.return_value = "Raven"
+        # After auto-add, the second get_pr_reviews call (the gate) must
+        # show Raven as listed. Simulate that by returning human-only the
+        # first time (auto-add decision) and human+Raven the second time
+        # (gate check).
+        mc.get_pr_reviews.side_effect = [
+            [{"user": {"login": "alice"}, "state": "COMMENTED"}],                          # auto-add check
+            [{"user": {"login": "alice"}, "state": "COMMENTED"}, {"user": {"login": "Raven"}, "state": "COMMENTED"}],  # gate check
+            [{"user": {"login": "alice"}, "state": "COMMENTED"}, {"user": {"login": "Raven"}, "state": "APPROVED"}],   # sole-reviewer merge check (later)
+        ]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.submit_review.return_value = {"id": 1}
+
+        with (
+            patch("raven.server.RAVEN_REVIEW_ALL_PRS", True),
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        mc.add_self_as_reviewer.assert_called_once()
+        mock_review.assert_called_once()
+
 
 class TestWaitForCi:
-    def test_initial_delay_before_first_check(self):
+    def test_initial_delay_skipped_on_terminal_fast_path(self):
+        """Fast path: if the first probe already returns a terminal
+        state, don't sleep at all. Saves 10s on no-CI repos and re-
+        reviews where CI has already finished before Raven's review."""
         gitea = MagicMock()
         gitea.get_commit_status.return_value = "success"
         with patch("raven.server.time.sleep") as mock_sleep:
             _wait_for_ci(gitea, "owner/repo", "abc123", timeout=60)
-        # First call is the 10s initial delay
-        mock_sleep.assert_called_once_with(10)
+        mock_sleep.assert_not_called()
+
+    def test_initial_delay_applied_when_pending(self):
+        """Slow path: if the first probe returns pending, keep the
+        original 10s settle delay before polling again."""
+        gitea = MagicMock()
+        # First probe pending → enter delay+poll. Second probe success.
+        gitea.get_commit_status.side_effect = ["pending", "success"]
+        with patch("raven.server.time.sleep") as mock_sleep:
+            _wait_for_ci(gitea, "owner/repo", "abc123", timeout=60)
+        # Exactly one 10s sleep (the initial delay). Second probe was
+        # success so no per-iteration sleep.
+        assert mock_sleep.call_args_list[0][0][0] == 10
 
     def test_returns_on_success(self):
         gitea = MagicMock()
@@ -886,6 +1165,17 @@ class TestWaitForCi:
         with patch("raven.server.time.sleep"):
             result = _wait_for_ci(gitea, "owner/repo", "abc123", timeout=60)
         assert result == "none"
+
+    def test_no_ci_takes_fast_path(self):
+        """Regression guard: a repo with no CI must not force a 10s wait
+        before falling through to merge."""
+        gitea = MagicMock()
+        gitea.get_commit_status.return_value = "none"
+        with patch("raven.server.time.sleep") as mock_sleep:
+            _wait_for_ci(gitea, "owner/repo", "abc123", timeout=60)
+        mock_sleep.assert_not_called()
+        # Only one probe — no reason to poll when there's no CI
+        gitea.get_commit_status.assert_called_once()
 
     def test_polls_until_success(self):
         gitea = MagicMock()
@@ -1042,7 +1332,13 @@ class TestCiWaitDispatch:
         mc.submit_review.return_value = {"id": 7}
         mc.add_label_to_pr.return_value = None
         mc.get_authenticated_user.return_value = "Raven"
-        mc.get_pr_reviews.return_value = []
+        # Raven not yet listed → auto-add fires. Gate check (2nd call) sees Raven.
+        # Sole-reviewer merge check (3rd call) also sees Raven APPROVED.
+        mc.get_pr_reviews.side_effect = [
+            [],                                                              # auto-add check
+            [{"user": {"login": "Raven"}, "state": "APPROVED"}],            # gate check
+            [{"user": {"login": "Raven"}, "state": "APPROVED"}],            # sole-reviewer check
+        ]
         mc.get_pr_requested_reviewers.return_value = []
         return mc
 
@@ -1076,27 +1372,6 @@ class TestCiWaitDispatch:
         assert call_args[3] == 42
         # Merge is NOT called on the provider here — it'll happen
         # inside the wait-pool task when the pool actually runs it.
-        mc.merge_pr.assert_not_called()
-
-    def test_process_review_approved_submits_merge_to_ci_wait_executor(self):
-        mc = MagicMock(spec=GitProvider)
-        mc.name = "gitea"
-        mc.get_authenticated_user.return_value = "Raven"
-        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
-        mc.get_pr_requested_reviewers.return_value = []
-        mc.get_pr_head_sha.return_value = "abc123"
-        payload = self._payload()
-
-        with (
-            patch("raven.server._AUTO_MERGE_ON_APPROVAL", True),
-            patch("raven.server.ci_wait_executor") as mock_exec,
-        ):
-            mock_exec.submit.return_value = MagicMock()
-            _process_review_approved(mc, payload)
-
-        mock_exec.submit.assert_called_once()
-        call_args = mock_exec.submit.call_args[0]
-        assert call_args[0] is _safe_do_merge
         mc.merge_pr.assert_not_called()
 
     def test_log_future_exception_surfaces_error_with_repo_label(self):
@@ -1218,13 +1493,13 @@ class TestSafeDoMerge:
         mc = MagicMock(spec=GitProvider)
         mc.name = "gitea"
         review = {"severity": "low", "summary": "ok", "findings": []}
-        # Simulate a pre-existing dedup entry for this PR
-        _recent_prs["gitea:owner/repo#42"] = 1.0
+        # Simulate a pre-existing dedup entry for this PR (SHA-aware key)
+        _recent_prs["gitea:owner/repo#42@abc"] = 1.0
 
         with patch("raven.server._do_merge", side_effect=RuntimeError("boom")):
             _safe_do_merge(mc, "owner/repo", 42, "t", "u", review, "abc", "squash")
 
-        assert "gitea:owner/repo#42" not in _recent_prs
+        assert "gitea:owner/repo#42@abc" not in _recent_prs
 
     def test_post_comment_failure_does_not_mask_original_error(self):
         """If the fallback ``post_pr_comment`` itself fails (e.g. API
@@ -1456,7 +1731,10 @@ class TestIncrementalReview:
             mc.submit_review.return_value = {"id": 1}
             mc.add_label_to_pr.return_value = None
             mc.get_authenticated_user.return_value = "Raven"
-            mc.get_pr_reviews.return_value = []
+            mc.get_pr_reviews.side_effect = [
+                [],                                                        # auto-add check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],      # gate check
+            ]
             mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
             _process_pr(mc, self._normalized_payload())
         mock_review.assert_called_once()
@@ -1477,7 +1755,10 @@ class TestIncrementalReview:
             mc.submit_review.return_value = {"id": 1}
             mc.add_label_to_pr.return_value = None
             mc.get_authenticated_user.return_value = "Raven"
-            mc.get_pr_reviews.return_value = []
+            mc.get_pr_reviews.side_effect = [
+                [],                                                        # auto-add check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],      # gate check
+            ]
             mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
             _process_pr(mc, self._normalized_payload())
         mock_review.assert_called_once()
@@ -1505,7 +1786,10 @@ class TestIncrementalReview:
             mc.submit_review.return_value = {"id": 1}
             mc.add_label_to_pr.return_value = None
             mc.get_authenticated_user.return_value = "Raven"
-            mc.get_pr_reviews.return_value = []
+            mc.get_pr_reviews.side_effect = [
+                [],                                                        # auto-add check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],      # gate check
+            ]
             mock_review.return_value = {"severity": "low", "summary": "a looks ok", "findings": []}
             _process_pr(mc, self._normalized_payload())
         # The submitted review body should include the carried finding
@@ -1535,7 +1819,10 @@ class TestIncrementalReview:
             mc.submit_review.return_value = {"id": 1}
             mc.add_label_to_pr.return_value = None
             mc.get_authenticated_user.return_value = "Raven"
-            mc.get_pr_reviews.return_value = []
+            mc.get_pr_reviews.side_effect = [
+                [],                                                        # auto-add check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],      # gate check
+            ]
             # New review is low, but carried is medium
             mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
             _process_pr(mc, self._normalized_payload())
@@ -1561,7 +1848,10 @@ class TestIncrementalReview:
             mc.submit_review.return_value = {"id": 1}
             mc.add_label_to_pr.return_value = None
             mc.get_authenticated_user.return_value = "Raven"
-            mc.get_pr_reviews.return_value = []
+            mc.get_pr_reviews.side_effect = [
+                [],                                                        # auto-add check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],      # gate check
+            ]
             # Re-review finds nothing
             mock_review.return_value = {"severity": "low", "summary": "clean", "findings": []}
             _process_pr(mc, self._normalized_payload())
@@ -1619,7 +1909,11 @@ class TestIncrementalReview:
             mc.submit_review.return_value = {"id": 1}
             mc.add_label_to_pr.return_value = None
             mc.get_authenticated_user.return_value = "Raven"
-            mc.get_pr_reviews.return_value = []
+            mc.get_pr_reviews.side_effect = [
+                [],                                                              # auto-add check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],            # gate check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],            # sole-reviewer check
+            ]
             mc.get_pr_requested_reviewers.return_value = []
             mc.get_pr_head_sha.return_value = "abc123"
             mc.merge_pr.return_value = True
@@ -1670,7 +1964,10 @@ class TestIncrementalReview:
             mc.submit_review.return_value = {"id": 1}
             mc.add_label_to_pr.return_value = None
             mc.get_authenticated_user.return_value = "Raven"
-            mc.get_pr_reviews.return_value = []
+            mc.get_pr_reviews.side_effect = [
+                [],                                                        # auto-add check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],      # gate check
+            ]
             mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
             _process_pr(mc, self._normalized_payload())
         # Should still work — no crash, review submitted
@@ -1714,6 +2011,14 @@ class TestReviewEvent:
             mc.add_label_to_pr.return_value = None
             mc.get_commit_status.return_value = "success"
             mc.merge_pr.return_value = True
+            mc.get_authenticated_user.return_value = "Raven"
+            mc.get_pr_reviews.side_effect = [
+                [],                                                              # auto-add check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],            # gate check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],            # sole-reviewer check
+            ]
+            mc.get_pr_requested_reviewers.return_value = []
+            mc.get_pr_head_sha.return_value = "abc123"
             mock_review.return_value = {"severity": severity, "summary": "test", "findings": []}
             _process_pr(mc, self._normalized_payload())
         return mc
@@ -1772,6 +2077,12 @@ class TestParseErrorBlocksMerge:
 
     def test_parse_error_posts_warning_and_skips_merge(self):
         mc = self._make_provider()
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.side_effect = [
+            [],                                                        # auto-add check
+            [{"user": {"login": "Raven"}, "state": "APPROVED"}],      # gate check
+        ]
+        mc.get_pr_requested_reviewers.return_value = []
         with (
             patch("raven.server.review_diff") as mock_review,
             patch("raven.server.notify") as mock_notify,
@@ -1815,6 +2126,25 @@ class TestDedup:
         # Simulate time passing beyond the dedup window
         _recent_prs["owner/repo#42"] -= DEDUP_WINDOW + 1
         assert _should_skip_duplicate("owner/repo", 42) is False
+
+    def test_different_head_sha_allowed(self):
+        """A push with a different head SHA is a legitimate new event,
+        not a redelivery — it must not be dropped as a duplicate."""
+        _should_skip_duplicate("owner/repo", 42, head_sha="aaaaaaaa")
+        assert _should_skip_duplicate("owner/repo", 42, head_sha="bbbbbbbb") is False
+
+    def test_same_head_sha_skipped(self):
+        """Redelivery of the same webhook (same SHA) is still deduped."""
+        _should_skip_duplicate("owner/repo", 42, head_sha="aaaaaaaa")
+        assert _should_skip_duplicate("owner/repo", 42, head_sha="aaaaaaaa") is True
+
+    def test_head_sha_optional_preserves_legacy_key(self):
+        """Calls without head_sha (e.g. comment dedup) keep the old key
+        format so they don't collide with SHA-keyed entries."""
+        _should_skip_duplicate("owner/repo", 42)
+        assert "owner/repo#42" in _recent_prs
+        _should_skip_duplicate("owner/repo", 42, head_sha="aaaaaaaa")
+        assert "owner/repo#42@aaaaaaaa" in _recent_prs
 
 
 class TestIssueComment:
@@ -2061,6 +2391,67 @@ class TestIssueComment:
             _process_comment(mc, self._normalized_comment_payload(is_mention=True))
         mc.get_comment_thread_authors.assert_not_called()
         mc.post_pr_comment.assert_called_once()
+
+    def test_respond_threads_prompt_override_from_base_branch(self):
+        """When .claude/rules/raven/prompts/respond.md exists on the base
+        branch, its contents are passed to respond_to_comment as
+        prompt_override."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.get_pr_comments.return_value = [{"user": {"login": "alice"}, "body": "@Raven explain"}]
+        mc.post_pr_comment.return_value = {"id": 1}
+        mc.get_pr_base_ref.return_value = "main"
+
+        def fetch_file(repo, path, ref="HEAD"):
+            if path == ".claude/rules/raven/prompts/respond.md":
+                assert ref == "main"
+                return "REPO-SPECIFIC RESPOND PROMPT"
+            return ""
+
+        mc.fetch_file.side_effect = fetch_file
+
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = "reply body"
+            _process_comment(mc, self._normalized_comment_payload())
+
+        kwargs = mock_respond.call_args.kwargs
+        assert kwargs.get("prompt_override") == "REPO-SPECIFIC RESPOND PROMPT"
+
+    def test_respond_no_override_passes_none(self):
+        """When the override file doesn't exist, prompt_override is None."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.fetch_file.side_effect = FileNotFoundError()
+        mc.get_pr_comments.return_value = [{"user": {"login": "alice"}, "body": "@Raven explain"}]
+        mc.post_pr_comment.return_value = {"id": 1}
+        mc.get_pr_base_ref.return_value = "main"
+
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = "reply body"
+            _process_comment(mc, self._normalized_comment_payload())
+
+        kwargs = mock_respond.call_args.kwargs
+        assert kwargs.get("prompt_override") is None
+
+    def test_respond_tolerates_base_ref_fetch_failure(self):
+        """If get_pr_base_ref raises, respond still runs with no override."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.get_pr_comments.return_value = [{"user": {"login": "alice"}, "body": "@Raven explain"}]
+        mc.post_pr_comment.return_value = {"id": 1}
+        mc.get_pr_base_ref.side_effect = RuntimeError("boom")
+
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = "reply body"
+            _process_comment(mc, self._normalized_comment_payload())
+
+        assert mock_respond.called
+        kwargs = mock_respond.call_args.kwargs
+        assert kwargs.get("prompt_override") is None
 
 
 class TestPullRequestComment:
@@ -2805,158 +3196,114 @@ class TestBitbucketDCWebhookRouting:
         assert resp.get_json() == {"status": "accepted"}
 
 
-class TestReviewApprovedEvent:
-    """Test that human approval triggers auto-merge check when Raven already approved."""
+class TestShouldAutoAddReviewer:
+    """Direct unit tests for the auto-add gate. Indirect coverage via
+    _process_pr exists, but the helper's contract (case-insensitive
+    match, empty-login tolerance, sole-Raven-counts-as-empty) is worth
+    pinning down separately."""
 
-    @pytest.fixture(autouse=True)
-    def _reset(self):
-        _recent_prs.clear()
-        _previous_diffs.clear()
-        yield
-        _recent_prs.clear()
-
-    def test_review_approved_triggers_merge_check(self, client):
-        payload = {
-            "action": "reviewed",
-            "repository": {"full_name": "owner/repo"},
-            "pull_request": {
-                "number": 42,
-                "title": "My PR",
-                "html_url": "http://x",
-                "head": {"ref": "feature", "sha": "abc123"},
-                "base": {"ref": "main"},
-            },
-            "sender": {"login": "alice"},
-        }
-        provider = _providers["gitea"]
-        with patch.object(provider, "get_authenticated_user", return_value="Raven"), \
-             patch("raven.server.executor") as mock_executor:
-            resp = _post(client, payload, event="pull_request_review_approved")
-        assert resp.get_json()["status"] == "accepted"
-        mock_executor.submit.assert_called_once()
-
-    def test_review_rejected_ignored(self, client):
-        payload = {
-            "action": "reviewed",
-            "repository": {"full_name": "owner/repo"},
-            "pull_request": {
-                "number": 42,
-                "title": "My PR",
-                "html_url": "http://x",
-                "head": {"ref": "feature", "sha": "abc123"},
-                "base": {"ref": "main"},
-            },
-            "sender": {"login": "alice"},
-        }
-        resp = _post(client, payload, event="pull_request_review_rejected")
-        assert resp.get_json()["status"] == "ignored"
-
-    def test_process_review_approved_merges_when_raven_approved(self):
+    def _mc(self, raven_user="raven-bot", reviews=None, requested=None):
         mc = MagicMock(spec=GitProvider)
-        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = raven_user
+        mc.get_pr_reviews.return_value = reviews or []
+        mc.get_pr_requested_reviewers.return_value = requested or []
+        return mc
+
+    def test_no_reviewers_returns_true(self):
+        from raven.server import _should_auto_add_reviewer
+        mc = self._mc()
+        assert _should_auto_add_reviewer(mc, "owner/repo", 1) is True
+
+    def test_human_reviewer_returns_false_in_fill_gap_mode(self, mocker):
+        """Fill-gap mode: human reviewer present → don't add Raven."""
+        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", False)
+        from raven.server import _should_auto_add_reviewer
+        mc = self._mc(reviews=[{"user": {"login": "alice"}, "state": "COMMENT"}])
+        assert _should_auto_add_reviewer(mc, "owner/repo", 1) is False
+
+    def test_human_requested_returns_false_in_fill_gap_mode(self, mocker):
+        """Fill-gap mode: human requested reviewer present → don't add Raven."""
+        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", False)
+        from raven.server import _should_auto_add_reviewer
+        mc = self._mc(requested=["alice"])
+        assert _should_auto_add_reviewer(mc, "owner/repo", 1) is False
+
+    def test_case_insensitive_raven_match(self):
+        """Some providers normalize login casing differently (BB DC
+        lowercases slugs; Gitea preserves case). The gate must detect
+        Raven's own entry regardless of case and not re-add."""
+        from raven.server import _should_auto_add_reviewer
+        mc = self._mc(
+            raven_user="Raven-Bot",
+            reviews=[{"user": {"login": "raven-bot"}, "state": "APPROVED"}],
+            requested=["RAVEN-BOT"],
+        )
+        assert _should_auto_add_reviewer(mc, "owner/repo", 1) is False
+
+    def test_empty_login_entries_ignored(self):
+        """A review with an empty/null login is neither Raven nor a
+        human — ignore it rather than short-circuiting to False."""
+        from raven.server import _should_auto_add_reviewer
+        mc = self._mc(
+            reviews=[{"user": {"login": ""}, "state": "COMMENT"},
+                     {"user": {"login": None}, "state": "COMMENT"},
+                     {"user": None, "state": "COMMENT"}],
+            requested=["", None],
+        )
+        assert _should_auto_add_reviewer(mc, "owner/repo", 1) is True
+
+    def test_auto_add_true_when_all_prs_flag_set_and_not_reviewer(self, mocker):
+        """In RAVEN_REVIEW_ALL_PRS=true mode, Raven auto-adds even when
+        a human reviewer is listed, so long as Raven itself isn't."""
+        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", True)
+        mc = MagicMock(spec=GitProvider)
         mc.get_authenticated_user.return_value = "Raven"
-        mc.get_pr_reviews.return_value = [
-            {"user": {"login": "Raven"}, "state": "APPROVED"},
-            {"user": {"login": "alice"}, "state": "APPROVED"},
-        ]
+        mc.get_pr_reviews.return_value = [{"user": {"login": "alice"}, "state": "COMMENTED"}]
+        mc.get_pr_requested_reviewers.return_value = ["bob"]
+        from raven.server import _should_auto_add_reviewer
+        assert _should_auto_add_reviewer(mc, "owner/repo", 42) is True
+
+    def test_auto_add_false_when_all_prs_flag_set_and_raven_already_reviewer(self, mocker):
+        """RAVEN_REVIEW_ALL_PRS=true must still be idempotent — don't
+        re-add if Raven is already a reviewer."""
+        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", True)
+        mc = MagicMock(spec=GitProvider)
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
         mc.get_pr_requested_reviewers.return_value = []
-        mc.get_pr_head_sha.return_value = "abc123"
-        mc.get_commit_status.return_value = "success"
-        mc.merge_pr.return_value = True
-        with patch("raven.server._AUTO_MERGE_ON_APPROVAL", True), \
-             patch("raven.server.time.sleep"):
-            _process_review_approved(mc, {
-                "repo": "owner/repo",
-                "pr_number": 42,
-                "pr_title": "My PR",
-                "pr_url": "http://x",
-                "head_sha": "abc123",
-            })
-        mc.merge_pr.assert_called_once()
+        from raven.server import _should_auto_add_reviewer
+        assert _should_auto_add_reviewer(mc, "owner/repo", 42) is False
 
-    def test_process_review_approved_skips_when_raven_not_approved(self):
+    def test_auto_add_false_when_all_prs_flag_set_and_raven_requested(self, mocker):
+        """Idempotent: if Raven is already in requested reviewers, no add."""
+        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", True)
         mc = MagicMock(spec=GitProvider)
-        mc.name = "gitea"
         mc.get_authenticated_user.return_value = "Raven"
-        mc.get_pr_reviews.return_value = [
-            {"user": {"login": "alice"}, "state": "APPROVED"},
-        ]
-        with patch("raven.server._AUTO_MERGE_ON_APPROVAL", True):
-            _process_review_approved(mc, {
-                "repo": "owner/repo",
-                "pr_number": 42,
-                "pr_title": "My PR",
-                "pr_url": "http://x",
-            })
-        mc.merge_pr.assert_not_called()
+        mc.get_pr_reviews.return_value = []
+        mc.get_pr_requested_reviewers.return_value = ["Raven"]
+        from raven.server import _should_auto_add_reviewer
+        assert _should_auto_add_reviewer(mc, "owner/repo", 42) is False
 
-    def test_process_review_approved_skips_when_request_changes_outstanding(self):
-        """Don't merge if another reviewer has REQUEST_CHANGES."""
+    def test_auto_add_false_in_fill_gap_mode_with_other_reviewer(self, mocker):
+        """Fill-gap mode preserves the PR #101 behaviour — decline when
+        any human reviewer is present."""
+        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", False)
         mc = MagicMock(spec=GitProvider)
-        mc.name = "gitea"
         mc.get_authenticated_user.return_value = "Raven"
-        mc.get_pr_reviews.return_value = [
-            {"user": {"login": "Raven"}, "state": "APPROVED"},
-            {"user": {"login": "alice"}, "state": "REQUEST_CHANGES"},
-            {"user": {"login": "bob"}, "state": "APPROVED"},
-        ]
-        with patch("raven.server._AUTO_MERGE_ON_APPROVAL", True):
-            _process_review_approved(mc, {
-                "repo": "owner/repo",
-                "pr_number": 42,
-                "pr_title": "My PR",
-                "pr_url": "http://x",
-            })
-        mc.merge_pr.assert_not_called()
+        mc.get_pr_reviews.return_value = [{"user": {"login": "alice"}, "state": "COMMENTED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        from raven.server import _should_auto_add_reviewer
+        assert _should_auto_add_reviewer(mc, "owner/repo", 42) is False
 
-    def test_process_review_approved_skips_when_flag_disabled(self):
-        """No-op when RAVEN_AUTO_MERGE_ON_APPROVAL is not set."""
+    def test_auto_add_true_in_fill_gap_mode_with_no_others(self, mocker):
+        """Fill-gap mode: no humans, Raven is welcome."""
+        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", False)
         mc = MagicMock(spec=GitProvider)
-        mc.name = "gitea"
-        with patch("raven.server._AUTO_MERGE_ON_APPROVAL", False):
-            _process_review_approved(mc, {
-                "repo": "owner/repo",
-                "pr_number": 42,
-            })
-        mc.get_authenticated_user.assert_not_called()
-        mc.merge_pr.assert_not_called()
-
-    def test_process_review_approved_uses_latest_review_per_user(self):
-        """Raven approved then later rejected — should NOT merge."""
-        mc = MagicMock(spec=GitProvider)
-        mc.name = "gitea"
         mc.get_authenticated_user.return_value = "Raven"
-        mc.get_pr_reviews.return_value = [
-            {"user": {"login": "Raven"}, "state": "APPROVED"},       # old
-            {"user": {"login": "Raven"}, "state": "REQUEST_CHANGES"},  # latest
-            {"user": {"login": "alice"}, "state": "APPROVED"},
-        ]
-        with patch("raven.server._AUTO_MERGE_ON_APPROVAL", True):
-            _process_review_approved(mc, {
-                "repo": "owner/repo",
-                "pr_number": 42,
-                "pr_title": "My PR",
-                "pr_url": "http://x",
-            })
-        mc.merge_pr.assert_not_called()
-
-
-class TestLatestReviewPerUser:
-    def test_resolves_to_latest(self):
-        reviews = [
-            {"user": {"login": "alice"}, "state": "REQUEST_CHANGES"},
-            {"user": {"login": "alice"}, "state": "APPROVED"},
-            {"user": {"login": "bob"}, "state": "APPROVED"},
-        ]
-        assert _latest_review_per_user(reviews) == {"alice": "APPROVED", "bob": "APPROVED"}
-
-    def test_ignores_comment_state(self):
-        reviews = [
-            {"user": {"login": "alice"}, "state": "APPROVED"},
-            {"user": {"login": "alice"}, "state": "COMMENT"},
-        ]
-        # COMMENT doesn't overwrite APPROVED (only APPROVED/REQUEST_CHANGES tracked)
-        assert _latest_review_per_user(reviews) == {"alice": "APPROVED"}
+        mc.get_pr_reviews.return_value = []
+        mc.get_pr_requested_reviewers.return_value = []
+        from raven.server import _should_auto_add_reviewer
+        assert _should_auto_add_reviewer(mc, "owner/repo", 42) is True
 
 
 class TestDoMerge:
@@ -3031,3 +3378,101 @@ class TestGiteaAutoMerge:
         # BB DC should use regular merge (not merge_when_checks_succeed)
         mc.merge_pr.assert_called_once()
         assert mc.merge_pr.call_args.kwargs.get("merge_when_checks_succeed") is not True
+
+
+class TestFetchPromptOverride:
+    """The per-repo prompt-override fetch helper.
+
+    Returns the override string on success; None on missing file, fetch
+    error, empty or whitespace-only content, or when RULES_DIR is empty.
+    """
+
+    def _make_provider(self, fetch_file_impl):
+        mp = MagicMock()
+        mp.fetch_file.side_effect = fetch_file_impl
+        return mp
+
+    def test_returns_override_on_success(self, mocker):
+        mocker.patch("raven.server.RULES_DIR", ".claude/rules")
+        from raven.server import _fetch_prompt_override
+        provider = self._make_provider(
+            lambda repo, path, ref=None: "OVERRIDE PROMPT BODY"
+        )
+        result = _fetch_prompt_override(provider, "owner/repo", "main", "review")
+        assert result == "OVERRIDE PROMPT BODY"
+
+    def test_returns_none_on_missing_file(self, mocker):
+        mocker.patch("raven.server.RULES_DIR", ".claude/rules")
+        from raven.server import _fetch_prompt_override
+        provider = self._make_provider(
+            lambda repo, path, ref=None: (_ for _ in ()).throw(FileNotFoundError())
+        )
+        result = _fetch_prompt_override(provider, "owner/repo", "main", "review")
+        assert result is None
+
+    def test_returns_none_on_generic_fetch_error(self, mocker):
+        mocker.patch("raven.server.RULES_DIR", ".claude/rules")
+        from raven.server import _fetch_prompt_override
+        provider = self._make_provider(
+            lambda repo, path, ref=None: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        result = _fetch_prompt_override(provider, "owner/repo", "main", "review")
+        assert result is None
+
+    def test_returns_none_on_empty_content(self, mocker):
+        mocker.patch("raven.server.RULES_DIR", ".claude/rules")
+        from raven.server import _fetch_prompt_override
+        provider = self._make_provider(lambda repo, path, ref=None: "")
+        result = _fetch_prompt_override(provider, "owner/repo", "main", "review")
+        assert result is None
+
+    def test_returns_none_on_whitespace_only_content(self, mocker):
+        mocker.patch("raven.server.RULES_DIR", ".claude/rules")
+        from raven.server import _fetch_prompt_override
+        provider = self._make_provider(lambda repo, path, ref=None: "  \n\t\n  ")
+        result = _fetch_prompt_override(provider, "owner/repo", "main", "review")
+        assert result is None
+
+    def test_returns_none_when_rules_dir_empty(self, mocker):
+        mocker.patch("raven.server.RULES_DIR", "")
+        from raven.server import _fetch_prompt_override
+        provider = MagicMock()
+        provider.fetch_file.side_effect = AssertionError("fetch_file should not be called")
+        result = _fetch_prompt_override(provider, "owner/repo", "main", "review")
+        assert result is None
+        provider.fetch_file.assert_not_called()
+
+    def test_constructs_correct_path_for_review(self, mocker):
+        mocker.patch("raven.server.RULES_DIR", ".claude/rules")
+        from raven.server import _fetch_prompt_override
+        captured = {}
+        def fetch_file(repo, path, ref=None):
+            captured["path"] = path
+            captured["ref"] = ref
+            return "body"
+        provider = self._make_provider(fetch_file)
+        _fetch_prompt_override(provider, "owner/repo", "main", "review")
+        assert captured["path"] == ".claude/rules/raven/prompts/review.md"
+        assert captured["ref"] == "main"
+
+    def test_constructs_correct_path_for_respond(self, mocker):
+        mocker.patch("raven.server.RULES_DIR", ".claude/rules")
+        from raven.server import _fetch_prompt_override
+        captured = {}
+        def fetch_file(repo, path, ref=None):
+            captured["path"] = path
+            return "body"
+        provider = self._make_provider(fetch_file)
+        _fetch_prompt_override(provider, "owner/repo", "main", "respond")
+        assert captured["path"] == ".claude/rules/raven/prompts/respond.md"
+
+    def test_honours_custom_rules_dir(self, mocker):
+        mocker.patch("raven.server.RULES_DIR", ".custom/dir")
+        from raven.server import _fetch_prompt_override
+        captured = {}
+        def fetch_file(repo, path, ref=None):
+            captured["path"] = path
+            return "body"
+        provider = self._make_provider(fetch_file)
+        _fetch_prompt_override(provider, "owner/repo", "main", "review")
+        assert captured["path"] == ".custom/dir/raven/prompts/review.md"

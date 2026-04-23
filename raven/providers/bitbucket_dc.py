@@ -98,6 +98,17 @@ class BitbucketDCProvider(GitProvider):
             raise RuntimeError(f"Bitbucket DC returned empty head SHA for PR #{pr_number}")
         return sha
 
+    def get_pr_base_ref(self, repo_full_name: str, pr_number: int) -> str:
+        """Return the PR's base branch name from ``toRef.displayId``."""
+        project, repo = _split_repo(repo_full_name)
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}"
+        resp = self.session.get(url, timeout=10)
+        resp.raise_for_status()
+        ref = resp.json().get("toRef", {}).get("displayId", "")
+        if not ref:
+            raise RuntimeError(f"Bitbucket DC returned empty base ref for PR #{pr_number}")
+        return ref
+
     def get_pr_description(self, repo_full_name: str, pr_number: int) -> str:
         """Return the PR description, or "" on any failure."""
         project, repo = _split_repo(repo_full_name)

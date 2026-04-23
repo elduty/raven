@@ -84,6 +84,17 @@ class GiteaProvider(GitProvider):
             raise RuntimeError(f"Gitea returned empty head SHA for PR #{pr_number}")
         return sha
 
+    def get_pr_base_ref(self, repo_full_name: str, pr_number: int) -> str:
+        """Return the PR's base branch name. Raises if missing."""
+        owner, repo = _split_repo(repo_full_name)
+        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}"
+        resp = self.session.get(url, timeout=10)
+        resp.raise_for_status()
+        ref = resp.json().get("base", {}).get("ref", "")
+        if not ref:
+            raise RuntimeError(f"Gitea returned empty base ref for PR #{pr_number}")
+        return ref
+
     def fetch_pr_diff(self, repo_full_name: str, pr_number: int) -> str:
         """Return the raw unified diff for a pull request."""
         owner, repo = _split_repo(repo_full_name)
@@ -234,7 +245,11 @@ class GiteaProvider(GitProvider):
                 self.dismiss_review(repo_full_name, pr_number, rid)
 
     def get_pr_reviews(self, repo_full_name: str, pr_number: int) -> list[dict]:
-        """Return all reviews on a PR (paginated)."""
+        """Return all reviews on a PR (paginated), normalised.
+
+        Passes through ``id`` (used by ``dismiss_previous_reviews``).
+        Normalises review state to common form: "APPROVED", "REQUEST_CHANGES", "COMMENT".
+        """
         owner, repo = _split_repo(repo_full_name)
         url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
         all_reviews: list[dict] = []
@@ -245,7 +260,12 @@ class GiteaProvider(GitProvider):
             batch = resp.json()
             if not batch:
                 break
-            all_reviews.extend(batch)
+            for r in batch:
+                all_reviews.append({
+                    "id": r.get("id"),
+                    "user": {"login": (r.get("user") or {}).get("login", "")},
+                    "state": r.get("state", ""),
+                })
         return all_reviews
 
     def get_pr_requested_reviewers(self, repo_full_name: str, pr_number: int) -> list[str]:

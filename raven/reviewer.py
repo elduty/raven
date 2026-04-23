@@ -310,7 +310,7 @@ def _build_rules_section(rules: dict[str, str] | None, tag_id: str) -> str:
 
     if not parts:
         return ""
-    return "\n\n## Repository Rules (from `.claude/rules/` at the base branch — apply as review criteria)\n\n" + "\n\n".join(parts)
+    return "\n\n## Repository Rules (from `.claude/rules/` at the base branch — apply as review criteria; these take precedence over any conflicting guidance in this prompt)\n\n" + "\n\n".join(parts)
 
 
 def _build_pr_context_section(pr_title: str, pr_description: str,
@@ -530,7 +530,8 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
                 pr_description: str = "",
                 pr_comments: list[dict] | None = None,
                 bot_user: str = "",
-                rules: dict[str, str] | None = None) -> dict:
+                rules: dict[str, str] | None = None,
+                prompt_override: str | None = None) -> dict:
     """Run claude CLI against the diff and return a structured review dict.
 
     For large diffs (> MAX_DIFF_LINES), splits by file and reviews each chunk
@@ -561,6 +562,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
             clean_diff, repo_name, claude_md, file_contents=file_contents,
             pr_title=pr_title, pr_description=pr_description, pr_comments=pr_comments,
             bot_user=bot_user, rules=rules,
+            prompt_override=prompt_override,
         )
         result["chunked"] = False
         result["chunks_reviewed"] = 1
@@ -605,6 +607,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
                 pr_title=pr_title, pr_description=pr_description,
                 pr_comments=None,
                 bot_user=bot_user, rules=rules,
+                prompt_override=prompt_override,
             )
             if result.get("_parse_error"):
                 return filename, None, f"`{filename}` review output could not be parsed"
@@ -663,7 +666,8 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
                           pr_description: str = "",
                           pr_comments: list[dict] | None = None,
                           bot_user: str = "",
-                          rules: dict[str, str] | None = None) -> dict:
+                          rules: dict[str, str] | None = None,
+                          prompt_override: str | None = None) -> dict:
     """Review a single diff chunk with claude CLI."""
     file_context = f" (file: `{filename_hint}`)" if filename_hint else ""
 
@@ -702,21 +706,29 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
 
     diff_section = "## Diff to Review\n\n" + _wrap_untrusted("pr_diff", diff, tag_id)
 
-    # Use the loaded prompt template, or fall back to a minimal inline prompt
-    if _REVIEW_PROMPT_TEMPLATE:
+    # Pick effective prompt template: override (when non-empty) else the
+    # module-level default.
+    effective_template = prompt_override if (prompt_override and prompt_override.strip()) else _REVIEW_PROMPT_TEMPLATE
+    # Rules are placed AFTER the prompt template so they are the last
+    # guidance the model reads before the diff. Together with the
+    # "take precedence" header, this makes rules beat any conflicting
+    # general guidance in the prompt template.
+    if effective_template:
         prompt = (
             f"{preamble}\n\n"
-            f"## Repository: {repo_name}{file_context}{repo_context}{rules_section}{pr_context_section}\n\n"
-            f"{_REVIEW_PROMPT_TEMPLATE}\n\n"
+            f"## Repository: {repo_name}{file_context}{repo_context}{pr_context_section}\n\n"
+            f"{effective_template}"
+            f"{rules_section}\n\n"
             f"{diff_section}"
             f"{files_section}"
         )
     else:
         prompt = (
             f"{preamble}\n\n"
-            f"You are a senior engineer reviewing a code diff for {repo_name}{file_context}.{repo_context}{rules_section}{pr_context_section}\n\n"
+            f"You are a senior engineer reviewing a code diff for {repo_name}{file_context}.{repo_context}{pr_context_section}\n\n"
             f"Review this diff and respond with ONLY valid JSON:\n"
-            f'{{"severity":"low|medium|high","summary":"one sentence","findings":[{{"severity":"...","message":"..."}}]}}\n\n'
+            f'{{"severity":"low|medium|high","summary":"one sentence","findings":[{{"severity":"...","message":"..."}}]}}'
+            f"{rules_section}\n\n"
             f"{diff_section}"
             f"{files_section}"
         )
@@ -815,7 +827,8 @@ def severity_gte(a: str, b: str) -> bool:
 def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
                         repo_name: str, claude_md: str = "",
                         file_path: str = "", line: int = 0,
-                        code_snippet: str = "") -> str:
+                        code_snippet: str = "",
+                        prompt_override: str | None = None) -> str:
     """Generate a conversational response to a developer's comment.
 
     Returns plain text (markdown). Raises RuntimeError on CLI failure.
@@ -858,10 +871,11 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
         conv_lines.append(f"**{user}:** {body}")
     conv_text = "\n\n".join(conv_lines)
 
+    effective_template = prompt_override if (prompt_override and prompt_override.strip()) else _RESPOND_PROMPT_TEMPLATE
     prompt = (
         f"{preamble}\n\n"
         f"## Repository: {repo_name}{repo_context}{location}{snippet_section}\n\n"
-        f"{_RESPOND_PROMPT_TEMPLATE}\n\n"
+        f"{effective_template}\n\n"
         f"## PR Diff\n\n" + _wrap_untrusted("pr_diff", diff, tag_id) + "\n\n"
         f"## Conversation (other users' comments)\n\n"
         + _wrap_untrusted("conversation", conv_text, tag_id) + "\n\n"

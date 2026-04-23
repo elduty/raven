@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 
 _GITEA_AUTO_MERGE = os.environ.get("RAVEN_GITEA_AUTO_MERGE", "").lower() in ("1", "true", "yes")
 
+# Whether Raven auto-adds itself to every PR (default) or only to PRs
+# with no other reviewer. Default is True — review-all-PRs mode is the
+# standard behaviour; opt out with RAVEN_REVIEW_ALL_PRS=false|0|no.
+RAVEN_REVIEW_ALL_PRS = os.environ.get("RAVEN_REVIEW_ALL_PRS", "true").lower() not in ("0", "false", "no")
+
 executor = ThreadPoolExecutor(
     max_workers=int(os.environ.get("RAVEN_MAX_WORKERS", "16")),
     thread_name_prefix="raven-review",
@@ -214,9 +219,16 @@ def _evict_cache() -> None:
             del _previous_diffs[key]
 
 
-def _should_skip_duplicate(repo: str, pr_number: int) -> bool:
-    """Return True if this PR was already dispatched within DEDUP_WINDOW."""
-    key = f"{repo}#{pr_number}"
+def _should_skip_duplicate(repo: str, pr_number: int, head_sha: str | None = None) -> bool:
+    """Return True if this PR was already dispatched within DEDUP_WINDOW.
+
+    When ``head_sha`` is provided, it's appended to the dedup key so that
+    a push carrying a new SHA is treated as a fresh event (not a webhook
+    redelivery of the original). Dedup's purpose is to absorb duplicate
+    deliveries of the *same* event — different SHAs are different events.
+    """
+    suffix = f"@{head_sha}" if head_sha else ""
+    key = f"{repo}#{pr_number}{suffix}"
     now = time.time()
     with _recent_prs_lock:
         if key in _recent_prs and now - _recent_prs[key] < DEDUP_WINDOW:
@@ -319,7 +331,8 @@ def create_app() -> Flask:
             pr_number = pr.get("number")
             if not pr_number:
                 return jsonify({"status": "skipped", "reason": "missing PR number"})
-            if _should_skip_duplicate(f"{provider.name}:{repo}", pr_number):
+            head_sha = pr.get("head", {}).get("sha", "HEAD")
+            if _should_skip_duplicate(f"{provider.name}:{repo}", pr_number, head_sha=head_sha):
                 logger.info("Push to PR branch %s — skipping duplicate for PR #%s", branch, pr_number)
                 return jsonify({"status": "skipped", "reason": "duplicate"})
             logger.info("Push to PR branch %s — triggering re-review for PR #%s", branch, pr_number)
@@ -327,7 +340,7 @@ def create_app() -> Flask:
             payload["pr_number"] = pr_number
             payload["pr_title"] = pr.get("title", f"PR #{pr_number}")
             payload["pr_url"] = pr.get("html_url", "")
-            payload["head_sha"] = pr.get("head", {}).get("sha", "HEAD")
+            payload["head_sha"] = head_sha
             payload["head_ref"] = pr.get("head", {}).get("ref", "")
             payload["base_ref"] = pr.get("base", {}).get("ref", "")
             executor.submit(_process_pr, provider, payload)
@@ -339,7 +352,8 @@ def create_app() -> Flask:
             pr_number = payload["pr_number"]
             if not pr_number:
                 return jsonify({"status": "skipped", "reason": "missing PR number"})
-            if _should_skip_duplicate(f"{provider.name}:{repo}", pr_number):
+            if _should_skip_duplicate(f"{provider.name}:{repo}", pr_number,
+                                     head_sha=payload.get("head_sha") or "HEAD"):
                 logger.info("Skipping duplicate review for %s PR #%s", repo, pr_number)
                 return jsonify({"status": "skipped", "reason": "duplicate"})
             executor.submit(_process_pr, provider, payload)
@@ -365,25 +379,17 @@ def create_app() -> Flask:
             if sender and sender.lower() == raven_user.lower():
                 return jsonify({"status": "ignored", "reason": "self-triggered"})
             # Dedup review requests separately from normal PR events
-            if _should_skip_duplicate(f"{provider.name}:{repo}", f"review-{pr_number}"):
+            if _should_skip_duplicate(f"{provider.name}:{repo}", f"review-{pr_number}",
+                                     head_sha=payload.get("head_sha") or "HEAD"):
                 return jsonify({"status": "skipped", "reason": "duplicate"})
             executor.submit(_process_pr, provider, payload)
             return jsonify({"status": "accepted", "reason": "review requested"})
 
         elif event_type in ("review_approved", "review_rejected"):
-            if event_type == "review_rejected":
-                return jsonify({"status": "ignored", "reason": "review rejected — no action"})
-            pr_number = payload.get("pr_number")
-            if not pr_number:
-                return jsonify({"status": "skipped", "reason": "missing PR number"})
-            if _is_bot_author(sender):
-                return jsonify({"status": "skipped"})
-            if _is_skipped_repo(repo):
-                return jsonify({"status": "skipped"})
-            if _should_skip_duplicate(f"{provider.name}:{repo}", f"review-approved-{pr_number}"):
-                return jsonify({"status": "skipped", "reason": "duplicate"})
-            executor.submit(_process_review_approved, provider, payload)
-            return jsonify({"status": "accepted", "reason": "checking merge eligibility"})
+            # Co-approval auto-merge was removed. Route preserved so
+            # Gitea/BB DC don't see 404s on deliveries from existing
+            # webhook configurations.
+            return jsonify({"status": "ignored", "reason": "no action taken"})
 
         elif event_type in ("comment", "diff_comment"):
             pr_number = payload.get("pr_number")
@@ -435,6 +441,57 @@ def create_app() -> Flask:
 #  Background PR review                                               #
 # ------------------------------------------------------------------ #
 
+def _should_auto_add_reviewer(provider: GitProvider, repo_full_name: str,
+                               pr_number: int) -> bool:
+    """Return True if Raven should auto-add itself as a reviewer on this PR.
+
+    Behaviour depends on the RAVEN_REVIEW_ALL_PRS switch:
+
+    * ``True`` (default): auto-add unless Raven is already a reviewer
+      (or a requested reviewer). Every PR gets a Raven review.
+    * ``False``: auto-add only when the PR has no other reviewer and
+      no other requested reviewer — the "fill-the-gap" mode.
+
+    Raven being already listed counts as "don't re-add" in both modes
+    (keeps re-review triggers idempotent).
+    """
+    try:
+        raven_user = provider.get_authenticated_user().lower()
+    except Exception as e:
+        logger.warning("Could not resolve bot user for auto-add check: %s", e)
+        return False
+    try:
+        existing = provider.get_pr_reviews(repo_full_name, pr_number)
+    except Exception as e:
+        logger.warning("Could not list reviews on %s PR #%d: %s", repo_full_name, pr_number, e)
+        return False
+    try:
+        requested = provider.get_pr_requested_reviewers(repo_full_name, pr_number)
+    except Exception as e:
+        logger.warning("Could not list requested reviewers on %s PR #%d: %s", repo_full_name, pr_number, e)
+        return False
+
+    raven_already_listed = any(
+        ((r.get("user") or {}).get("login") or "").lower() == raven_user
+        for r in existing
+    ) or any(
+        (login or "").lower() == raven_user for login in requested
+    )
+    if raven_already_listed:
+        return False
+
+    if RAVEN_REVIEW_ALL_PRS:
+        return True
+
+    other_present = any(
+        ((r.get("user") or {}).get("login") or "").lower() not in ("", raven_user)
+        for r in existing
+    ) or any(
+        (login or "").lower() not in ("", raven_user) for login in requested
+    )
+    return not other_present
+
+
 def _process_pr(provider: GitProvider, payload: dict) -> None:
     """Review a PR in a background thread. All exceptions caught here."""
     repo_full_name = None
@@ -460,13 +517,54 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 return
             _in_progress_prs.add(pr_key)
 
-        # Make the pending review visible immediately by adding Raven as a reviewer
-        # before fetching the diff. Best-effort — failures do not block the review.
+        # Auto-add Raven as a reviewer only when there are no other
+        # reviewers or requested reviewers on the PR — the "fill the
+        # gap" case where no human is assigned. If humans are already
+        # involved, stay out of the way: they can still pull Raven in
+        # by @mentioning or manually adding Raven as a reviewer, which
+        # fires the review_requested webhook and triggers _process_pr
+        # the same as any other review trigger. (Raven still runs the
+        # review regardless; it just doesn't claim the reviewer slot.)
+        # Best-effort — failures on the check or the add don't block
+        # the review itself.
         try:
-            provider.add_self_as_reviewer(repo_full_name, pr_number)
+            if _should_auto_add_reviewer(provider, repo_full_name, pr_number):
+                provider.add_self_as_reviewer(repo_full_name, pr_number)
+            else:
+                logger.info("PR #%d already has other reviewers — not auto-adding Raven", pr_number)
         except Exception as e:
             logger.warning("Failed to add Raven as reviewer on PR #%d: %s", pr_number, e)
             inc("raven_errors_total", {"type": "self_reviewer_failed", "repo": repo_full_name})
+
+        # Reviewer-status gate: review only runs if Raven is listed as
+        # a reviewer (or requested reviewer) on this PR. Combined with
+        # the auto-add step above, this means:
+        #   * RAVEN_REVIEW_ALL_PRS=true + any PR → auto-added → gate passes.
+        #   * RAVEN_REVIEW_ALL_PRS=false + no humans → auto-added → gate passes.
+        #   * RAVEN_REVIEW_ALL_PRS=false + humans → no auto-add → gate
+        #     fails unless a human manually added Raven earlier.
+        try:
+            raven_user_lc = (provider.get_authenticated_user() or "").lower()
+            reviews_for_gate = provider.get_pr_reviews(repo_full_name, pr_number)
+            requested_for_gate = provider.get_pr_requested_reviewers(repo_full_name, pr_number)
+        except Exception as e:
+            logger.warning("Could not verify Raven's reviewer status on PR #%d — proceeding anyway: %s",
+                           pr_number, e)
+            raven_user_lc = ""
+            reviews_for_gate = []
+            requested_for_gate = []
+
+        if raven_user_lc:
+            raven_listed = any(
+                ((r.get("user") or {}).get("login") or "").lower() == raven_user_lc
+                for r in reviews_for_gate
+            ) or any(
+                (login or "").lower() == raven_user_lc for login in requested_for_gate
+            )
+            if not raven_listed:
+                logger.debug("PR #%d — Raven not a reviewer, skipping review", pr_number)
+                inc("raven_reviews_skipped_total", {"reason": "not_reviewer", "repo": repo_full_name})
+                return
 
         # Fetch diff
         diff = provider.fetch_pr_diff(repo_full_name, pr_number)
@@ -492,6 +590,9 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
 
         base_ref = payload.get("base_ref") or "HEAD"
         rules = _fetch_rules(provider, repo_full_name, base_ref)
+        review_prompt_override = _fetch_prompt_override(
+            provider, repo_full_name, base_ref, "review",
+        )
 
         # Guard: empty diff after stripping lockfiles/binaries
         clean_diff = _strip_lockfiles_and_binaries(diff)
@@ -573,6 +674,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 pr_title=pr_title, pr_description=pr_description,
                 pr_comments=pr_comments, bot_user=bot_user,
                 rules=rules,
+                prompt_override=review_prompt_override,
             )
         # Save original findings before merging carried ones (used for cache write)
         fresh_findings = list(review.get("findings", []))
@@ -692,9 +794,12 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
     except Exception as e:
         logger.error("Unhandled error processing PR: %s", e, exc_info=True)
         inc("raven_errors_total", {"type": "unhandled", "repo": repo_full_name or "unknown"})
-        # Clear dedup entry so webhook retries can re-attempt this PR
+        # Clear dedup entry so webhook retries can re-attempt this PR.
+        # Key format must match _should_skip_duplicate's — same head_sha
+        # fallback ("HEAD") as dispatch so the SHA-aware suffix aligns.
         if repo_full_name is not None and pr_number is not None:
-            key = f"{provider.name}:{repo_full_name}#{pr_number}"
+            dedup_sha = payload.get("head_sha") or "HEAD"
+            key = f"{provider.name}:{repo_full_name}#{pr_number}@{dedup_sha}"
             with _recent_prs_lock:
                 _recent_prs.pop(key, None)
             try:
@@ -797,11 +902,24 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 logger.debug("Could not fetch code snippet for %s:%s — %s",
                              file_path, line, e)
 
+        # Fetch per-repo respond-prompt override from the PR base branch.
+        # Best-effort: fall back to the built-in default on any failure.
+        respond_prompt_override = None
+        try:
+            base_ref = provider.get_pr_base_ref(repo_full_name, pr_number)
+            respond_prompt_override = _fetch_prompt_override(
+                provider, repo_full_name, base_ref, "respond",
+            )
+        except Exception as e:
+            logger.debug("Could not resolve base ref / respond override for PR #%d: %s",
+                         pr_number, e)
+
         # Generate response
         response = respond_to_comment(
             comment_body, conversation, diff, repo_full_name,
             claude_md=claude_md, file_path=file_path, line=line,
             code_snippet=code_snippet,
+            prompt_override=respond_prompt_override,
         )
 
         # Post response (skip if Claude returned nothing)
@@ -876,7 +994,8 @@ def _safe_do_merge(provider: GitProvider, repo_full_name: str, pr_number: int,
                      pr_number, repo_full_name, e, exc_info=True)
         inc("raven_errors_total", {"type": "merge_unhandled", "repo": repo_full_name})
         # Clear dedup so a webhook retry can re-attempt the review + merge.
-        key = f"{provider.name}:{repo_full_name}#{pr_number}"
+        # head_sha here is the same value that _process_pr used for dispatch.
+        key = f"{provider.name}:{repo_full_name}#{pr_number}@{head_sha or 'HEAD'}"
         with _recent_prs_lock:
             _recent_prs.pop(key, None)
         with contextlib.suppress(Exception):
@@ -950,71 +1069,6 @@ def _do_merge(provider: GitProvider, repo_full_name: str, pr_number: int,
 #  Review-approved handler                                             #
 # ------------------------------------------------------------------ #
 
-_AUTO_MERGE_ON_APPROVAL = os.environ.get("RAVEN_AUTO_MERGE_ON_APPROVAL", "").lower() in ("1", "true", "yes")
-
-
-def _latest_review_per_user(reviews: list[dict]) -> dict[str, str]:
-    """Resolve review list to {login: latest_state}. Later entries win."""
-    latest: dict[str, str] = {}
-    for r in reviews:
-        login = r.get("user", {}).get("login", "")
-        state = r.get("state", "")
-        if login and state in ("APPROVED", "REQUEST_CHANGES"):
-            latest[login] = state
-    return latest
-
-
-def _process_review_approved(provider: GitProvider, payload: dict) -> None:
-    """Check if a human approval means we can now auto-merge a Raven-approved PR."""
-    try:
-        if not _AUTO_MERGE_ON_APPROVAL:
-            logger.debug("RAVEN_AUTO_MERGE_ON_APPROVAL not enabled — ignoring review_approved event")
-            return
-
-        repo_full_name = payload["repo"]
-        pr_number = payload["pr_number"]
-        pr_title = payload.get("pr_title") or f"PR #{pr_number}"
-        pr_url = payload.get("pr_url", "")
-
-        raven_user = provider.get_authenticated_user()
-        reviews = provider.get_pr_reviews(repo_full_name, pr_number)
-
-        # Resolve to latest review state per user (handles superseded reviews)
-        latest = _latest_review_per_user(reviews)
-
-        if latest.get(raven_user) != "APPROVED":
-            logger.info("PR #%d: Raven's latest review is not APPROVED — skipping merge", pr_number)
-            return
-
-        # Check no reviewer has outstanding REQUEST_CHANGES
-        has_rejections = any(
-            state == "REQUEST_CHANGES" for login, state in latest.items() if login != raven_user
-        )
-        if has_rejections:
-            logger.info("PR #%d: outstanding REQUEST_CHANGES from another reviewer — skipping merge", pr_number)
-            return
-
-        # Check no outstanding requested reviewers remain
-        requested = provider.get_pr_requested_reviewers(repo_full_name, pr_number)
-        if requested:
-            logger.info("PR #%d: still has requested reviewers — skipping merge", pr_number)
-            return
-
-        current_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
-        merge_strategy = os.environ.get("MERGE_STRATEGY", "squash")
-        # Construct a minimal review dict for notifications
-        review = {"severity": "low", "summary": "Previously approved by Raven", "findings": []}
-
-        # Dispatched to the CI-wait pool so this handler returns
-        # quickly — same motivation as in _process_pr.
-        fut = ci_wait_executor.submit(_safe_do_merge, provider, repo_full_name, pr_number,
-                                       pr_title, pr_url, review, current_sha, merge_strategy)
-        fut.add_done_callback(functools.partial(_log_future_exception, repo=repo_full_name))
-
-    except Exception as e:
-        logger.error("Failed to process review_approved: %s", e, exc_info=True)
-
-
 # ------------------------------------------------------------------ #
 #  CI status polling                                                   #
 # ------------------------------------------------------------------ #
@@ -1025,14 +1079,28 @@ def _wait_for_ci(provider: GitProvider, repo_full_name: str, sha: str, timeout: 
     Returns 'success', 'failure', 'error', 'pending', or 'none'.
     'none' means no CI is configured for this repo.
 
-    Waits 10s before the first check to give CI time to register 'pending'.
-    Without this, Raven can merge before CI even starts.
+    Fast path: probe once up front and short-circuit on any terminal
+    state (``success``, ``failure``, ``error``, ``none``). By the time
+    ``_do_merge`` is invoked the review has already taken 30-60s; if CI
+    was going to register ``pending`` it has. The fast path saves the
+    10-second initial delay for the no-CI and CI-already-done cases
+    (re-reviews on pushed branches hit this often).
+
+    Slow path: if the first probe returns ``pending``, sleep an initial
+    10s and then poll at ``interval`` until ``timeout``. The delay
+    exists as belt-and-braces in case ``pending`` flaps back to
+    ``none`` momentarily on some providers.
     """
+    # Fast path — terminal state already known.
+    initial = provider.get_commit_status(repo_full_name, sha)
+    if initial in ("success", "failure", "error", "none"):
+        return initial
+
     initial_delay = 10
     interval = 15
     elapsed = 0
 
-    # Give CI time to pick up the job and set status to 'pending'
+    # Give CI time to stabilise before the next probe
     time.sleep(initial_delay)
     elapsed += initial_delay
 
@@ -1362,6 +1430,34 @@ def _fetch_rules(provider: GitProvider, repo_full_name: str, ref: str) -> dict[s
     if rules:
         logger.info("Loaded %d rule file(s) from %s for %s", len(rules), RULES_DIR, repo_full_name)
     return rules
+
+
+def _fetch_prompt_override(provider: GitProvider, repo_full_name: str,
+                            ref: str, name: str) -> str | None:
+    """Fetch a per-repo prompt override from ``{RULES_DIR}/raven/prompts/{name}.md``.
+
+    Returns the file contents on success, ``None`` on any failure mode
+    (missing file, fetch error, empty / whitespace-only content, or
+    ``RULES_DIR`` disabled). Callers must treat ``None`` as "no override,
+    use the built-in default".
+
+    ``name`` is ``"review"`` or ``"respond"`` — not validated, but only
+    those two are currently wired into the reviewer.
+    """
+    if not RULES_DIR:
+        return None
+    path = f"{RULES_DIR}/raven/prompts/{name}.md"
+    try:
+        content = provider.fetch_file(repo_full_name, path, ref=ref)
+    except Exception as e:
+        logger.debug("Prompt override fetch for %s@%s/%s: %s",
+                     repo_full_name, ref[:8] if ref else "", path, e)
+        return None
+    if not content or not content.strip():
+        return None
+    logger.info("Loaded %s prompt override from %s for %s",
+                name, path, repo_full_name)
+    return content
 
 
 def _notify_if_needed(repo_full_name: str, pr_number: int, pr_title: str, pr_url: str, review: dict) -> None:

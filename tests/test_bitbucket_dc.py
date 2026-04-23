@@ -763,6 +763,29 @@ class TestGetPrHeadSha:
                 client.get_pr_head_sha("PROJ/repo", 7)
 
 
+# ------------------------------------------------------------------ #
+#  PR base ref                                                        #
+# ------------------------------------------------------------------ #
+
+class TestGetPrBaseRef:
+    def test_returns_base_ref(self, client):
+        data = {"toRef": {"displayId": "main"}}
+        with _mock_get(client, json_data=data):
+            assert client.get_pr_base_ref("PROJ/repo", 7) == "main"
+
+    def test_url_contains_pr_number(self, client):
+        data = {"toRef": {"displayId": "main"}}
+        with _mock_get(client, json_data=data) as mock_get:
+            client.get_pr_base_ref("PROJ/repo", 42)
+        url = mock_get.call_args[0][0]
+        assert "/pull-requests/42" in url
+
+    def test_missing_base_ref_raises(self, client):
+        with _mock_get(client, json_data={}):
+            with pytest.raises(RuntimeError, match="empty base ref"):
+                client.get_pr_base_ref("PROJ/repo", 7)
+
+
 class TestGetPrDescription:
     def test_returns_description(self, client):
         with _mock_get(client, json_data={"description": "Fixes DEV-123\n\nApproach: ..."}):
