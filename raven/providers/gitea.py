@@ -269,15 +269,22 @@ class GiteaProvider(GitProvider):
         return all_reviews
 
     def get_pr_requested_reviewers(self, repo_full_name: str, pr_number: int) -> list[str]:
-        """Return login names of users requested to review this PR."""
+        """Return login names of users requested to review this PR.
+
+        Reads the ``requested_reviewers`` field from the PR object
+        itself. The dedicated ``/pulls/{n}/requested_reviewers``
+        endpoint returns 404 on some Gitea versions (self-hosted 1.22
+        has been observed), and silently returning ``[]`` there would
+        make auto-add and the reviewer-status gate misjudge the PR's
+        state. The PR object's field is populated reliably across
+        versions.
+        """
         owner, repo = _split_repo(repo_full_name)
-        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/requested_reviewers"
+        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}"
         resp = self.session.get(url, timeout=10)
-        if resp.status_code == 404:
-            return []
         resp.raise_for_status()
-        data = resp.json()
-        users = data.get("users", []) if isinstance(data, dict) else data
+        data = resp.json() or {}
+        users = data.get("requested_reviewers") or []
         return [u.get("login", "") for u in users if isinstance(u, dict)]
 
     def add_self_as_reviewer(self, repo_full_name: str, pr_number: int) -> None:

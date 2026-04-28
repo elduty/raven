@@ -1,137 +1,62 @@
-"""reviewer.py — Runs claude CLI with a diff and parses the JSON response."""
+"""reviewer.py — Runs an AI backend with a diff and parses the JSON response."""
 
-import contextlib
 import hashlib
 import json
 import logging
 import os
 import re
 import secrets
-import subprocess
-import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from raven.ai import get_backend
+
 logger = logging.getLogger(__name__)
 
-CLAUDE_BIN = "/usr/bin/claude"
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-6")
-CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "max")
+# Backend-agnostic AI knobs. New names are RAVEN_AI_*; legacy CLAUDE_*
+# names are honored as a fallback so existing deployments don't need a
+# coordinated env-var change. The Python identifiers stay CLAUDE_*-named
+# to avoid churning every call site for a refactor that's purely about
+# operator-facing config strings.
+CLAUDE_MODEL = (
+    os.environ.get("RAVEN_AI_MODEL")
+    or os.environ.get("CLAUDE_MODEL")
+    or "claude-opus-4-7"
+)
+MAX_CONCURRENT_CLAUDE = max(int(
+    os.environ.get("RAVEN_AI_MAX_CONCURRENT")
+    or os.environ.get("RAVEN_MAX_CONCURRENT_CLAUDE")
+    or "4"
+), 1)
+CLAUDE_EFFORT = (
+    os.environ.get("RAVEN_AI_EFFORT")
+    or os.environ.get("CLAUDE_EFFORT")
+    or "max"
+)
 # Conversational replies don't need max thinking — default to medium for
-# cheaper/faster responses. Override with CLAUDE_EFFORT_COMMENT.
-CLAUDE_EFFORT_COMMENT = os.environ.get("CLAUDE_EFFORT_COMMENT", "medium")
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
-MAX_CONCURRENT_CLAUDE = max(int(os.environ.get("RAVEN_MAX_CONCURRENT_CLAUDE", "4")), 1)
-_claude_semaphore = threading.Semaphore(MAX_CONCURRENT_CLAUDE)
-
-# Track in-flight Claude CLI subprocesses so shutdown hooks can terminate
-# them. Each active Popen is added to _active_procs for the lifetime of
-# the call and removed in the finally block. terminate_active_processes()
-# sends SIGTERM to each, escalating to SIGKILL after a grace period — this
-# prevents gunicorn's graceful timeout from being consumed by LLM inference
-# whose result will be discarded on exit.
-_active_procs: set[subprocess.Popen] = set()
-_active_procs_lock = threading.Lock()
-
-
-def _run_claude_cli(args: list[str], *, prompt: str, timeout: int) -> subprocess.CompletedProcess:
-    """Spawn the Claude CLI with a tracked Popen handle.
-
-    Equivalent to ``subprocess.run`` for our usage (stdin=prompt,
-    captured stdout/stderr, text mode) but goes through Popen explicitly
-    so the child is registered in ``_active_procs`` for the duration of
-    the call. ``terminate_active_processes`` can then SIGTERM every
-    in-flight subprocess on shutdown.
-
-    The Popen is used as a context manager so ``__exit__`` closes the
-    stdin/stdout/stderr pipes and waits on the child even when an
-    exception unwinds the block — matching ``subprocess.run``'s
-    cleanup semantics. The bare ``except BaseException`` clause
-    mirrors ``subprocess.run``'s own handling: on any non-timeout
-    error (``BrokenPipeError`` if the child exits mid-write, ``OSError``
-    on I/O failure, ``KeyboardInterrupt``), the child is killed so the
-    context-manager exit doesn't hang waiting for it.
-
-    Raises ``subprocess.TimeoutExpired`` and ``FileNotFoundError`` with
-    the same semantics as ``subprocess.run`` so callers can catch them.
-    """
-    with subprocess.Popen(
-        args,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ) as proc:
-        with _active_procs_lock:
-            _active_procs.add(proc)
-        try:
-            stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            raise
-        except BaseException:
-            # Any other exception (BrokenPipeError, OSError, KeyboardInterrupt):
-            # kill the child so the with-exit wait() doesn't block.
-            # subprocess.run uses the same bare-except pattern.
-            proc.kill()
-            raise
-        finally:
-            with _active_procs_lock:
-                _active_procs.discard(proc)
-    return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+# cheaper/faster responses. Override with RAVEN_AI_EFFORT_COMMENT.
+CLAUDE_EFFORT_COMMENT = (
+    os.environ.get("RAVEN_AI_EFFORT_COMMENT")
+    or os.environ.get("CLAUDE_EFFORT_COMMENT")
+    or "medium"
+)
+CLAUDE_TIMEOUT = int(
+    os.environ.get("RAVEN_AI_TIMEOUT")
+    or os.environ.get("CLAUDE_TIMEOUT")
+    or "600"
+)
 
 
 def terminate_active_processes(grace_period: float = 2.0) -> int:
-    """SIGTERM every in-flight Claude subprocess, SIGKILL survivors.
+    """Shutdown hook — delegates to the active backend.
 
-    Called from the server's shutdown hook. Running reviews that survive
-    ``cancel_futures`` are almost always blocked in a Claude CLI call
-    (the diff fetch is short); killing those subprocesses unblocks the
-    worker threads so gunicorn's graceful shutdown can finish instead of
-    waiting the full ``CLAUDE_TIMEOUT``.
-
-    Returns the number of processes that were signalled.
+    Kept at this import path so server.py's shutdown handler doesn't
+    need to change. The actual teardown (SIGTERM-and-wait for Claude CLI
+    subprocesses, or HTTP-client close for OpenAI-compatible backends)
+    lives in the backend's shutdown() method.
     """
-    with _active_procs_lock:
-        procs = list(_active_procs)
-    if not procs:
-        return 0
-    logger.info("Terminating %d in-flight Claude CLI subprocess(es)", len(procs))
-    for p in procs:
-        with contextlib.suppress(Exception):
-            p.terminate()
-    deadline = time.monotonic() + grace_period
-    for p in procs:
-        remaining = max(0.0, deadline - time.monotonic())
-        try:
-            p.wait(timeout=remaining)
-            continue  # exited cleanly within the grace period
-        except subprocess.TimeoutExpired:
-            pass  # still alive — escalate below
-        except Exception:
-            # Already reaped, OSError on racily-closed pipe, etc.
-            # Nothing useful a kill can do; move on to the next proc
-            # instead of aborting the whole loop.
-            continue
-        with contextlib.suppress(Exception):
-            p.kill()
-            p.wait(timeout=1)
-    return len(procs)
+    return get_backend().shutdown(grace_period)
 
-# Restrict the Claude CLI to plain text generation. Raven feeds the CLI
-# user-controlled content (diff text, PR comments, conversation history) —
-# without an explicit tool allowlist, a prompt-injection could coerce the
-# model into running tools with access to credentials and the network.
-# Passing an empty --allowed-tools denies every tool; if a future CLI
-# version changes the semantics, the output will surface the divergence
-# in the no-tools integration test rather than silently regress.
-CLAUDE_BASE_ARGS = [
-    CLAUDE_BIN, "-p",
-    "--output-format", "text",
-    "--allowed-tools", "",
-]
 
 # Load review prompt from prompts/review.md (relative to this package)
 _PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "review.md"
@@ -436,8 +361,8 @@ def _build_pr_context_section(pr_title: str, pr_description: str,
 
 
 def review_config_hash() -> str:
-    """SHA256 of model + effort + prompt — changes when review config changes."""
-    content = f"{CLAUDE_MODEL}:{CLAUDE_EFFORT}:{_REVIEW_PROMPT_TEMPLATE}"
+    """SHA256 of backend + model + effort + prompt — changes when review config changes."""
+    content = f"{get_backend().name}:{CLAUDE_MODEL}:{CLAUDE_EFFORT}:{_REVIEW_PROMPT_TEMPLATE}"
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 # Binary / lock file extensions and names to strip from diffs
@@ -590,7 +515,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
         else:
             reviewable.append((filename, chunk))
 
-    # Review chunks in parallel (bounded by _claude_semaphore).
+    # Review chunks in parallel (concurrency bounded by the backend's semaphore).
     # Per-file chunks share the same PR title + description, so include
     # those (they're short and carry author intent). Skip pr_comments in
     # chunked mode: replicating up to REVIEW_COMMENT_CONTEXT × the per-
@@ -734,32 +659,19 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
         )
 
     logger.info(
-        "Running claude CLI for %s%s (model=%s effort=%s diff=%d lines)",
-        repo_name, f"/{filename_hint}" if filename_hint else "",
+        "Reviewing %s%s (model=%s effort=%s diff=%d lines)",
+        repo_name,
+        f"/{filename_hint}" if filename_hint else "",
         CLAUDE_MODEL, CLAUDE_EFFORT, diff.count("\n"),
     )
-    with _claude_semaphore:
-        try:
-            result = _run_claude_cli(
-                CLAUDE_BASE_ARGS + [
-                    "--model", CLAUDE_MODEL,
-                    "--effort", CLAUDE_EFFORT,
-                ],
-                prompt=prompt,
-                timeout=CLAUDE_TIMEOUT,
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"claude CLI timed out after {CLAUDE_TIMEOUT}s")
-        except FileNotFoundError:
-            raise RuntimeError(f"claude CLI not found at {CLAUDE_BIN}")
-
-    if result.returncode != 0:
-        logger.error("claude CLI stderr: %s", result.stderr[:500])
-        logger.error("claude CLI stdout: %s", result.stdout[:500])
-        detail = result.stderr[:200] or result.stdout[:200]
-        raise RuntimeError(f"claude CLI exited with code {result.returncode}: {detail}")
-
-    return _parse_response(result.stdout)
+    output = get_backend().complete(
+        prompt,
+        model=CLAUDE_MODEL,
+        effort=CLAUDE_EFFORT,
+        timeout=CLAUDE_TIMEOUT,
+        purpose="review",
+    )
+    return _parse_response(output)
 
 
 def _parse_response(output: str) -> dict:
@@ -884,26 +796,16 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
         f"Write your response:"
     )
 
-    logger.info("Generating response for %s (model=%s effort=%s)",
-                repo_name, CLAUDE_MODEL, CLAUDE_EFFORT_COMMENT)
-
-    with _claude_semaphore:
-        try:
-            result = _run_claude_cli(
-                CLAUDE_BASE_ARGS + [
-                    "--model", CLAUDE_MODEL,
-                    "--effort", CLAUDE_EFFORT_COMMENT,
-                ],
-                prompt=prompt,
-                timeout=CLAUDE_TIMEOUT,
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"claude CLI timed out after {CLAUDE_TIMEOUT}s")
-        except FileNotFoundError:
-            raise RuntimeError(f"claude CLI not found at {CLAUDE_BIN}")
-
-    if result.returncode != 0:
-        logger.error("claude CLI stderr: %s", result.stderr[:500])
-        raise RuntimeError(f"claude CLI exited with code {result.returncode}")
-
-    return result.stdout.strip()
+    logger.info(
+        "Responding on %s%s (model=%s effort=%s)",
+        repo_name,
+        f" {file_path}:{line}" if file_path and line else (f" {file_path}" if file_path else ""),
+        CLAUDE_MODEL, CLAUDE_EFFORT_COMMENT,
+    )
+    return get_backend().complete(
+        prompt,
+        model=CLAUDE_MODEL,
+        effort=CLAUDE_EFFORT_COMMENT,
+        timeout=CLAUDE_TIMEOUT,
+        purpose="respond",
+    ).strip()

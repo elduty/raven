@@ -6,8 +6,6 @@ import pytest
 import requests
 from unittest.mock import MagicMock, patch
 
-os.environ.setdefault("GITEA_URL", "https://gitea.example.com")
-os.environ.setdefault("GITEA_TOKEN", "test-token")
 
 from raven.providers.gitea import GiteaProvider, _split_repo
 
@@ -294,11 +292,46 @@ class TestGetPrReviews:
 
 
 class TestGetPrRequestedReviewers:
-    def test_returns_logins(self, client):
-        data = {"users": [{"login": "alice"}, {"login": "bob"}]}
-        with _mock_get(client, json_data=data):
+    def test_returns_logins_from_pr_object(self, client):
+        """Reads the field from the PR object itself, not the separate
+        /requested_reviewers endpoint. That dedicated endpoint returns
+        404 on some Gitea versions; the PR object's field is reliable."""
+        data = {
+            "number": 7,
+            "requested_reviewers": [{"login": "alice"}, {"login": "bob"}],
+        }
+        with _mock_get(client, json_data=data) as mock_get:
             result = client.get_pr_requested_reviewers("owner/repo", 7)
         assert result == ["alice", "bob"]
+        url = mock_get.call_args[0][0]
+        # Calls the PR object, not the dedicated /requested_reviewers path
+        assert url.endswith("/repos/owner/repo/pulls/7")
+        assert not url.endswith("/requested_reviewers")
+
+    def test_empty_when_requested_reviewers_null(self, client):
+        """Gitea returns requested_reviewers: null when no one is requested."""
+        data = {"number": 7, "requested_reviewers": None}
+        with _mock_get(client, json_data=data):
+            result = client.get_pr_requested_reviewers("owner/repo", 7)
+        assert result == []
+
+    def test_empty_when_requested_reviewers_missing(self, client):
+        """Defensive: field absent from response entirely."""
+        data = {"number": 7}
+        with _mock_get(client, json_data=data):
+            result = client.get_pr_requested_reviewers("owner/repo", 7)
+        assert result == []
+
+    def test_skips_non_dict_entries(self, client):
+        """Defensive: if the list contains something other than a user
+        dict (unlikely but the old code tolerated it), skip it."""
+        data = {
+            "number": 7,
+            "requested_reviewers": [{"login": "alice"}, None, "not-a-dict"],
+        }
+        with _mock_get(client, json_data=data):
+            result = client.get_pr_requested_reviewers("owner/repo", 7)
+        assert result == ["alice"]
 
     def test_http_error_raises(self, client):
         mock_resp = MagicMock()

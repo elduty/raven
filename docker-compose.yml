@@ -43,11 +43,18 @@ services:
       # Toggles: empty = off. server.py parses (".lower() in 1|true|yes").
       - RAVEN_GITEA_AUTO_MERGE=${RAVEN_GITEA_AUTO_MERGE:-}
       - RAVEN_REVIEW_ALL_PRS=${RAVEN_REVIEW_ALL_PRS:-true}
-      # ── Claude CLI (defaults must match raven/reviewer.py)
-      - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-opus-4-6}
-      - CLAUDE_EFFORT=${CLAUDE_EFFORT:-max}
-      - CLAUDE_EFFORT_COMMENT=${CLAUDE_EFFORT_COMMENT:-medium}
-      - CLAUDE_TIMEOUT=${CLAUDE_TIMEOUT:-600}
+      # ── AI model & effort (defaults must match raven/reviewer.py).
+      # Apply to BOTH backends. Legacy CLAUDE_* names are still honored
+      # by the code as a fallback; new deployments should use RAVEN_AI_*.
+      - RAVEN_AI_MODEL=${RAVEN_AI_MODEL:-${CLAUDE_MODEL:-claude-opus-4-7}}
+      - RAVEN_AI_EFFORT=${RAVEN_AI_EFFORT:-${CLAUDE_EFFORT:-max}}
+      - RAVEN_AI_EFFORT_COMMENT=${RAVEN_AI_EFFORT_COMMENT:-${CLAUDE_EFFORT_COMMENT:-medium}}
+      - RAVEN_AI_TIMEOUT=${RAVEN_AI_TIMEOUT:-${CLAUDE_TIMEOUT:-600}}
+      # ── AI backend (pick ONE of the credential sets below; see README)
+      - RAVEN_AI_BACKEND=${RAVEN_AI_BACKEND:-}
+      - RAVEN_AI_API_BASE=${RAVEN_AI_API_BASE:-}
+      - RAVEN_AI_API_KEY=${RAVEN_AI_API_KEY:-}
+      - RAVEN_AI_MAX_TOKENS=${RAVEN_AI_MAX_TOKENS:-}
       # ── Comment replies (default must match raven/server.py)
       - RAVEN_COMMENT_HISTORY=${RAVEN_COMMENT_HISTORY:-20}
       # ── Review PR-conversation context (defaults must match raven/reviewer.py)
@@ -65,7 +72,7 @@ services:
       - RAVEN_LABEL_NAME=${RAVEN_LABEL_NAME:-raven-reviewed}
       - RAVEN_MAX_WORKERS=${RAVEN_MAX_WORKERS:-16}
       - RAVEN_CI_WAIT_WORKERS=${RAVEN_CI_WAIT_WORKERS:-32}
-      - RAVEN_MAX_CONCURRENT_CLAUDE=${RAVEN_MAX_CONCURRENT_CLAUDE:-4}
+      - RAVEN_AI_MAX_CONCURRENT=${RAVEN_AI_MAX_CONCURRENT:-${RAVEN_MAX_CONCURRENT_CLAUDE:-4}}
       - RAVEN_MAX_CACHED_PRS=${RAVEN_MAX_CACHED_PRS:-200}
       # Cache dir must live on the named volume — override any .env value.
       - RAVEN_CACHE_DIR=/data/raven

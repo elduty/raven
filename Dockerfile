@@ -32,8 +32,8 @@ COPY entrypoint.sh ./entrypoint.sh
 RUN mkdir -p /app/logs
 
 ENV PYTHONUNBUFFERED=1 \
-    CLAUDE_MODEL=claude-opus-4-6 \
-    CLAUDE_EFFORT=max
+    RAVEN_AI_MODEL=claude-opus-4-7 \
+    RAVEN_AI_EFFORT=max
 
 EXPOSE 8080
 

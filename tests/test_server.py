@@ -7,10 +7,6 @@ import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-os.environ.setdefault("GITEA_URL", "https://gitea.example.com")
-os.environ.setdefault("GITEA_TOKEN", "test-token")
-os.environ.setdefault("RAVEN_WEBHOOK_SECRET", "testsecret")
-os.environ.setdefault("GITEA_WEBHOOK_SECRET", "testsecret")
 
 import raven.server as _server_mod
 from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _fetch_rules, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _wait_for_ci, _should_skip_duplicate, _do_merge, _safe_do_merge, _truncate_diff_for_comment, _extract_code_snippet, _shutdown_executor, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
@@ -701,6 +697,38 @@ class TestProcessPr:
             mock_review.return_value = {"severity": "low", "summary": "Clean", "findings": []}
             _process_pr(mc, self._normalized_payload())
         mc.merge_pr.assert_not_called()
+
+    def test_merged_when_only_raven_in_requested_reviewers(self):
+        """Regression guard: when Raven auto-adds itself or a human
+        re-requests its review, the bot's own login lands in
+        requested_reviewers. The auto-merge gate must filter Raven out
+        of that list — otherwise every PR Raven self-requests is
+        falsely classified as 'has other reviewers' and never merges.
+
+        This bug stayed hidden because the existing reviewer-gate
+        tests populated requested_reviewers with non-Raven names only.
+        """
+        mc = self._make_provider()
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.get_authenticated_user.return_value = "Raven"
+            # Raven approved AND Raven is still in requested_reviewers
+            # (mixed case to verify the filter is case-insensitive).
+            mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
+            mc.get_pr_requested_reviewers.return_value = ["raven"]
+            mc.get_pr_head_sha.return_value = "abc123"
+            mc.get_commit_status.return_value = "success"
+            mc.merge_pr.return_value = True
+            mock_review.return_value = {"severity": "low", "summary": "Clean", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+        mc.merge_pr.assert_called_once()
 
     def test_merge_passes_head_sha_for_atomic_safety(self):
         """head_commit_id is passed to merge_pr so Gitea rejects if SHA changed."""

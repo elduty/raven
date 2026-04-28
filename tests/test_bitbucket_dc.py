@@ -7,8 +7,6 @@ import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-os.environ.setdefault("GITEA_URL", "https://gitea.example.com")
-os.environ.setdefault("GITEA_TOKEN", "test-token")
 
 from raven.providers.bitbucket_dc import BitbucketDCProvider, _split_repo
 

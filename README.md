@@ -18,7 +18,7 @@ push to branch
       -> strip lockfiles and binaries
       -> incremental check: only review files changed since last review
       -> fetch full file contents for context
-      -> send to Claude Opus via stdin (extended thinking, --effort max)
+      -> send to the configured AI backend (claude_cli subprocess, or openai_compatible HTTP)
       -> parse JSON response with file/line locations
       -> guard: if parse failed, post warning, notify, do NOT merge
       -> submit formal review (APPROVED or REQUEST_CHANGES)
@@ -51,7 +51,7 @@ Developers can @mention Raven in PR comments to ask questions or dispute finding
 - **Threaded replies** — on platforms that support comment threads (Bitbucket Data Center), Raven replies inside the thread rather than posting a top-level comment.
 - **No re-@mention inside Raven's threads** — any reply in a thread where Raven has already participated triggers a follow-up, so the conversation flows naturally.
 - **Line-aware context** — inline diff comments get a line-numbered snippet of the file injected into the prompt, so Raven answers about the exact code without having to parse hunk headers.
-- **Faster effort** — comment replies default to `CLAUDE_EFFORT_COMMENT=medium`; PR reviews still use max.
+- **Faster effort** — comment replies default to `RAVEN_AI_EFFORT_COMMENT=medium`; PR reviews still use max.
 
 ## Quick start
 
@@ -100,7 +100,7 @@ See [docs/bitbucket-dc-setup.md](docs/bitbucket-dc-setup.md) for the full guide.
 
 ### Claude Code OAuth
 
-Raven uses the Claude Code CLI with OAuth authentication.
+Only required when using the `claude_cli` backend (see [AI backend](#ai-backend) below).
 
 Generate a portable token (~1 year lifetime) on a machine with Claude Code installed:
 
@@ -131,8 +131,12 @@ All configuration is via environment variables. See `config.example.env` for the
 | `RAVEN_WEBHOOK_SECRET` | — | — | Deprecated alias for `GITEA_WEBHOOK_SECRET`. Still works for backward compat. |
 | `GITEA_URL` | Gitea | — | Base URL of the Gitea instance. |
 | `GITEA_TOKEN` | Gitea | — | Gitea personal access token. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Yes | — | Claude Code OAuth token (JSON blob from `claude setup-token`, or a bare access token). |
+| `CLAUDE_CODE_OAUTH_TOKEN` | claude_cli | — | Claude Code OAuth token (JSON blob from `claude setup-token`, or a bare access token). Required only for the `claude_cli` backend. |
 | `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` | No | — | Only needed if `CLAUDE_CODE_OAUTH_TOKEN` is a bare token string (not a JSON blob). Enables automatic token refresh. |
+| `RAVEN_AI_BACKEND` | No | auto | Force a backend (`claude_cli` or `openai_compatible`). Omit to auto-detect from credentials. |
+| `RAVEN_AI_API_BASE` | openai_compatible | — | Base URL of the OpenAI-compatible endpoint (LiteLLM proxy, vLLM, OpenRouter, OpenAI, etc.). |
+| `RAVEN_AI_API_KEY` | openai_compatible | — | API key for the OpenAI-compatible endpoint. |
+| `RAVEN_AI_MAX_TOKENS` | No | — | When set, passed as `max_tokens` to the `openai_compatible` backend. Use this to lift the model's default output cap (e.g., GPT-4o defaults to 16k) so long reviews don't truncate mid-JSON. Ignored by `claude_cli`. |
 | `NOTIFY_CHANNELS` | No | — | JSON array of notification channels (see below). |
 | `REVIEW_APPROVE_MAX_SEVERITY` | No | `low` | Approve PRs at or below this severity (`low`, `medium`, `high`). |
 | `MERGE_STRATEGY` | No | `squash` | Merge method (`squash`, `merge`, `rebase`). |
@@ -140,10 +144,10 @@ All configuration is via environment variables. See `config.example.env` for the
 | `CI_WAIT_TIMEOUT` | No | `300` | Seconds to wait for CI before giving up. `0` to skip CI check. |
 | `SKIP_REPOS` | No | — | Comma-separated `owner/repo` list to skip. |
 | `SKIP_AUTHORS` | No | — | Comma-separated author names to skip. |
-| `CLAUDE_MODEL` | No | `claude-opus-4-6` | Model to use for reviews. |
-| `CLAUDE_EFFORT` | No | `max` | Thinking effort on PR reviews (`low`, `medium`, `high`, `max`). |
-| `CLAUDE_EFFORT_COMMENT` | No | `medium` | Thinking effort on comment replies. Q&A rarely needs max. |
-| `CLAUDE_TIMEOUT` | No | `600` | Timeout in seconds for each Claude CLI invocation. |
+| `RAVEN_AI_MODEL` | No | `claude-opus-4-7` | Model to use for reviews. Backend-agnostic — the string is whatever your active backend (and any proxy) routes. Legacy alias: `CLAUDE_MODEL`. |
+| `RAVEN_AI_EFFORT` | No | `max` | Thinking effort on PR reviews (`none`, `low`, `medium`, `high`, `max`). `none` omits `reasoning_effort` from the OpenAI-compatible request entirely — use it when routing to non-reasoning models behind a proxy that doesn't strip the param. Legacy alias: `CLAUDE_EFFORT`. |
+| `RAVEN_AI_EFFORT_COMMENT` | No | `medium` | Thinking effort on comment replies (`none`, `low`, `medium`, `high`, `max`). Q&A rarely needs max. Legacy alias: `CLAUDE_EFFORT_COMMENT`. |
+| `RAVEN_AI_TIMEOUT` | No | `600` | Per-request timeout in seconds (CLI subprocess for `claude_cli`, HTTP call for `openai_compatible`). Legacy alias: `CLAUDE_TIMEOUT`. |
 | `RAVEN_COMMENT_HISTORY` | No | `20` | Recent comments passed to Claude as conversation context (for @mention replies). |
 | `RAVEN_REVIEW_COMMENT_CONTEXT` | No | `20` | Max non-bot PR comments included in the review prompt's "PR Conversation" section. `0` disables the subsection. |
 | `RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS` | No | `4000` | Per-item character cap applied to PR title, description, and each comment body before they're concatenated into the review prompt. Approximate — a truncation marker of ~30-40 chars is appended after the prefix. `0` disables truncation (keep full text). |
@@ -157,11 +161,37 @@ All configuration is via environment variables. See `config.example.env` for the
 | `RAVEN_MAX_CACHED_PRS` | No | `200` | Max PR entries in the findings cache (LRU eviction). |
 | `RAVEN_MAX_WORKERS` | No | `16` | Main review pool size (webhook dispatch, diff fetch, Claude CLI, review submission). |
 | `RAVEN_CI_WAIT_WORKERS` | No | `32` | Dedicated pool for the post-review CI-wait-and-merge phase. Sized larger than the main pool because these tasks spend nearly all their time sleeping. |
-| `RAVEN_MAX_CONCURRENT_CLAUDE` | No | `4` | Max concurrent Claude CLI subprocesses. Limits memory usage. |
+| `RAVEN_AI_MAX_CONCURRENT` | No | `4` | Max concurrent in-flight AI calls. For `claude_cli` this caps subprocesses (memory); for `openai_compatible` it caps simultaneous HTTP requests to the proxy. Legacy alias: `RAVEN_MAX_CONCURRENT_CLAUDE`. |
 | `BITBUCKET_DC_URL` | BB DC | — | Bitbucket Data Center base URL. Enables BB DC provider when set with token + secret + username. |
 | `BITBUCKET_DC_TOKEN` | BB DC | — | BB DC personal access token (Repository Write + Pull Request Write). |
 | `BITBUCKET_DC_WEBHOOK_SECRET` | BB DC | — | HMAC-SHA256 secret for BB DC webhooks. |
 | `BITBUCKET_DC_USERNAME` | BB DC | — | BB DC service account username (slug). Required for identity checks. |
+
+### AI backend
+
+Raven talks to an LLM through one of two pluggable backends. It picks one at startup based on which credentials are present:
+
+| Backend | Selected when | Required env vars |
+|---|---|---|
+| `claude_cli` | `CLAUDE_CODE_OAUTH_TOKEN` is set (and no OpenAI creds) | `CLAUDE_CODE_OAUTH_TOKEN` |
+| `openai_compatible` | `RAVEN_AI_API_BASE` + `RAVEN_AI_API_KEY` both set | `RAVEN_AI_API_BASE`, `RAVEN_AI_API_KEY` |
+
+If both credential sets are present, `openai_compatible` wins. To pin the selection explicitly, set `RAVEN_AI_BACKEND=claude_cli` or `RAVEN_AI_BACKEND=openai_compatible`.
+
+The `openai_compatible` backend talks to any endpoint that speaks OpenAI chat/completions — a LiteLLM proxy, vLLM, OpenRouter, actual OpenAI, etc. The upstream model is whatever the endpoint routes; set `RAVEN_AI_MODEL` to a string that endpoint accepts (e.g. `claude-opus-4-7`, `anthropic/claude-opus-4-7`, or a proxy-defined alias).
+
+`RAVEN_AI_EFFORT` / `RAVEN_AI_EFFORT_COMMENT` map to the backend's reasoning controls: the Claude CLI passes them as `--effort`; the OpenAI-compatible backend translates `max→high`, `high→high`, `medium→medium`, `low→low`, `none→` (parameter omitted). The target model / proxy is expected to translate `reasoning_effort` further if it hosts an Anthropic model (LiteLLM does this natively).
+
+**Non-reasoning models:** if your route lands on a model that doesn't support `reasoning_effort` (most non-reasoning OpenAI models, Llama, Mistral, base Gemini) and the proxy doesn't strip the parameter for you, set `RAVEN_AI_EFFORT=none` and `RAVEN_AI_EFFORT_COMMENT=none` to omit the kwarg entirely.
+
+Example LiteLLM proxy setup:
+
+```bash
+export RAVEN_AI_API_BASE=http://proxy.internal:4000
+export RAVEN_AI_API_KEY=sk-proxy-key
+export RAVEN_AI_MODEL=claude-opus-4-7
+# do NOT set CLAUDE_CODE_OAUTH_TOKEN
+```
 
 ### Notification channels
 
@@ -218,19 +248,24 @@ Edit `prompts/review.md` to tune review quality. The prompt is loaded at contain
 
 ```
 raven/
-├── server.py           Flask app, webhook routing, async dispatch, merge/notify logic
+├── server.py              Flask app, webhook routing, async dispatch, merge/notify logic
 ├── providers/
-│   ├── __init__.py     GitProvider ABC + provider registry
-│   ├── gitea.py        GiteaProvider — Gitea REST API + webhook parsing
-│   └── bitbucket_dc.py BitbucketDCProvider — BB Data Center REST API + webhook parsing
-├── reviewer.py         Claude CLI invocation, diff chunking, JSON response parsing
-├── notifier.py         Channel-based notifications (Slack, webhook)
-├── metrics.py          In-memory counters exposed via /metrics (Prometheus format)
+│   ├── __init__.py        GitProvider ABC + provider registry
+│   ├── gitea.py           GiteaProvider — Gitea REST API + webhook parsing
+│   └── bitbucket_dc.py    BitbucketDCProvider — BB Data Center REST API + webhook parsing
+├── ai/
+│   ├── __init__.py        Backend registry + auto-selection (get_backend, _select_backend)
+│   ├── base.py            AIBackend ABC (complete, shutdown)
+│   ├── claude_cli.py      ClaudeCLIBackend — wraps the Claude Code CLI subprocess
+│   └── openai_compatible.py  OpenAICompatibleBackend — chat/completions via openai SDK
+├── reviewer.py            Diff chunking, JSON response parsing, routes through AIBackend
+├── notifier.py            Channel-based notifications (Slack, webhook)
+├── metrics.py             In-memory counters exposed via /metrics (Prometheus format)
 prompts/
-├── review.md           Review prompt template
-├── respond.md          Conversational response prompt template
-├── audit.md            Full technical audit prompt
-entrypoint.sh           Writes OAuth credentials, updates Claude CLI on start + daily
+├── review.md              Review prompt template
+├── respond.md             Conversational response prompt template
+├── audit.md               Full technical audit prompt
+entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start + daily
 ```
 
 ### Request flow
@@ -246,7 +281,7 @@ entrypoint.sh           Writes OAuth credentials, updates Claude CLI on start + 
    - Strips lockfiles and binary files
    - Compares against cached diff hashes for incremental review (only changed files)
    - Fetches full file contents for all PR files (cross-file context)
-   - Pipes the prompt, diff, and file contents to Claude CLI via stdin
+   - Sends the prompt, diff, and file contents to the configured AI backend (`claude_cli` pipes through stdin; `openai_compatible` posts via HTTP)
    - Parses the JSON response with file/line locations per finding
    - If parse failed: posts warning comment, sends notification, stops (no merge)
    - Carries forward findings from unchanged files, recomputes consolidated verdict
@@ -266,7 +301,7 @@ entrypoint.sh           Writes OAuth credentials, updates Claude CLI on start + 
 - **Sole reviewer gate**: only merges when Raven is the only reviewer (no human reviews or requests)
 - **CI gate**: waits for CI to pass; failure/timeout blocks merge with notification
 - **Force-push protection**: verifies head SHA hasn't changed before merging
-- **PR dedup**: 30s in-memory cache prevents concurrent reviews
+- **PR dedup**: 30 s in-memory cache keyed on `(repo, pr_number, head_sha)` absorbs webhook redelivery storms without dropping legitimate new pushes (a new SHA is treated as a fresh event, not a duplicate)
 - **Consolidated incremental reviews**: carried findings from unchanged files included in verdict
 - **Stale review dismissal**: previous Raven reviews dismissed after new review is posted
 - **Cache invalidation**: findings cache wiped automatically on model or prompt change
@@ -292,7 +327,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-450 tests across 6 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, both git providers, and the full PR flow including CI gating.
+512 tests across 11 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, SHA-aware PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
 
 ## CI
 

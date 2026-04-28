@@ -98,7 +98,7 @@ def _shutdown_executor() -> None:
     ``concurrent.futures.thread._python_exit`` atexit handler joins
     every live worker thread anyway. Step 3 is what actually shortens
     shutdown: without it, a worker blocked in a Claude call could
-    still hold up exit for the full ``CLAUDE_TIMEOUT``.
+    still hold up exit for the full ``RAVEN_AI_TIMEOUT``.
 
     Gunicorn's sync worker handles SIGTERM by calling ``sys.exit(0)``
     (not via the OS default signal action), which raises SystemExit
@@ -774,9 +774,16 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             return
 
         raven_user = provider.get_authenticated_user()
+        raven_user_lc = (raven_user or "").lower()
         other_reviews = [r for r in provider.get_pr_reviews(repo_full_name, pr_number)
-                         if r.get("user", {}).get("login") != raven_user]
-        requested = provider.get_pr_requested_reviewers(repo_full_name, pr_number)
+                         if ((r.get("user") or {}).get("login") or "").lower() != raven_user_lc]
+        # Filter Raven itself out of the requested-reviewers list. Raven is
+        # in this list whenever it auto-added itself or a human re-requested
+        # its review — neither case represents another reviewer waiting to
+        # weigh in. Without this filter, every PR Raven self-requests would
+        # be falsely classified as "has other reviewers" and never auto-merge.
+        requested = [u for u in provider.get_pr_requested_reviewers(repo_full_name, pr_number)
+                     if (u or "").lower() != raven_user_lc]
         if other_reviews or requested:
             logger.info("PR #%d has other reviewers — leaving open for human review", pr_number)
             _notify_if_needed(repo_full_name, pr_number, pr_title, pr_url, review)
