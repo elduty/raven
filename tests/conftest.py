@@ -33,9 +33,8 @@ os.environ.setdefault("GITEA_TOKEN", "test-token")
 os.environ.setdefault("RAVEN_AI_BACKEND", "claude_cli")
 os.environ.setdefault("CLAUDE_CODE_OAUTH_TOKEN", "dummy-token-for-tests")
 
-# Webhook secrets — server.py reads these at import time; failing to
-# set them produces a startup error before any test can run.
-os.environ.setdefault("RAVEN_WEBHOOK_SECRET", "testsecret")
+# Webhook secret — server.py reads it at import time; failing to set it
+# produces a startup error before any test can run.
 os.environ.setdefault("GITEA_WEBHOOK_SECRET", "testsecret")
 
 # OpenAI-compatible backend defaults — set so tests that instantiate

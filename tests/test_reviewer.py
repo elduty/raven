@@ -592,9 +592,9 @@ class TestReviewerDelegatesToBackend:
         fake_backend.complete.assert_called_once()
         _, kwargs = fake_backend.complete.call_args
         assert kwargs["purpose"] == "review"
-        assert kwargs["model"] == rv.CLAUDE_MODEL
-        assert kwargs["effort"] == rv.CLAUDE_EFFORT
-        assert kwargs["timeout"] == rv.CLAUDE_TIMEOUT
+        assert kwargs["model"] == rv.RAVEN_AI_MODEL
+        assert kwargs["effort"] == rv.RAVEN_AI_EFFORT
+        assert kwargs["timeout"] == rv.RAVEN_AI_TIMEOUT
 
         _reset_backend_cache()  # restore real selection for later tests
 
@@ -614,7 +614,7 @@ class TestReviewerDelegatesToBackend:
         assert result == {"response": "Thanks for the comment.", "revise": None, "retract_findings": []}
         _, kwargs = fake_backend.complete.call_args
         assert kwargs["purpose"] == "respond"
-        assert kwargs["effort"] == rv.CLAUDE_EFFORT_COMMENT
+        assert kwargs["effort"] == rv.RAVEN_AI_EFFORT_COMMENT
 
         _reset_backend_cache()
 

@@ -87,22 +87,22 @@ class TestStartupAssertion:
         _providers.clear()
 
     def test_fails_without_secret(self):
-        with patch.dict(os.environ, {"GITEA_WEBHOOK_SECRET": "", "RAVEN_WEBHOOK_SECRET": "", "GITEA_URL": "https://x", "GITEA_TOKEN": "t"}):
+        with patch.dict(os.environ, {"GITEA_WEBHOOK_SECRET": "", "GITEA_URL": "https://x", "GITEA_TOKEN": "t"}):
             with pytest.raises(RuntimeError, match="No git providers configured"):
                 create_app()
 
     def test_fails_without_gitea_url(self):
-        with patch.dict(os.environ, {"GITEA_WEBHOOK_SECRET": "s", "RAVEN_WEBHOOK_SECRET": "", "GITEA_URL": "", "GITEA_TOKEN": "t"}):
+        with patch.dict(os.environ, {"GITEA_WEBHOOK_SECRET": "s", "GITEA_URL": "", "GITEA_TOKEN": "t"}):
             with pytest.raises(RuntimeError, match="No git providers configured"):
                 create_app()
 
     def test_fails_without_gitea_token(self):
-        with patch.dict(os.environ, {"GITEA_WEBHOOK_SECRET": "s", "RAVEN_WEBHOOK_SECRET": "", "GITEA_URL": "https://x", "GITEA_TOKEN": ""}):
+        with patch.dict(os.environ, {"GITEA_WEBHOOK_SECRET": "s", "GITEA_URL": "https://x", "GITEA_TOKEN": ""}):
             with pytest.raises(RuntimeError, match="No git providers configured"):
                 create_app()
 
     def test_reports_all_missing_vars(self):
-        with patch.dict(os.environ, {"GITEA_WEBHOOK_SECRET": "", "RAVEN_WEBHOOK_SECRET": "", "GITEA_URL": "", "GITEA_TOKEN": ""}):
+        with patch.dict(os.environ, {"GITEA_WEBHOOK_SECRET": "", "GITEA_URL": "", "GITEA_TOKEN": ""}):
             with pytest.raises(RuntimeError, match="No git providers configured"):
                 create_app()
 
@@ -939,7 +939,7 @@ class TestProcessPr:
             patch("raven.server.review_diff") as mock_review,
             patch("raven.server.notify"),
             patch("raven.server.time.sleep"),
-            patch("raven.server.RAVEN_REVIEW_ALL_PRS", False),
+            patch("raven.server.RAVEN_REVIEW_MODE", "gap"),
         ):
             mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
             mc.fetch_file.return_value = ""
@@ -967,7 +967,7 @@ class TestProcessPr:
             patch("raven.server.review_diff") as mock_review,
             patch("raven.server.notify"),
             patch("raven.server.time.sleep"),
-            patch("raven.server.RAVEN_REVIEW_ALL_PRS", False),
+            patch("raven.server.RAVEN_REVIEW_MODE", "gap"),
         ):
             mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
             mc.fetch_file.return_value = ""
@@ -1127,7 +1127,7 @@ class TestProcessPr:
         mc.fetch_file.return_value = ""
 
         with (
-            patch("raven.server.RAVEN_REVIEW_ALL_PRS", False),
+            patch("raven.server.RAVEN_REVIEW_MODE", "gap"),
             patch("raven.server.review_diff") as mock_review,
             patch("raven.server.notify"),
             patch("raven.server.time.sleep"),
@@ -1154,7 +1154,7 @@ class TestProcessPr:
         mc.submit_review.return_value = {"id": 1}
 
         with (
-            patch("raven.server.RAVEN_REVIEW_ALL_PRS", False),
+            patch("raven.server.RAVEN_REVIEW_MODE", "gap"),
             patch("raven.server.review_diff") as mock_review,
             patch("raven.server.notify"),
             patch("raven.server.time.sleep"),
@@ -1165,7 +1165,7 @@ class TestProcessPr:
         mock_review.assert_called_once()
 
     def test_runs_review_when_all_prs_mode_auto_adds_raven(self):
-        """In RAVEN_REVIEW_ALL_PRS=true mode, Raven auto-adds itself
+        """In RAVEN_REVIEW_MODE="all" mode, Raven auto-adds itself
         even with human reviewers — so the gate passes after auto-add."""
         mc = self._make_provider()
         mc.get_authenticated_user.return_value = "Raven"
@@ -1184,7 +1184,7 @@ class TestProcessPr:
         mc.submit_review.return_value = {"id": 1}
 
         with (
-            patch("raven.server.RAVEN_REVIEW_ALL_PRS", True),
+            patch("raven.server.RAVEN_REVIEW_MODE", "all"),
             patch("raven.server.review_diff") as mock_review,
             patch("raven.server.notify"),
             patch("raven.server.time.sleep"),
@@ -1513,6 +1513,87 @@ class TestCiWaitDispatch:
         mock_inc.assert_not_called()
 
 
+class TestProcessPrAdvisoryMode:
+    """Advisory mode reshapes _process_pr's post-submit flow:
+      - Reviewer-listed gate bypassed (Raven engages on every webhook).
+      - submit_review called with comment_only=True.
+      - Body uses the 'advisory' header.
+      - Auto-merge dispatch + reviewer-state checks skipped after submit.
+
+    Uses monkeypatch.setattr on the module-level RAVEN_REVIEW_MODE
+    constant rather than reload(). Reload would create a fresh
+    _recent_prs / _previous_diffs dict, decoupling from the references
+    imported at module top of this test file — and pollute other test
+    classes' fixtures that rely on those references.
+    """
+
+    def _make_provider(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_pr_diff.return_value = "diff --git a/x.py b/x.py\n+x = 1\n"
+        mc.fetch_file.return_value = ""
+        mc.submit_review.return_value = {"id": 42, "inline_comments": []}
+        mc.add_label_to_pr.return_value = None
+        # Empty reviewer lists — in all/gap mode this trips the gate
+        # and returns early. Advisory mode must bypass.
+        mc.get_pr_reviews.return_value = []
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_authenticated_user.return_value = "raven-bot"
+        return mc
+
+    def _payload(self):
+        return {
+            "repo": "owner/repo", "pr_number": 7, "pr_title": "x",
+            "pr_url": "http://x", "head_sha": "abc123",
+        }
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def test_advisory_mode_proceeds_past_gate_and_uses_comment_only(self, monkeypatch):
+        """Gate bypass + comment_only kwarg + advisory body header +
+        no auto-merge dispatch — all in one end-to-end run."""
+        monkeypatch.setattr("raven.server.RAVEN_REVIEW_MODE", "advisory")
+        mc = self._make_provider()
+        with patch("raven.server.review_diff", return_value={
+                "severity": "low", "summary": "ok", "findings": []}), \
+             patch("raven.server.notify"), \
+             patch("raven.server.ci_wait_executor") as mock_exec:
+            _process_pr(mc, self._payload())
+
+        # Gate bypass: submit_review reached even though reviewer lists are empty.
+        mc.submit_review.assert_called_once()
+        call = mc.submit_review.call_args
+        assert call.kwargs.get("comment_only") is True
+        # Body uses the advisory header.
+        body_arg = call.kwargs.get("body") or call.args[2]
+        assert "Raven Recommendation" in body_arg
+        # Advisory mode never reaches the merge dispatch.
+        mock_exec.submit.assert_not_called()
+
+    def test_advisory_mode_bypasses_gate_when_raven_not_listed(self, monkeypatch):
+        """Specifically isolate the gate-bypass: confirm advisory mode
+        does NOT short-circuit with 'not_reviewer' even though
+        get_pr_reviews returns no raven entry."""
+        monkeypatch.setattr("raven.server.RAVEN_REVIEW_MODE", "advisory")
+        mc = self._make_provider()
+        with patch("raven.server.review_diff", return_value={
+                "severity": "low", "summary": "ok", "findings": []}), \
+             patch("raven.server.notify"), \
+             patch("raven.server.inc") as mock_inc, \
+             patch("raven.server.ci_wait_executor"):
+            _process_pr(mc, self._payload())
+
+        # raven_reviews_skipped_total NOT incremented for not_reviewer in advisory mode.
+        skipped_calls = [
+            c for c in mock_inc.call_args_list
+            if c.args and c.args[0] == "raven_reviews_skipped_total"
+            and c.args[1].get("reason") == "not_reviewer"
+        ]
+        assert not skipped_calls
+
+
 class TestSafeDoMerge:
     """``_safe_do_merge`` restores the user-visible error path that used
     to live in ``_process_pr``'s outer try/except when the merge was
@@ -1713,6 +1794,32 @@ class TestHelpers:
         assert "SQL injection risk" in comment
         assert "Unescaped input" in comment
         assert "Reviewed by Raven" in comment
+        # Footer mentions the model used so operators / readers can see
+        # which backend produced the verdict without digging into config.
+        from raven.reviewer import RAVEN_AI_MODEL
+        assert RAVEN_AI_MODEL in comment
+
+    def test_format_comment_advisory_mode_swaps_header(self):
+        review = {"severity": "medium", "summary": "minor issue", "findings": []}
+        body = _format_comment(review, mode="advisory")
+        assert "🦅 **Raven Recommendation**" in body
+        assert "Advisory only" in body
+        assert "**Raven Review**" not in body
+
+    def test_format_comment_advisory_update_mode_header(self):
+        review = {"severity": "low", "summary": "looks fine now", "findings": []}
+        body = _format_comment(review, mode="advisory_update")
+        assert "🦅 **Raven Updated Recommendation**" in body
+        assert "Advisory only" in body
+
+    def test_format_comment_default_mode_keeps_review_header(self):
+        """Default mode='review' keeps the existing header so the
+        non-advisory render path is unchanged."""
+        review = {"severity": "low", "summary": "ok", "findings": []}
+        body = _format_comment(review)
+        assert "🦅 **Raven Review**" in body
+        assert "Recommendation" not in body
+        assert "Advisory only" not in body
 
     def test_format_comment_chunked_shows_file_count(self):
         review = {"severity": "low", "summary": "Looks clean", "findings": [], "chunked": True, "chunks_reviewed": 5}
@@ -2815,8 +2922,11 @@ class TestCachePersistence:
 
     # ── Migration & new-field tests (Task 1 of the comment-thread plan) ──
 
-    def test_load_legacy_3tuple_entries_yields_none_verdict(self, tmp_path):
-        """Legacy 3-tuple cache entries load with verdict=None, summary=None."""
+    def test_load_legacy_3tuple_entries_skipped(self, tmp_path):
+        """Legacy 3-tuple cache entries (pre-2026-05-13) are no longer
+        loadable — the loader treats them as malformed and skips them,
+        re-warming from the next push. Operators with stale cache files
+        on disk get a clean restart rather than an inconsistent state."""
         from raven.reviewer import review_config_hash
         cache_dir = tmp_path / "raven"
         cache_dir.mkdir()
@@ -2831,12 +2941,8 @@ class TestCachePersistence:
         with patch("raven.server._CACHE_DIR", cache_dir), \
              patch("raven.server._CACHE_FILE", cache_file):
             _load_cache()
-        entry = _previous_diffs["u/r#1"]
-        assert entry.timestamp == 1234567890.0
-        assert entry.hashes == {"a.py": "h1"}
-        assert entry.findings == {"a.py": [{"severity": "low"}]}
-        assert entry.verdict is None
-        assert entry.summary is None
+        # Legacy entry skipped — cache empty after load.
+        assert "u/r#1" not in _previous_diffs
 
     def test_load_new_dict_entries_round_trip(self, tmp_path):
         """New dict-shape entries round-trip with verdict + summary."""
@@ -2936,7 +3042,7 @@ class TestBitbucketDCWebhook:
             "GITEA_URL": "",
             "GITEA_TOKEN": "",
             "GITEA_WEBHOOK_SECRET": "",
-            "RAVEN_WEBHOOK_SECRET": "",
+            
         }
         with patch.dict(os.environ, env):
             app = create_app()
@@ -3258,7 +3364,7 @@ class TestBitbucketDCWebhookRouting:
             "GITEA_URL": "",
             "GITEA_TOKEN": "",
             "GITEA_WEBHOOK_SECRET": "",
-            "RAVEN_WEBHOOK_SECRET": "",
+            
         }
         with patch.dict(os.environ, env):
             app = create_app()
@@ -3325,16 +3431,29 @@ class TestShouldAutoAddReviewer:
         mc = self._mc()
         assert _should_auto_add_reviewer(mc, "owner/repo", 1) is True
 
+    def test_advisory_mode_never_auto_adds(self, mocker):
+        """Advisory mode short-circuits to False before any provider call.
+        Auto-adding Raven would itself block the merge (Raven listed as
+        reviewer without formal approval = blocked) — defeats advisory."""
+        mocker.patch("raven.server.RAVEN_REVIEW_MODE", "advisory")
+        from raven.server import _should_auto_add_reviewer
+        mc = self._mc()
+        assert _should_auto_add_reviewer(mc, "owner/repo", 1) is False
+        # Short-circuit before any API hit.
+        mc.get_authenticated_user.assert_not_called()
+        mc.get_pr_reviews.assert_not_called()
+        mc.get_pr_requested_reviewers.assert_not_called()
+
     def test_human_reviewer_returns_false_in_fill_gap_mode(self, mocker):
         """Fill-gap mode: human reviewer present → don't add Raven."""
-        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", False)
+        mocker.patch("raven.server.RAVEN_REVIEW_MODE", "gap")
         from raven.server import _should_auto_add_reviewer
         mc = self._mc(reviews=[{"user": {"login": "alice"}, "state": "COMMENT"}])
         assert _should_auto_add_reviewer(mc, "owner/repo", 1) is False
 
     def test_human_requested_returns_false_in_fill_gap_mode(self, mocker):
         """Fill-gap mode: human requested reviewer present → don't add Raven."""
-        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", False)
+        mocker.patch("raven.server.RAVEN_REVIEW_MODE", "gap")
         from raven.server import _should_auto_add_reviewer
         mc = self._mc(requested=["alice"])
         assert _should_auto_add_reviewer(mc, "owner/repo", 1) is False
@@ -3364,9 +3483,9 @@ class TestShouldAutoAddReviewer:
         assert _should_auto_add_reviewer(mc, "owner/repo", 1) is True
 
     def test_auto_add_true_when_all_prs_flag_set_and_not_reviewer(self, mocker):
-        """In RAVEN_REVIEW_ALL_PRS=true mode, Raven auto-adds even when
+        """In RAVEN_REVIEW_MODE="all" mode, Raven auto-adds even when
         a human reviewer is listed, so long as Raven itself isn't."""
-        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", True)
+        mocker.patch("raven.server.RAVEN_REVIEW_MODE", "all")
         mc = MagicMock(spec=GitProvider)
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [{"user": {"login": "alice"}, "state": "COMMENTED"}]
@@ -3375,9 +3494,9 @@ class TestShouldAutoAddReviewer:
         assert _should_auto_add_reviewer(mc, "owner/repo", 42) is True
 
     def test_auto_add_false_when_all_prs_flag_set_and_raven_already_reviewer(self, mocker):
-        """RAVEN_REVIEW_ALL_PRS=true must still be idempotent — don't
+        """RAVEN_REVIEW_MODE="all" must still be idempotent — don't
         re-add if Raven is already a reviewer."""
-        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", True)
+        mocker.patch("raven.server.RAVEN_REVIEW_MODE", "all")
         mc = MagicMock(spec=GitProvider)
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
@@ -3387,7 +3506,7 @@ class TestShouldAutoAddReviewer:
 
     def test_auto_add_false_when_all_prs_flag_set_and_raven_requested(self, mocker):
         """Idempotent: if Raven is already in requested reviewers, no add."""
-        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", True)
+        mocker.patch("raven.server.RAVEN_REVIEW_MODE", "all")
         mc = MagicMock(spec=GitProvider)
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = []
@@ -3398,7 +3517,7 @@ class TestShouldAutoAddReviewer:
     def test_auto_add_false_in_fill_gap_mode_with_other_reviewer(self, mocker):
         """Fill-gap mode preserves the PR #101 behaviour — decline when
         any human reviewer is present."""
-        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", False)
+        mocker.patch("raven.server.RAVEN_REVIEW_MODE", "gap")
         mc = MagicMock(spec=GitProvider)
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [{"user": {"login": "alice"}, "state": "COMMENTED"}]
@@ -3408,7 +3527,7 @@ class TestShouldAutoAddReviewer:
 
     def test_auto_add_true_in_fill_gap_mode_with_no_others(self, mocker):
         """Fill-gap mode: no humans, Raven is welcome."""
-        mocker.patch("raven.server.RAVEN_REVIEW_ALL_PRS", False)
+        mocker.patch("raven.server.RAVEN_REVIEW_MODE", "gap")
         mc = MagicMock(spec=GitProvider)
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = []
@@ -3646,8 +3765,15 @@ class TestProcessCommentRetraction:
             "file_path": "a.py", "line": 5,
         }
 
-    def test_retracts_filtered_to_thread_ids(self, mock_provider_for_comment_flow):
-        """IDs not in the fetched thread are dropped."""
+    def test_retracts_filtered_to_raven_authored_thread_ids(self, mock_provider_for_comment_flow):
+        """IDs the AI lists are filtered TWO ways:
+          - dropped if not in the fetched thread (defense vs hallucination), AND
+          - dropped if the thread entry wasn't authored by Raven (defense
+            against the AI/prompt-injection resolving a developer's
+            comment).
+        Mock thread has id=10 (raven) and id=11 (alice). AI returns
+        [10, 11, 9999]. After filtering, only Raven's own comment 10
+        survives."""
         with patch("raven.server.respond_to_comment") as mock_respond:
             mock_respond.return_value = {
                 "response": "ok", "revise": None,
@@ -3657,7 +3783,7 @@ class TestProcessCommentRetraction:
         called_ids = sorted(
             call.args[2] for call in mock_provider_for_comment_flow.retract_finding.call_args_list
         )
-        assert called_ids == [10, 11]
+        assert called_ids == [10]
 
     def test_retracts_skipped_when_pr_not_open(self, mock_provider_for_comment_flow):
         mock_provider_for_comment_flow.get_pr_state.return_value = "merged"
@@ -3670,6 +3796,17 @@ class TestProcessCommentRetraction:
         mock_provider_for_comment_flow.retract_finding.assert_not_called()
 
     def test_retract_failure_does_not_block_subsequent(self, mock_provider_for_comment_flow):
+        # Both ids must belong to Raven for the new authorship filter to
+        # keep them in `to_retract`. Override the default thread (which
+        # has id=10 raven + id=11 alice) with two raven-authored entries.
+        mock_provider_for_comment_flow.get_comment_thread.return_value = [
+            {"id": 10, "parent_id": None, "user": {"login": "raven"},
+             "body": "Finding 1", "file_path": "a.py", "line": 5,
+             "resolved": False},
+            {"id": 11, "parent_id": 10, "user": {"login": "raven"},
+             "body": "Finding 2", "file_path": "a.py", "line": 5,
+             "resolved": False},
+        ]
         mock_provider_for_comment_flow.retract_finding.side_effect = [False, True]
         with patch("raven.server.respond_to_comment") as mock_respond:
             mock_respond.return_value = {
@@ -3729,6 +3866,96 @@ class TestProcessCommentRetraction:
         finally:
             _previous_diffs.pop(pr_key, None)
 
+    def test_all_findings_retracted_synthesizes_revise_to_approve(self, mock_provider_for_comment_flow):
+        """Defense in depth: when the AI retracts every cached finding
+        but doesn't set `revise`, and prior verdict was `needs_work`,
+        the server synthesizes a flip to `approve`. Without this
+        backstop, a conservative AI's "I acknowledge" response leaves
+        the PR blocked despite the basis for blocking being gone."""
+        from raven.server import CacheEntry, _previous_diffs
+        pr_key = "gitea:u/r#1"
+        _previous_diffs[pr_key] = CacheEntry(
+            timestamp=0.0, hashes={"a.py": "h"},
+            findings={"a.py": [
+                {"file": "a.py", "line": 5, "severity": "high",
+                 "message": "the only finding", "comment_id": 42},
+            ]},
+            verdict="needs_work", summary="single concern",
+        )
+        try:
+            mock_provider_for_comment_flow.retract_finding.return_value = True
+            mock_provider_for_comment_flow.get_comment_thread.return_value = [
+                {"id": 42, "parent_id": None, "user": {"login": "raven"},
+                 "body": "the only finding", "file_path": "a.py", "line": 5,
+                 "resolved": False},
+            ]
+            mock_provider_for_comment_flow.submit_review.return_value = {"id": 1234}
+            with patch("raven.server.respond_to_comment") as mock_respond, \
+                 patch("raven.server._safe_do_merge"):
+                mock_respond.return_value = {
+                    "response": "you're right, retracting",
+                    "revise": None,                # AI did NOT set revise
+                    "retract_findings": [42],      # but retracted the only finding
+                }
+                _process_comment(mock_provider_for_comment_flow, {
+                    "repo": "u/r", "pr_number": 1,
+                    "comment_body": "?", "comment_id": 99,
+                    "parent_comment_id": 42, "_is_mention": True,
+                    "file_path": "a.py", "line": 5,
+                })
+            # The backstop fired: a new formal review was submitted with
+            # approve=True and the synthesized body.
+            mock_provider_for_comment_flow.submit_review.assert_called_once()
+            kwargs = mock_provider_for_comment_flow.submit_review.call_args.kwargs
+            assert kwargs["approve"] is True
+            assert "Revised to approve" in kwargs["body"]
+            # Cache verdict flipped accordingly.
+            assert _previous_diffs[pr_key].verdict == "approve"
+        finally:
+            _previous_diffs.pop(pr_key, None)
+
+    def test_partial_retract_does_not_synthesize_revise(self, mock_provider_for_comment_flow):
+        """Backstop fires only when the cache is empty after retract.
+        Retracting 1 of 2 findings leaves the verdict unchanged — the
+        remaining finding still justifies `needs_work`."""
+        from raven.server import CacheEntry, _previous_diffs
+        pr_key = "gitea:u/r#1"
+        _previous_diffs[pr_key] = CacheEntry(
+            timestamp=0.0, hashes={"a.py": "h"},
+            findings={"a.py": [
+                {"file": "a.py", "line": 5, "severity": "high",
+                 "message": "retract me", "comment_id": 42},
+                {"file": "a.py", "line": 9, "severity": "high",
+                 "message": "still valid", "comment_id": 43},
+            ]},
+            verdict="needs_work", summary="two concerns",
+        )
+        try:
+            mock_provider_for_comment_flow.retract_finding.return_value = True
+            mock_provider_for_comment_flow.get_comment_thread.return_value = [
+                {"id": 42, "parent_id": None, "user": {"login": "raven"},
+                 "body": "retract me", "file_path": "a.py", "line": 5,
+                 "resolved": False},
+            ]
+            with patch("raven.server.respond_to_comment") as mock_respond, \
+                 patch("raven.server._safe_do_merge"):
+                mock_respond.return_value = {
+                    "response": "ack",
+                    "revise": None,
+                    "retract_findings": [42],
+                }
+                _process_comment(mock_provider_for_comment_flow, {
+                    "repo": "u/r", "pr_number": 1,
+                    "comment_body": "?", "comment_id": 99,
+                    "parent_comment_id": 42, "_is_mention": True,
+                    "file_path": "a.py", "line": 5,
+                })
+            # No new formal review submitted — cache still has a finding.
+            mock_provider_for_comment_flow.submit_review.assert_not_called()
+            assert _previous_diffs[pr_key].verdict == "needs_work"
+        finally:
+            _previous_diffs.pop(pr_key, None)
+
 
 class TestProcessCommentRevision:
     def _payload(self):
@@ -3755,6 +3982,30 @@ class TestProcessCommentRevision:
         kwargs = mock_provider_for_comment_flow.submit_review.call_args.kwargs
         assert kwargs["approve"] is True
         assert kwargs["body"] == "Revised: LGTM"
+
+    def test_revise_in_advisory_mode_uses_comment_only_and_advisory_body(
+        self, mock_provider_for_comment_flow, cached_needs_work, monkeypatch,
+    ):
+        """In advisory mode, verdict revision posts via
+        submit_review(comment_only=True) with the advisory_update body
+        header, and auto-merge dispatch is suppressed."""
+        monkeypatch.setattr("raven.server.RAVEN_REVIEW_MODE", "advisory")
+        with patch("raven.server.respond_to_comment") as mock_respond, \
+             patch("raven.server._safe_do_merge") as mock_merge:
+            mock_respond.return_value = {
+                "response": "ack",
+                "revise": {"verdict": "approve", "body": "Revised: LGTM"},
+                "retract_findings": [],
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+
+        kwargs = mock_provider_for_comment_flow.submit_review.call_args.kwargs
+        # comment_only path
+        assert kwargs.get("comment_only") is True
+        # Body is wrapped via _format_comment(mode="advisory_update").
+        assert "Raven Updated Recommendation" in kwargs["body"]
+        # Even on a flip-to-approve, auto-merge is suppressed in advisory.
+        mock_merge.assert_not_called()
 
     def test_revise_unchanged_verdict_skips_submit(
         self, mock_provider_for_comment_flow, cached_needs_work,
@@ -4053,3 +4304,64 @@ class TestProcessCommentRaceGuard:
             mock_provider_for_comment_flow.submit_review.assert_not_called()
         finally:
             _previous_diffs.pop(pr_key, None)
+
+
+# ------------------------------------------------------------------ #
+#  RAVEN_REVIEW_MODE resolver                                          #
+# ------------------------------------------------------------------ #
+
+class TestReviewMode:
+    """RAVEN_REVIEW_MODE resolution: explicit flag, defaults, validation.
+
+    Tests the resolver function directly via ``_resolve_review_mode()``
+    rather than reloading the module. The resolver reads ``os.environ``
+    at call time, so ``monkeypatch.setenv`` is sufficient — no reload,
+    no ThreadPoolExecutor leaks, no stale dict references for sibling
+    test classes.
+    """
+
+    def test_default_mode_is_all(self, monkeypatch):
+        from raven.server import _resolve_review_mode
+        monkeypatch.delenv("RAVEN_REVIEW_MODE", raising=False)
+        assert _resolve_review_mode() == "all"
+
+    def test_explicit_mode_advisory(self, monkeypatch):
+        from raven.server import _resolve_review_mode
+        monkeypatch.setenv("RAVEN_REVIEW_MODE", "advisory")
+        assert _resolve_review_mode() == "advisory"
+
+    def test_explicit_mode_gap(self, monkeypatch):
+        from raven.server import _resolve_review_mode
+        monkeypatch.setenv("RAVEN_REVIEW_MODE", "gap")
+        assert _resolve_review_mode() == "gap"
+
+    def test_invalid_mode_raises_systemexit(self, monkeypatch):
+        from raven.server import _resolve_review_mode
+        monkeypatch.setenv("RAVEN_REVIEW_MODE", "bogus")
+        with pytest.raises(SystemExit):
+            _resolve_review_mode()
+
+    def test_legacy_env_var_is_ignored(self, monkeypatch):
+        """RAVEN_REVIEW_ALL_PRS was removed entirely — setting it has no
+        effect. Clean break, not a soft migration."""
+        from raven.server import _resolve_review_mode
+        monkeypatch.delenv("RAVEN_REVIEW_MODE", raising=False)
+        monkeypatch.setenv("RAVEN_REVIEW_ALL_PRS", "false")  # would have meant 'gap'
+        # Default still 'all' because RAVEN_REVIEW_ALL_PRS is no longer read.
+        assert _resolve_review_mode() == "all"
+
+    def test_empty_env_var_falls_back_to_default(self, monkeypatch):
+        """docker-compose `${RAVEN_REVIEW_MODE:-}` passes "" into the
+        container when the host var is unset. Must not crash the
+        validator — empty string is treated as unset and defaults to
+        'all'."""
+        from raven.server import _resolve_review_mode
+        monkeypatch.setenv("RAVEN_REVIEW_MODE", "")
+        assert _resolve_review_mode() == "all"
+
+    def test_whitespace_only_env_var_falls_back_to_default(self, monkeypatch):
+        """``   `` is functionally unset (same as empty); resolver strips
+        before validating."""
+        from raven.server import _resolve_review_mode
+        monkeypatch.setenv("RAVEN_REVIEW_MODE", "   ")
+        assert _resolve_review_mode() == "all"

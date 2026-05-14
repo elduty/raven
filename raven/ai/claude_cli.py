@@ -17,12 +17,8 @@ import time
 logger = logging.getLogger(__name__)
 
 CLAUDE_BIN = "/usr/bin/claude"
-MAX_CONCURRENT_CLAUDE = max(int(
-    os.environ.get("RAVEN_AI_MAX_CONCURRENT")
-    or os.environ.get("RAVEN_MAX_CONCURRENT_CLAUDE")
-    or "4"
-), 1)
-_claude_semaphore = threading.Semaphore(MAX_CONCURRENT_CLAUDE)
+RAVEN_AI_MAX_CONCURRENT = max(int(os.environ.get("RAVEN_AI_MAX_CONCURRENT", "4")), 1)
+_claude_semaphore = threading.Semaphore(RAVEN_AI_MAX_CONCURRENT)
 
 # Track in-flight Claude CLI subprocesses so shutdown hooks can terminate
 # them. Each active Popen is added to _active_procs for the lifetime of

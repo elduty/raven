@@ -442,12 +442,15 @@ class BitbucketDCProvider(GitProvider):
 
     def submit_review(self, repo_full_name: str, pr_number: int, body: str,
                       approve: bool, inline_comments: list[dict] | None = None,
-                      commit_id: str = "") -> dict:
+                      commit_id: str = "", comment_only: bool = False) -> dict:
         """Submit a review: post comment + approve or set needs-work.
 
         approve=True  -> post comment + POST /approve
         approve=False -> post comment + PUT /participants/{user} with NEEDS_WORK
         commit_id is accepted for ABC compatibility but not used by BB DC.
+        comment_only: when True, posts body + inline anchor comments but
+            skips the approve / needs-work participant call — review
+            remains non-blocking. Used for advisory mode.
 
         Returns the BB DC main-comment dict, extended with an
         `inline_comments` key carrying per-input-entry `{file, line,
@@ -470,8 +473,11 @@ class BitbucketDCProvider(GitProvider):
         result = resp.json()
         result["inline_comments"] = posted_inline
 
-        # Approve or set needs-work
-        if approve:
+        # Approve / needs-work — skipped in comment_only mode so the
+        # review remains advisory.
+        if comment_only:
+            pass
+        elif approve:
             approve_url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/approve"
             approve_resp = self.session.post(approve_url, timeout=10)
             if approve_resp.status_code not in (200, 409):

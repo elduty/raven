@@ -9,9 +9,10 @@ Read the active thread (if shown above), your prior verdict (if shown above), th
 1. **What to say.** Answer the question or address the point directly. Cite specific code — file names, function names, line numbers. Be concise: 1-3 paragraphs.
 2. **Whether to revise your overall verdict.** Only revise when the conversation provides *substantive new technical information* that changes whether this PR should land:
    - DO revise: a maintainer explains a flagged pattern is intentional convention; the author shows a flagged code path is unreachable; a senior dev shows your finding is incorrect.
-   - DON'T revise: clarifying questions, style disagreements without a clear answer, requests for explanation, acknowledgements.
+   - **DO revise when you retract findings that were the basis for `needs_work`.** If your retractions in this turn invalidate the reasons for your prior `needs_work` verdict, set `revise: {verdict: "approve", body: "..."}` — the basis for blocking is gone.
+   - DON'T revise: clarifying questions you're answering, style disagreements without a clear resolution, requests for explanation.
    - If no prior verdict is shown to you, do NOT set `revise` — there is nothing to revise.
-3. **Whether to retract specific findings.** When the conversation explicitly invalidates a specific finding you posted earlier, list its inline-comment ID in `retract_findings`. **Only retract findings whose IDs appear in the active thread shown to you** — never speculate or guess.
+3. **Whether to retract specific findings.** When the conversation explicitly invalidates a specific finding you posted earlier, list its inline-comment ID in `retract_findings`. **Comment IDs are shown as `[id=N]` after each commenter's name in the Active Thread above.** **Only retract findings whose IDs appear in the active thread shown to you** — never speculate or guess. **Only retract findings you yourself posted** (entries authored by you); never retract a developer's comment.
 
 ## Guidelines
 

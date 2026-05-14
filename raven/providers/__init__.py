@@ -96,8 +96,19 @@ class GitProvider(ABC):
     @abstractmethod
     def submit_review(self, repo: str, pr_number: int, body: str,
                       approve: bool, inline_comments: list[dict] | None = None,
-                      commit_id: str = "") -> dict:
-        """Submit review. inline_comments: [{"file": str, "line": int, "body": str}]. Returns dict with "id"."""
+                      commit_id: str = "", comment_only: bool = False) -> dict:
+        """Submit review. inline_comments: [{"file": str, "line": int, "body": str}].
+
+        ``comment_only=True`` posts the body + inline comments without
+        recording a blocking verdict — used for advisory mode. Returns
+        dict with ``"id"``.
+
+        Note: the default value here is documentation/intention only;
+        Python doesn't propagate ABC defaults to override implementations.
+        Call sites pass ``comment_only`` conditionally via dict-spread
+        so out-of-tree providers running in non-advisory modes never see
+        the new kwarg.
+        """
         ...
 
     @abstractmethod

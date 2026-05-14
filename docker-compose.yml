@@ -21,7 +21,6 @@ services:
       - GITEA_WEBHOOK_SECRET=${GITEA_WEBHOOK_SECRET:-}
       - GITEA_URL=${GITEA_URL:-}
       - GITEA_TOKEN=${GITEA_TOKEN:-}
-      - RAVEN_WEBHOOK_SECRET=${RAVEN_WEBHOOK_SECRET:-}
       # ── Bitbucket Data Center (required if using BB DC; no defaults)
       - BITBUCKET_DC_URL=${BITBUCKET_DC_URL:-}
       - BITBUCKET_DC_TOKEN=${BITBUCKET_DC_TOKEN:-}
@@ -42,14 +41,14 @@ services:
       - SKIP_AUTHORS=${SKIP_AUTHORS:-}
       # Toggles: empty = off. server.py parses (".lower() in 1|true|yes").
       - RAVEN_GITEA_AUTO_MERGE=${RAVEN_GITEA_AUTO_MERGE:-}
-      - RAVEN_REVIEW_ALL_PRS=${RAVEN_REVIEW_ALL_PRS:-true}
+      # Review engagement mode: all | gap | advisory. Empty defaults to 'all'.
+      - RAVEN_REVIEW_MODE=${RAVEN_REVIEW_MODE:-}
       # ── AI model & effort (defaults must match raven/reviewer.py).
-      # Apply to BOTH backends. Legacy CLAUDE_* names are still honored
-      # by the code as a fallback; new deployments should use RAVEN_AI_*.
-      - RAVEN_AI_MODEL=${RAVEN_AI_MODEL:-${CLAUDE_MODEL:-claude-opus-4-7}}
-      - RAVEN_AI_EFFORT=${RAVEN_AI_EFFORT:-${CLAUDE_EFFORT:-max}}
-      - RAVEN_AI_EFFORT_COMMENT=${RAVEN_AI_EFFORT_COMMENT:-${CLAUDE_EFFORT_COMMENT:-medium}}
-      - RAVEN_AI_TIMEOUT=${RAVEN_AI_TIMEOUT:-${CLAUDE_TIMEOUT:-600}}
+      # Apply to BOTH backends.
+      - RAVEN_AI_MODEL=${RAVEN_AI_MODEL:-claude-opus-4-7}
+      - RAVEN_AI_EFFORT=${RAVEN_AI_EFFORT:-max}
+      - RAVEN_AI_EFFORT_COMMENT=${RAVEN_AI_EFFORT_COMMENT:-medium}
+      - RAVEN_AI_TIMEOUT=${RAVEN_AI_TIMEOUT:-600}
       # ── AI backend (pick ONE of the credential sets below; see README)
       - RAVEN_AI_BACKEND=${RAVEN_AI_BACKEND:-}
       - RAVEN_AI_API_BASE=${RAVEN_AI_API_BASE:-}
@@ -77,7 +76,7 @@ services:
       - RAVEN_LABEL_NAME=${RAVEN_LABEL_NAME:-raven-reviewed}
       - RAVEN_MAX_WORKERS=${RAVEN_MAX_WORKERS:-16}
       - RAVEN_CI_WAIT_WORKERS=${RAVEN_CI_WAIT_WORKERS:-32}
-      - RAVEN_AI_MAX_CONCURRENT=${RAVEN_AI_MAX_CONCURRENT:-${RAVEN_MAX_CONCURRENT_CLAUDE:-4}}
+      - RAVEN_AI_MAX_CONCURRENT=${RAVEN_AI_MAX_CONCURRENT:-4}
       - RAVEN_MAX_CACHED_PRS=${RAVEN_MAX_CACHED_PRS:-200}
       # ── Observability (empty = /metrics returns 404; see raven/server.py).
       # When set, Prometheus must send `Authorization: Bearer <token>`.

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -23,7 +24,7 @@ from .providers import GitProvider, get_provider, register_provider, registered_
 from .providers.gitea import GiteaProvider
 from .metrics import inc, Timer, format_prometheus
 from .notifier import notify
-from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, MAX_DIFF_LINES, terminate_active_processes, RespondParseError
+from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, MAX_DIFF_LINES, terminate_active_processes, RespondParseError, RAVEN_AI_MODEL
 
 _SEVERITY_NAME = {v: k for k, v in SEVERITY_ORDER.items()}
 
@@ -31,10 +32,30 @@ logger = logging.getLogger(__name__)
 
 _GITEA_AUTO_MERGE = os.environ.get("RAVEN_GITEA_AUTO_MERGE", "").lower() in ("1", "true", "yes")
 
-# Whether Raven auto-adds itself to every PR (default) or only to PRs
-# with no other reviewer. Default is True — review-all-PRs mode is the
-# standard behaviour; opt out with RAVEN_REVIEW_ALL_PRS=false|0|no.
-RAVEN_REVIEW_ALL_PRS = os.environ.get("RAVEN_REVIEW_ALL_PRS", "true").lower() not in ("0", "false", "no")
+# Review-engagement mode. Single source of truth for "which PRs does
+# Raven engage with, and how blocking is the output?"
+#   * all       — auto-add to every PR, submit formal review, auto-merge when sole reviewer.
+#   * gap       — only auto-add when no other reviewer is listed; submit formal review.
+#   * advisory  — never auto-add; post a non-blocking recommendation comment.
+_VALID_REVIEW_MODES = {"all", "gap", "advisory"}
+
+
+def _resolve_review_mode() -> str:
+    # Treat empty string as unset. docker-compose `${VAR:-}` substitutes the
+    # empty string into the container when the host var is unset; without the
+    # `or "all"` fallback, the strict validator below would reject "" and
+    # crash-loop the container on default deployment.
+    raw = os.environ.get("RAVEN_REVIEW_MODE", "").strip().lower() or "all"
+    if raw not in _VALID_REVIEW_MODES:
+        logger.error(
+            "Invalid RAVEN_REVIEW_MODE=%r (expected one of %s) — exiting",
+            raw, sorted(_VALID_REVIEW_MODES),
+        )
+        sys.exit(1)
+    return raw
+
+
+RAVEN_REVIEW_MODE = _resolve_review_mode()
 
 executor = ThreadPoolExecutor(
     max_workers=int(os.environ.get("RAVEN_MAX_WORKERS", "16")),
@@ -183,9 +204,10 @@ _CACHE_FILE = _CACHE_DIR / "findings_cache.json"
 def _load_cache() -> None:
     """Load findings cache from disk on startup. Wipes cache if config changed.
 
-    Backwards-compatible: legacy entries serialized as 3-tuples (pre-2026-05-13)
-    load with verdict=None / summary=None; new entries are serialized as
-    dicts with the full schema.
+    Entries are dicts with the full ``CacheEntry`` schema. Legacy
+    3-tuple entries (pre-2026-05-13) are no longer recognized — on a
+    legacy cache file the entries fail per-row guards and the cache
+    re-warms from the next push.
     """
     try:
         if not _CACHE_FILE.exists():
@@ -206,19 +228,13 @@ def _load_cache() -> None:
                 # wrong type) must not abort the load loop and leave the
                 # other 199 healthy entries behind.
                 try:
-                    if isinstance(entry, list) and len(entry) >= 3:
-                        # Legacy 3-tuple: (timestamp, hashes, findings)
-                        _previous_diffs[key] = CacheEntry(
-                            timestamp=entry[0], hashes=entry[1], findings=entry[2],
-                        )
-                    elif isinstance(entry, dict):
-                        _previous_diffs[key] = CacheEntry(
-                            timestamp=entry["timestamp"],
-                            hashes=entry["hashes"],
-                            findings=entry["findings"],
-                            verdict=entry.get("verdict"),
-                            summary=entry.get("summary"),
-                        )
+                    _previous_diffs[key] = CacheEntry(
+                        timestamp=entry["timestamp"],
+                        hashes=entry["hashes"],
+                        findings=entry["findings"],
+                        verdict=entry.get("verdict"),
+                        summary=entry.get("summary"),
+                    )
                 except (KeyError, TypeError, ValueError) as e:
                     logger.warning("Skipping malformed cache entry %s: %s", key, e)
                     skipped += 1
@@ -298,9 +314,7 @@ def create_app() -> Flask:
     # Register providers based on available env vars
     gitea_url = os.environ.get("GITEA_URL")
     gitea_token = os.environ.get("GITEA_TOKEN")
-    gitea_secret = os.environ.get("GITEA_WEBHOOK_SECRET") or os.environ.get("RAVEN_WEBHOOK_SECRET")
-    if os.environ.get("RAVEN_WEBHOOK_SECRET") and not os.environ.get("GITEA_WEBHOOK_SECRET"):
-        logger.warning("RAVEN_WEBHOOK_SECRET is deprecated — use GITEA_WEBHOOK_SECRET")
+    gitea_secret = os.environ.get("GITEA_WEBHOOK_SECRET")
     if gitea_url and gitea_token and gitea_secret:
         register_provider("gitea", GiteaProvider(gitea_url, gitea_token, gitea_secret))
 
@@ -349,12 +363,6 @@ def create_app() -> Flask:
         if not header.startswith(prefix) or not hmac.compare_digest(header[len(prefix):], metrics_token):
             abort(404)
         return format_prometheus(), 200, {"Content-Type": "text/plain; charset=utf-8"}
-
-    @app.route("/hook", methods=["POST"])
-    def hook_legacy():
-        """Backward compat — route to first registered provider."""
-        first = next(iter(registered_providers()))
-        return hook(first)
 
     @app.route("/hook/<provider_name>", methods=["POST"])
     def hook(provider_name):
@@ -513,16 +521,23 @@ def _should_auto_add_reviewer(provider: GitProvider, repo_full_name: str,
         failure rather than thinking the PR legitimately has other
         reviewers.
 
-    Behaviour depends on the RAVEN_REVIEW_ALL_PRS switch:
+    Behaviour depends on the ``RAVEN_REVIEW_MODE`` switch:
 
-    * ``True`` (default): auto-add unless Raven is already a reviewer
+    * ``all`` (default): auto-add unless Raven is already a reviewer
       (or a requested reviewer). Every PR gets a Raven review.
-    * ``False``: auto-add only when the PR has no other reviewer and
+    * ``gap``: auto-add only when the PR has no other reviewer and
       no other requested reviewer — the "fill-the-gap" mode.
+    * ``advisory``: never auto-add — Raven posts a non-blocking
+      recommendation comment instead of a formal review.
 
-    Raven being already listed counts as "don't re-add" in both modes
+    Raven being already listed counts as "don't re-add" in all modes
     (keeps re-review triggers idempotent).
     """
+    # Advisory mode never auto-adds: a listed Raven reviewer that doesn't
+    # submit a formal approval would block the PR — the opposite of
+    # "advisory only".
+    if RAVEN_REVIEW_MODE == "advisory":
+        return False
     try:
         raven_user = provider.get_authenticated_user().lower()
     except Exception as e:
@@ -551,7 +566,7 @@ def _should_auto_add_reviewer(provider: GitProvider, repo_full_name: str,
     if raven_already_listed:
         return False
 
-    if RAVEN_REVIEW_ALL_PRS:
+    if RAVEN_REVIEW_MODE == "all":
         return True
 
     other_present = any(
@@ -617,32 +632,35 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # Reviewer-status gate: review only runs if Raven is listed as
         # a reviewer (or requested reviewer) on this PR. Combined with
         # the auto-add step above, this means:
-        #   * RAVEN_REVIEW_ALL_PRS=true + any PR → auto-added → gate passes.
-        #   * RAVEN_REVIEW_ALL_PRS=false + no humans → auto-added → gate passes.
-        #   * RAVEN_REVIEW_ALL_PRS=false + humans → no auto-add → gate
+        #   * RAVEN_REVIEW_MODE=all + any PR → auto-added → gate passes.
+        #   * RAVEN_REVIEW_MODE=gap + no humans → auto-added → gate passes.
+        #   * RAVEN_REVIEW_MODE=gap + humans → no auto-add → gate
         #     fails unless a human manually added Raven earlier.
-        try:
-            raven_user_lc = (provider.get_authenticated_user() or "").lower()
-            reviews_for_gate = provider.get_pr_reviews(repo_full_name, pr_number)
-            requested_for_gate = provider.get_pr_requested_reviewers(repo_full_name, pr_number)
-        except Exception as e:
-            logger.warning("Could not verify Raven's reviewer status on PR #%d — proceeding anyway: %s",
-                           pr_number, e)
-            raven_user_lc = ""
-            reviews_for_gate = []
-            requested_for_gate = []
+        #   * RAVEN_REVIEW_MODE=advisory → gate bypassed (advisory mode
+        #     engages on every webhook regardless of reviewer assignment).
+        if RAVEN_REVIEW_MODE != "advisory":
+            try:
+                raven_user_lc = (provider.get_authenticated_user() or "").lower()
+                reviews_for_gate = provider.get_pr_reviews(repo_full_name, pr_number)
+                requested_for_gate = provider.get_pr_requested_reviewers(repo_full_name, pr_number)
+            except Exception as e:
+                logger.warning("Could not verify Raven's reviewer status on PR #%d — proceeding anyway: %s",
+                               pr_number, e)
+                raven_user_lc = ""
+                reviews_for_gate = []
+                requested_for_gate = []
 
-        if raven_user_lc:
-            raven_listed = any(
-                ((r.get("user") or {}).get("login") or "").lower() == raven_user_lc
-                for r in reviews_for_gate
-            ) or any(
-                (login or "").lower() == raven_user_lc for login in requested_for_gate
-            )
-            if not raven_listed:
-                logger.debug("PR #%d — Raven not a reviewer, skipping review", pr_number)
-                inc("raven_reviews_skipped_total", {"reason": "not_reviewer", "repo": repo_full_name})
-                return
+            if raven_user_lc:
+                raven_listed = any(
+                    ((r.get("user") or {}).get("login") or "").lower() == raven_user_lc
+                    for r in reviews_for_gate
+                ) or any(
+                    (login or "").lower() == raven_user_lc for login in requested_for_gate
+                )
+                if not raven_listed:
+                    logger.debug("PR #%d — Raven not a reviewer, skipping review", pr_number)
+                    inc("raven_reviews_skipped_total", {"reason": "not_reviewer", "repo": repo_full_name})
+                    return
 
         # Fetch diff
         diff = provider.fetch_pr_diff(repo_full_name, pr_number)
@@ -799,7 +817,10 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             return
 
         # Submit formal review — must succeed before dismissing old reviews
-        body = _format_comment(review)
+        body = _format_comment(
+            review,
+            mode="advisory" if RAVEN_REVIEW_MODE == "advisory" else "review",
+        )
         approve_sev = os.environ.get("REVIEW_APPROVE_MAX_SEVERITY", "low")
         approve = severity_gte(approve_sev, review["severity"])
         default_emoji = "\U0001f7e2"
@@ -812,10 +833,17 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             for f in review.get("findings", [])
             if f.get("file") and isinstance(f.get("line"), int) and f["line"] > 0
         ]
+        # Pass comment_only conditionally via dict-spread so out-of-tree
+        # providers running in non-advisory modes never see the new kwarg.
+        # (Default in the ABC doesn't propagate to overriders.)
+        advisory_kwargs = (
+            {"comment_only": True} if RAVEN_REVIEW_MODE == "advisory" else {}
+        )
         try:
             new_review = provider.submit_review(repo_full_name, pr_number, body,
                                                 approve=approve, inline_comments=inline_comments,
-                                                commit_id=head_sha)
+                                                commit_id=head_sha,
+                                                **advisory_kwargs)
         except Exception as e:
             logger.error("Failed to submit review on PR #%d: %s", pr_number, e)
             notify(repo_full_name, f"PR #{pr_number}: {pr_title}", review,
@@ -909,6 +937,15 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         except Exception as e:
             logger.warning("Failed to add label: %s", e)
             inc("raven_errors_total", {"type": "label_failed", "repo": repo_full_name})
+
+        # Advisory mode is done after submit_review + cache + label.
+        # No formal verdict was registered, so the auto-merge gates
+        # (reviewer-state checks + merge dispatch) don't apply and the
+        # "review=REQUEST_CHANGES — leaving open" log below would be
+        # factually wrong. Notify per channel severity and return.
+        if RAVEN_REVIEW_MODE == "advisory":
+            _notify_if_needed(repo_full_name, pr_number, pr_title, pr_url, review)
+            return
 
         if not approve:
             logger.info("PR #%d review=REQUEST_CHANGES — leaving open", pr_number)
@@ -1255,13 +1292,25 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 logger.debug("PR %s state=%s — skipping revision/retraction", pr_key, pr_state)
                 return
 
-            # Filter retraction IDs against fetched thread (defensive
-            # against AI hallucination).
-            valid_thread_ids = {c.get("id") for c in thread}
-            to_retract = [cid for cid in retract_findings if cid in valid_thread_ids]
+            # Filter retraction IDs against fetched thread, restricted to
+            # comments Raven itself authored. Defense in depth: prevents
+            # a hallucinating AI (or a prompt-injection vector) from
+            # resolving a developer's comment via the platform API. We
+            # only ever retract our OWN findings.
+            try:
+                raven_user_lc = (provider.get_authenticated_user() or "").lower()
+            except Exception:
+                raven_user_lc = ""
+            raven_owned_ids = {
+                c.get("id") for c in thread
+                if c.get("id") is not None
+                and ((c.get("user") or {}).get("login") or "").lower() == raven_user_lc
+                and raven_user_lc
+            }
+            to_retract = [cid for cid in retract_findings if cid in raven_owned_ids]
             dropped = set(retract_findings) - set(to_retract)
             if dropped:
-                logger.debug("Dropped %d hallucinated retract IDs not in thread: %s",
+                logger.debug("Dropped %d retract IDs not authored by Raven or absent from thread: %s",
                              len(dropped), dropped)
 
             any_retraction_succeeded = False
@@ -1299,8 +1348,51 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                                          cid, fname)
                             break
 
+            # Defense in depth: if the AI retracted finding(s) but didn't
+            # set `revise`, and the cache now has no remaining findings,
+            # and prior verdict was needs_work — synthesize a flip to
+            # approve. The basis for blocking has been removed via the
+            # conversation; the prompt asks the AI to revise in this
+            # case but a conservative AI may not. Backstop here.
+            if (
+                any_retraction_succeeded
+                and revise is None
+                and prior_verdict == "needs_work"
+            ):
+                with _previous_diffs_lock:
+                    entry_after_retract = _previous_diffs.get(pr_key)
+                remaining_count = (
+                    sum(len(fl) for fl in entry_after_retract.findings.values())
+                    if entry_after_retract else 0
+                )
+                if remaining_count == 0:
+                    logger.info(
+                        "PR #%d: synthesizing revise→approve — all findings retracted via comment thread",
+                        pr_number,
+                    )
+                    revise = {
+                        "verdict": "approve",
+                        "body": (
+                            "🦅 **Raven Review (Revised)**\n\n"
+                            "Revised to approve following the comment-thread discussion: "
+                            "all previously-flagged findings have been retracted."
+                        ),
+                    }
+
             # Verdict revision (only when verdict actually changes).
             do_revision = revise is not None and revise.get("verdict") != prior_verdict
+
+            # Lift entry + remaining_findings ABOVE submit_review so the
+            # advisory body wrap can render the synthetic review correctly
+            # (needs severity + findings list at body-construction time).
+            # The dispatch site below reads these same locals — single
+            # source of truth, no duplicate flatten.
+            with _previous_diffs_lock:
+                entry = _previous_diffs.get(pr_key)
+            remaining_findings: list[dict] = []
+            if entry is not None:
+                for fl in entry.findings.values():
+                    remaining_findings.extend(fl)
 
             if not do_revision:
                 new_verdict = prior_verdict
@@ -1308,7 +1400,20 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 rev_head_sha = None
             else:
                 new_verdict = revise["verdict"]
-                new_body = revise["body"]
+                # In advisory mode wrap revise.body via _format_comment so
+                # the comment renders with the "Updated Recommendation"
+                # header. In all/gap modes keep the raw revise.body.
+                if RAVEN_REVIEW_MODE == "advisory":
+                    new_body = _format_comment(
+                        {
+                            "severity": _max_severity_from_findings(remaining_findings),
+                            "summary": revise["body"],
+                            "findings": remaining_findings,
+                        },
+                        mode="advisory_update",
+                    )
+                else:
+                    new_body = revise["body"]
 
             if do_revision:
                 # Pin the revised review to the current head_sha for
@@ -1334,6 +1439,11 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                         pr_number,
                     )
                     return
+                # Pass comment_only conditionally so out-of-tree providers
+                # running in all/gap mode never see the new kwarg.
+                advisory_kwargs = (
+                    {"comment_only": True} if RAVEN_REVIEW_MODE == "advisory" else {}
+                )
                 try:
                     new_review_dict = provider.submit_review(
                         repo_full_name, pr_number,
@@ -1341,6 +1451,7 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                         approve=(new_verdict == "approve"),
                         inline_comments=None,
                         commit_id=rev_head_sha,
+                        **advisory_kwargs,
                     )
                 except Exception as e:
                     logger.warning("Verdict revision submit_review failed for PR #%d: %s",
@@ -1384,9 +1495,14 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             #   (a) verdict flipped needs_work → approve, OR
             #   (b) verdict was already approve AND a retraction succeeded
             #       (BB DC all-comments-resolved unblock).
+            # Suppressed in advisory mode — no formal verdict was registered,
+            # so there's nothing to gate the merge on.
             should_dispatch_merge = (
-                (prior_verdict == "needs_work" and new_verdict == "approve")
-                or (prior_verdict == "approve" and new_verdict == "approve" and any_retraction_succeeded)
+                RAVEN_REVIEW_MODE != "advisory"
+                and (
+                    (prior_verdict == "needs_work" and new_verdict == "approve")
+                    or (prior_verdict == "approve" and new_verdict == "approve" and any_retraction_succeeded)
+                )
             )
             if should_dispatch_merge:
                 # Fail-closed on metadata fetch failure: dispatching with
@@ -1411,22 +1527,11 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 pr_url = meta.get("html_url") or ""
                 merge_strategy = os.environ.get("MERGE_STRATEGY", "squash")
                 # Synthesize a review dict reflecting residual cache state.
-                with _previous_diffs_lock:
-                    entry = _previous_diffs.get(pr_key)
-                remaining_findings = []
-                if entry is not None:
-                    for fl in entry.findings.values():
-                        remaining_findings.extend(fl)
-                if remaining_findings:
-                    max_sev = max(SEVERITY_ORDER.get(f.get("severity", "low"), 0)
-                                  for f in remaining_findings)
-                    severity = next(name for name, ord_ in SEVERITY_ORDER.items()
-                                    if ord_ == max_sev)
-                else:
-                    severity = "low"
+                # entry + remaining_findings were already computed above
+                # before submit_review (single source of truth).
                 synthetic_review = {
                     "approve": True,
-                    "severity": severity,
+                    "severity": _max_severity_from_findings(remaining_findings),
                     "summary": new_body,
                     "findings": remaining_findings,
                 }
@@ -1992,18 +2097,46 @@ def _notify_if_needed(repo_full_name: str, pr_number: int, pr_title: str, pr_url
 SEVERITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 
 
-def _format_comment(review: dict) -> str:
+def _max_severity_from_findings(findings: list[dict]) -> str:
+    """Highest severity name among findings; ``"low"`` when the list is
+    empty or no severity matches ``SEVERITY_ORDER``. Safe against
+    unknown severities — never raises ``StopIteration``."""
+    if not findings:
+        return "low"
+    max_sev = max(SEVERITY_ORDER.get(f.get("severity", "low"), 0)
+                  for f in findings)
+    for name, ord_ in SEVERITY_ORDER.items():
+        if ord_ == max_sev:
+            return name
+    return "low"
+
+
+def _format_comment(review: dict, mode: str = "review") -> str:
+    """Render the review summary body.
+
+    ``mode`` selects the header / subtitle:
+      * ``"review"``           — formal review (header: "Raven Review").
+      * ``"advisory"``         — initial advisory recommendation.
+      * ``"advisory_update"``  — advisory recommendation revised via comment thread.
+    """
     severity = review.get("severity", "low")
     summary = review.get("summary", "")
     findings = review.get("findings", [])
     emoji = SEVERITY_EMOJI.get(severity, "🟢")
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    lines = [
-        "🦅 **Raven Review**",
-        "",
-        f"**{emoji} {severity.upper()}** — {summary}",
-    ]
+    if mode == "advisory":
+        header = "🦅 **Raven Recommendation**"
+    elif mode == "advisory_update":
+        header = "🦅 **Raven Updated Recommendation**"
+    else:
+        header = "🦅 **Raven Review**"
+
+    lines = [header]
+    if mode in ("advisory", "advisory_update"):
+        lines.append("_Advisory only — Raven is not blocking this PR._")
+    lines.append("")
+    lines.append(f"**{emoji} {severity.upper()}** — {summary}")
 
     if findings:
         lines.append("")
@@ -2024,7 +2157,7 @@ def _format_comment(review: dict) -> str:
         lines.append(f"*Includes {n} finding(s) carried from unchanged files*")
 
     lines.append("")
-    lines.append(f"*Reviewed by Raven · {timestamp}*")
+    lines.append(f"*Reviewed by Raven · {RAVEN_AI_MODEL} · {timestamp}*")
 
     return "\n".join(lines)
 

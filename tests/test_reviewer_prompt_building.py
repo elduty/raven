@@ -604,8 +604,51 @@ class TestRespondPromptBuilding:
         )
         prompt = captured["prompt"]
         assert "## Active Thread" in prompt
-        assert "**raven:** Original finding" in prompt
-        assert "**alice:** Not a bug because X" in prompt
+        # The thread block now exposes comment IDs so the AI can populate
+        # `retract_findings`. Without IDs in the rendered prompt, the AI
+        # has nothing to put in that list — the retraction flow becomes
+        # unreachable.
+        assert "**raven [id=1]:** Original finding" in prompt
+        assert "**alice [id=2]:** Not a bug because X" in prompt
+
+    def test_thread_renders_id_marker_when_id_present(self, monkeypatch):
+        """Each thread entry must include `[id=N]` so the AI can reference
+        it in `retract_findings`. Regression guard for the silent-retract
+        bug where the prompt told the AI to use thread IDs but never
+        rendered them."""
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        thread = [
+            {"id": 7700, "user": {"login": "raven"},
+             "body": "SQL injection", "resolved": False},
+            {"id": 7701, "user": {"login": "dev"},
+             "body": "actually fine, see X", "resolved": False},
+        ]
+        respond_to_comment(
+            comment_body="?", conversation=[], diff="", repo_name="u/r",
+            thread=thread, prior_verdict="needs_work", prior_body="...",
+        )
+        prompt = captured["prompt"]
+        assert "[id=7700]" in prompt
+        assert "[id=7701]" in prompt
+
+    def test_thread_no_id_marker_when_id_missing(self, monkeypatch):
+        """Comments without an `id` field render without the `[id=N]` marker —
+        no `[id=None]` artifact. Some legacy code paths may produce
+        id-less entries (e.g. mocked test data); they should degrade
+        gracefully, not pollute the prompt with placeholder text."""
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        thread = [
+            {"user": {"login": "raven"}, "body": "no id here", "resolved": False},
+        ]
+        respond_to_comment(
+            comment_body="?", conversation=[], diff="", repo_name="u/r",
+            thread=thread, prior_verdict=None, prior_body=None,
+        )
+        prompt = captured["prompt"]
+        assert "[id=None]" not in prompt
+        assert "[id=" not in prompt or "**raven:**" in prompt
 
     def test_prior_verdict_section_included(self, monkeypatch):
         captured = self._capture_prompt(monkeypatch)
@@ -655,8 +698,10 @@ class TestRespondPromptBuilding:
             thread=thread, prior_verdict="needs_work", prior_body="x",
         )
         prompt = captured["prompt"]
-        assert "**raven [resolved]:** Original finding" in prompt
-        assert "**alice:** Reply" in prompt
+        # IDs now precede the resolved marker per the comment-thread-context
+        # retract fix (the AI needs IDs to populate `retract_findings`).
+        assert "**raven [id=1] [resolved]:** Original finding" in prompt
+        assert "**alice [id=2]:** Reply" in prompt
 
     def test_thread_truncation_preserves_root(self, monkeypatch):
         """CRITICAL — regression guard: oldest-first truncation would drop
@@ -677,12 +722,12 @@ class TestRespondPromptBuilding:
             thread=thread, prior_verdict=None, prior_body=None,
         )
         prompt = captured["prompt"]
-        # Root MUST be preserved
-        assert "**u0:**" in prompt, "Thread root was dropped — regression!"
+        # Root MUST be preserved (now includes [id=N] marker)
+        assert "**u0 [id=0]:**" in prompt, "Thread root was dropped — regression!"
         # Newest MUST be preserved
-        assert "**u5:**" in prompt
+        assert "**u5 [id=5]:**" in prompt
         # Some middle entries MUST be dropped at this cap
-        assert ("**u2:**" not in prompt) or ("**u3:**" not in prompt)
+        assert ("**u2 [id=2]:**" not in prompt) or ("**u3 [id=3]:**" not in prompt)
         # Truncation marker present when entries were dropped
         assert "earlier replies truncated" in prompt
 
@@ -704,8 +749,8 @@ class TestRespondPromptBuilding:
             thread=thread, prior_verdict=None, prior_body=None,
         )
         prompt = captured["prompt"]
-        assert "**raven:** Finding" in prompt
-        assert "**alice:** Reply" in prompt
+        assert "**raven [id=1]:** Finding" in prompt
+        assert "**alice [id=2]:** Reply" in prompt
         assert "earlier replies truncated" not in prompt
 
 

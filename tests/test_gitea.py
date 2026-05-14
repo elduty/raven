@@ -257,6 +257,24 @@ class TestSubmitReview:
             with pytest.raises(requests.HTTPError):
                 client.submit_review("owner/repo", 1, "body", approve=True)
 
+    def test_comment_only_uses_event_comment(self, client):
+        """comment_only=True bypasses the approve flag and sends
+        event=COMMENT — the review carries body + inline anchors but
+        no APPROVED / REQUEST_CHANGES verdict. Used for advisory mode."""
+        with _mock_post(client) as mock_post:
+            client.submit_review("owner/repo", 3, "advisory body",
+                                  approve=False, commit_id="sha1",
+                                  comment_only=True)
+        payload = mock_post.call_args[1]["json"]
+        assert payload["event"] == "COMMENT"
+        # approve flag ignored in comment_only mode
+        with _mock_post(client) as mock_post:
+            client.submit_review("owner/repo", 3, "advisory body",
+                                  approve=True, commit_id="sha1",
+                                  comment_only=True)
+        payload = mock_post.call_args[1]["json"]
+        assert payload["event"] == "COMMENT"
+
 
 # ------------------------------------------------------------------ #
 #  Authenticated user                                                  #

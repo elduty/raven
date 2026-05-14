@@ -26,11 +26,7 @@ _EFFORT_TO_REASONING = {
     "none":   None,  # omit reasoning_effort kwarg entirely
 }
 
-_MAX_CONCURRENT = max(int(
-    os.environ.get("RAVEN_AI_MAX_CONCURRENT")
-    or os.environ.get("RAVEN_MAX_CONCURRENT_CLAUDE")
-    or "4"
-), 1)
+_MAX_CONCURRENT = max(int(os.environ.get("RAVEN_AI_MAX_CONCURRENT", "4")), 1)
 
 
 class OpenAICompatibleBackend(AIBackend):

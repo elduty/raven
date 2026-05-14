@@ -324,12 +324,16 @@ class GiteaProvider(GitProvider):
 
     def submit_review(self, repo_full_name: str, pr_number: int, body: str,
                       approve: bool, inline_comments: list[dict] | None = None,
-                      commit_id: str = "") -> dict:
+                      commit_id: str = "", comment_only: bool = False) -> dict:
         """Submit a formal PR review with optional inline comments.
 
         approve: True -> APPROVED, False -> REQUEST_CHANGES.
         inline_comments: normalized [{"file": "...", "line": N, "body": "..."}] dicts.
         commit_id: pin review to a specific commit SHA (prevents stale reviews on force-push).
+        comment_only: when True, posts the review with event=COMMENT — no
+            APPROVED / REQUEST_CHANGES verdict, but inline comments still
+            attach. Used for advisory mode where the verdict is
+            non-blocking.
 
         Returns the Gitea review dict, extended with an ``inline_comments``
         key carrying per-input-entry ``{file, line, comment_id}`` — same
@@ -340,7 +344,10 @@ class GiteaProvider(GitProvider):
         """
         owner, repo = _split_repo(repo_full_name)
         url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
-        event = "APPROVED" if approve else "REQUEST_CHANGES"
+        if comment_only:
+            event = "COMMENT"
+        else:
+            event = "APPROVED" if approve else "REQUEST_CHANGES"
         payload: dict = {"body": body, "event": event}
         if commit_id:
             payload["commit_id"] = commit_id

@@ -13,38 +13,14 @@ from raven.ai import get_backend
 
 logger = logging.getLogger(__name__)
 
-# Backend-agnostic AI knobs. New names are RAVEN_AI_*; legacy CLAUDE_*
-# names are honored as a fallback so existing deployments don't need a
-# coordinated env-var change. The Python identifiers stay CLAUDE_*-named
-# to avoid churning every call site for a refactor that's purely about
-# operator-facing config strings.
-CLAUDE_MODEL = (
-    os.environ.get("RAVEN_AI_MODEL")
-    or os.environ.get("CLAUDE_MODEL")
-    or "claude-opus-4-7"
-)
-MAX_CONCURRENT_CLAUDE = max(int(
-    os.environ.get("RAVEN_AI_MAX_CONCURRENT")
-    or os.environ.get("RAVEN_MAX_CONCURRENT_CLAUDE")
-    or "4"
-), 1)
-CLAUDE_EFFORT = (
-    os.environ.get("RAVEN_AI_EFFORT")
-    or os.environ.get("CLAUDE_EFFORT")
-    or "max"
-)
+# Backend-agnostic AI knobs.
+RAVEN_AI_MODEL = os.environ.get("RAVEN_AI_MODEL", "claude-opus-4-7")
+RAVEN_AI_MAX_CONCURRENT = max(int(os.environ.get("RAVEN_AI_MAX_CONCURRENT", "4")), 1)
+RAVEN_AI_EFFORT = os.environ.get("RAVEN_AI_EFFORT", "max")
 # Conversational replies don't need max thinking — default to medium for
-# cheaper/faster responses. Override with RAVEN_AI_EFFORT_COMMENT.
-CLAUDE_EFFORT_COMMENT = (
-    os.environ.get("RAVEN_AI_EFFORT_COMMENT")
-    or os.environ.get("CLAUDE_EFFORT_COMMENT")
-    or "medium"
-)
-CLAUDE_TIMEOUT = int(
-    os.environ.get("RAVEN_AI_TIMEOUT")
-    or os.environ.get("CLAUDE_TIMEOUT")
-    or "600"
-)
+# cheaper/faster responses.
+RAVEN_AI_EFFORT_COMMENT = os.environ.get("RAVEN_AI_EFFORT_COMMENT", "medium")
+RAVEN_AI_TIMEOUT = int(os.environ.get("RAVEN_AI_TIMEOUT", "600"))
 
 
 def terminate_active_processes(grace_period: float = 2.0) -> int:
@@ -362,7 +338,7 @@ def _build_pr_context_section(pr_title: str, pr_description: str,
 
 def review_config_hash() -> str:
     """SHA256 of backend + model + effort + prompt — changes when review config changes."""
-    content = f"{get_backend().name}:{CLAUDE_MODEL}:{CLAUDE_EFFORT}:{_REVIEW_PROMPT_TEMPLATE}"
+    content = f"{get_backend().name}:{RAVEN_AI_MODEL}:{RAVEN_AI_EFFORT}:{_REVIEW_PROMPT_TEMPLATE}"
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 # Binary / lock file extensions and names to strip from diffs
@@ -541,7 +517,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
             logger.error("Chunk review failed for %s: %s", filename, e)
             return filename, None, f"`{filename}` review failed: {e}"
 
-    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CLAUDE) as chunk_pool:
+    with ThreadPoolExecutor(max_workers=RAVEN_AI_MAX_CONCURRENT) as chunk_pool:
         futures = {chunk_pool.submit(_review_chunk, fn, ch): fn for fn, ch in reviewable}
         for future in as_completed(futures):
             filename, chunk_result, error = future.result()
@@ -662,13 +638,13 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
         "Reviewing %s%s (model=%s effort=%s diff=%d lines)",
         repo_name,
         f"/{filename_hint}" if filename_hint else "",
-        CLAUDE_MODEL, CLAUDE_EFFORT, diff.count("\n"),
+        RAVEN_AI_MODEL, RAVEN_AI_EFFORT, diff.count("\n"),
     )
     output = get_backend().complete(
         prompt,
-        model=CLAUDE_MODEL,
-        effort=CLAUDE_EFFORT,
-        timeout=CLAUDE_TIMEOUT,
+        model=RAVEN_AI_MODEL,
+        effort=RAVEN_AI_EFFORT,
+        timeout=RAVEN_AI_TIMEOUT,
         purpose="review",
     )
     return _parse_response(output)
@@ -991,8 +967,10 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
         thread_lines = []
         for c in thread_for_prompt:
             user = c.get('user', {}).get('login', 'unknown')
+            cid = c.get('id')
+            id_marker = f" [id={cid}]" if cid is not None else ""
             resolved = " [resolved]" if c.get("resolved") else ""
-            thread_lines.append(f"**{user}{resolved}:** {c.get('body', '')}")
+            thread_lines.append(f"**{user}{id_marker}{resolved}:** {c.get('body', '')}")
         thread_text = "\n\n".join(thread_lines)
         thread_section = (
             "\n\n## Active Thread (you are replying inside this)\n"
@@ -1025,13 +1003,13 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
         "Responding on %s%s (model=%s effort=%s)",
         repo_name,
         f" {file_path}:{line}" if file_path and line else (f" {file_path}" if file_path else ""),
-        CLAUDE_MODEL, CLAUDE_EFFORT_COMMENT,
+        RAVEN_AI_MODEL, RAVEN_AI_EFFORT_COMMENT,
     )
     raw = get_backend().complete(
         prompt,
-        model=CLAUDE_MODEL,
-        effort=CLAUDE_EFFORT_COMMENT,
-        timeout=CLAUDE_TIMEOUT,
+        model=RAVEN_AI_MODEL,
+        effort=RAVEN_AI_EFFORT_COMMENT,
+        timeout=RAVEN_AI_TIMEOUT,
         purpose="respond",
     ).strip()
     return _parse_respond_output(raw)

@@ -69,11 +69,11 @@ def get_backend() -> AIBackend:
     with _backend_lock:
         if _cached_backend is None:
             _cached_backend = _select_backend()
-            from raven.reviewer import CLAUDE_MODEL
+            from raven.reviewer import RAVEN_AI_MODEL
             logger.info(
                 "Using AI backend: %s (model=%s)",
                 _cached_backend.name,
-                CLAUDE_MODEL,
+                RAVEN_AI_MODEL,
             )
     return _cached_backend
 

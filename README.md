@@ -41,7 +41,13 @@ All of the above are optional and independent; missing files are skipped silentl
 
 Pushing new commits to a PR branch triggers an incremental re-review (only changed files). Findings from unchanged files are carried forward and included in the consolidated verdict. Clicking "re-request review" or adding Raven as a reviewer also triggers a fresh review.
 
-**Reviewer assignment**: by default Raven auto-adds itself to every PR it receives a webhook for and reviews it. It will auto-merge only PRs where it's the only reviewer; PRs with humans reviewing are reviewed but left for humans to merge. Set `RAVEN_REVIEW_ALL_PRS=false` for fill-gap mode — Raven only auto-adds on PRs with no other reviewer. Either way, adding Raven as a reviewer manually always triggers a fresh review.
+**Review mode**: `RAVEN_REVIEW_MODE` controls engagement and how blocking Raven's verdict is.
+
+- `all` (default) — Raven auto-adds itself to every PR, submits a formal review, and auto-merges PRs where it's the only reviewer.
+- `gap` — Raven only auto-adds on PRs with no other reviewer (fill-gap mode); still submits a formal review when engaged.
+- `advisory` — Raven posts a non-blocking **Raven Recommendation** comment with inline findings. It does not auto-add itself, does not submit a formal review, and does not auto-merge. Useful for trial deployments or teams that prefer humans to drive merges.
+
+Adding Raven as a reviewer manually always triggers a fresh review (in `advisory` mode that fresh review is still advisory).
 
 ### Conversational follow-up
 
@@ -69,7 +75,7 @@ docker compose up -d
 ### Gitea setup
 
 1. **System webhook** (Site Administration -> System Webhooks):
-   - URL: `https://raven.yourdomain.com/hook/gitea` (or `/hook` for backward compat)
+   - URL: `https://raven.yourdomain.com/hook/gitea`
    - Content Type: `application/json`
    - Secret: must match `GITEA_WEBHOOK_SECRET`
    - Events: Pull Request, Push, Issue Comment, Pull Request Comment, Pull Request Review Request
@@ -131,7 +137,6 @@ All configuration is via environment variables. See `config.example.env` for the
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `GITEA_WEBHOOK_SECRET` | Gitea | — | HMAC-SHA256 shared secret for Gitea webhooks. Required if using Gitea. |
-| `RAVEN_WEBHOOK_SECRET` | — | — | Deprecated alias for `GITEA_WEBHOOK_SECRET`. Still works for backward compat. |
 | `GITEA_URL` | Gitea | — | Base URL of the Gitea instance. |
 | `GITEA_TOKEN` | Gitea | — | Gitea personal access token. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | claude_cli | — | Claude Code OAuth token (JSON blob from `claude setup-token`, or a bare access token). Required only for the `claude_cli` backend. |
@@ -147,10 +152,10 @@ All configuration is via environment variables. See `config.example.env` for the
 | `CI_WAIT_TIMEOUT` | No | `300` | Seconds to wait for CI before giving up. `0` to skip CI check. |
 | `SKIP_REPOS` | No | — | Comma-separated `owner/repo` list to skip. |
 | `SKIP_AUTHORS` | No | — | Comma-separated author names to skip. |
-| `RAVEN_AI_MODEL` | No | `claude-opus-4-7` | Model to use for reviews. Backend-agnostic — the string is whatever your active backend (and any proxy) routes. Legacy alias: `CLAUDE_MODEL`. |
-| `RAVEN_AI_EFFORT` | No | `max` | Thinking effort on PR reviews (`none`, `low`, `medium`, `high`, `max`). `none` omits `reasoning_effort` from the OpenAI-compatible request entirely — use it when routing to non-reasoning models behind a proxy that doesn't strip the param. Legacy alias: `CLAUDE_EFFORT`. |
-| `RAVEN_AI_EFFORT_COMMENT` | No | `medium` | Thinking effort on comment replies (`none`, `low`, `medium`, `high`, `max`). Q&A rarely needs max. Legacy alias: `CLAUDE_EFFORT_COMMENT`. |
-| `RAVEN_AI_TIMEOUT` | No | `600` | Per-request timeout in seconds (CLI subprocess for `claude_cli`, HTTP call for `openai_compatible`). Legacy alias: `CLAUDE_TIMEOUT`. |
+| `RAVEN_AI_MODEL` | No | `claude-opus-4-7` | Model to use for reviews. Backend-agnostic — the string is whatever your active backend (and any proxy) routes. |
+| `RAVEN_AI_EFFORT` | No | `max` | Thinking effort on PR reviews (`none`, `low`, `medium`, `high`, `max`). `none` omits `reasoning_effort` from the OpenAI-compatible request entirely — use it when routing to non-reasoning models behind a proxy that doesn't strip the param. |
+| `RAVEN_AI_EFFORT_COMMENT` | No | `medium` | Thinking effort on comment replies (`none`, `low`, `medium`, `high`, `max`). Q&A rarely needs max. |
+| `RAVEN_AI_TIMEOUT` | No | `600` | Per-request timeout in seconds (CLI subprocess for `claude_cli`, HTTP call for `openai_compatible`). |
 | `RAVEN_COMMENT_HISTORY` | No | `20` | Recent comments passed to Claude as conversation context (for @mention replies). |
 | `RAVEN_REVIEW_COMMENT_CONTEXT` | No | `20` | Max non-bot PR comments included in the review prompt's "PR Conversation" section. `0` disables the subsection. |
 | `RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS` | No | `4000` | Per-item character cap applied to PR title, description, and each comment body before they're concatenated into the review prompt. Approximate — a truncation marker of ~30-40 chars is appended after the prefix. `0` disables truncation (keep full text). |
@@ -158,13 +163,13 @@ All configuration is via environment variables. See `config.example.env` for the
 | `RAVEN_RULES_DIR` | No | `.claude/rules` | Repository directory whose top-level `*.md` files are injected into every review prompt as "Repository Rules" context (flat listing — subdirectories are ignored for rules). Also hosts optional prompt overrides at `<RAVEN_RULES_DIR>/raven/prompts/{review,respond}.md`. Set to empty string to disable both rule injection and prompt overrides. |
 | `RAVEN_REVIEW_RULES_TOTAL_CHARS` | No | `16000` | Global budget across all rule files concatenated into the prompt. Per-file truncation uses `RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS`. `0` disables the global cap. |
 | `RAVEN_GITEA_AUTO_MERGE` | No | `false` | Gitea-only. Queue the merge and let Gitea wait for CI. BB DC has no equivalent REST flag; its CI enforcement lives in repo-level merge checks, so this setting does nothing on BB DC. Default behaviour (poll CI, then merge) works on every provider. |
-| `RAVEN_REVIEW_ALL_PRS` | No | `true` | Whether Raven auto-adds itself to every PR (default) or only to PRs with no other reviewer. Set to `false` (or `0` / `no`) for fill-gap behaviour — Raven stays out of human-reviewed PRs. |
+| `RAVEN_REVIEW_MODE` | No | `all` | Review engagement: `all` (auto-add + formal review + sole-reviewer auto-merge), `gap` (auto-add only when no other reviewer; formal review), or `advisory` (no auto-add; non-blocking "Raven Recommendation" comment; no auto-merge). Invalid values exit at startup. |
 | `RAVEN_LABEL_NAME` | No | `raven-reviewed` | Label name added to reviewed PRs. |
 | `RAVEN_CACHE_DIR` | No | `/tmp/raven` | Directory for persistent findings cache. Use a Docker volume in production. |
 | `RAVEN_MAX_CACHED_PRS` | No | `200` | Max PR entries in the findings cache (LRU eviction). |
 | `RAVEN_MAX_WORKERS` | No | `16` | Main review pool size (webhook dispatch, diff fetch, Claude CLI, review submission). |
 | `RAVEN_CI_WAIT_WORKERS` | No | `32` | Dedicated pool for the post-review CI-wait-and-merge phase. Sized larger than the main pool because these tasks spend nearly all their time sleeping. |
-| `RAVEN_AI_MAX_CONCURRENT` | No | `4` | Max concurrent in-flight AI calls. For `claude_cli` this caps subprocesses (memory); for `openai_compatible` it caps simultaneous HTTP requests to the proxy. Legacy alias: `RAVEN_MAX_CONCURRENT_CLAUDE`. |
+| `RAVEN_AI_MAX_CONCURRENT` | No | `4` | Max concurrent in-flight AI calls. For `claude_cli` this caps subprocesses (memory); for `openai_compatible` it caps simultaneous HTTP requests to the proxy. |
 | `BITBUCKET_DC_URL` | BB DC | — | Bitbucket Data Center base URL. Enables BB DC provider when set with token + secret + username. |
 | `BITBUCKET_DC_TOKEN` | BB DC | — | BB DC personal access token (Repository Write + Pull Request Write). |
 | `BITBUCKET_DC_WEBHOOK_SECRET` | BB DC | — | HMAC-SHA256 secret for BB DC webhooks. |
@@ -238,7 +243,7 @@ Raven submits formal reviews (APPROVED or REQUEST_CHANGES on Gitea, approve/need
 - 🔴 [high] `db.py:execute()` — user input concatenated directly into SQL string
 - 🟡 [medium] `auth.py:login()` — no rate limiting on failed attempts
 
-*Reviewed by Raven · 2026-03-22 00:41 UTC*
+*Reviewed by Raven · claude-opus-4-7 · 2026-03-22 00:41 UTC*
 ```
 
 Each finding with a file and line number is also posted as an inline comment on the exact diff line.
@@ -347,7 +352,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-585 tests across 13 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
+604 tests across 13 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop), three-mode review engagement (`all` / `gap` / `advisory`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
 
 ## CI
 

@@ -388,6 +388,27 @@ class TestSubmitReview:
         assert inline_payload["anchor"]["line"] == 10
         assert inline_payload["anchor"]["lineType"] == "ADDED"
 
+    def test_comment_only_skips_participant_status(self, client):
+        """comment_only=True posts the body comment but skips the
+        approve / needs-work participant PUT — keeps the review
+        non-blocking. Used for advisory mode."""
+        comment_resp = MagicMock(status_code=201, raise_for_status=MagicMock())
+        comment_resp.json.return_value = {"id": 99, "text": "advisory"}
+
+        with patch.object(client.session, "post", return_value=comment_resp) as mock_post, \
+             patch.object(client.session, "put") as mock_put:
+            client.submit_review(
+                "PROJ/repo", 7, "advisory body",
+                approve=False, comment_only=True,
+            )
+
+        # Comment posted; participants endpoint NOT called.
+        assert mock_post.called
+        mock_put.assert_not_called()
+        # And no /approve POST either.
+        approve_calls = [c for c in mock_post.call_args_list if "/approve" in c[0][0]]
+        assert not approve_calls
+
 
 # ------------------------------------------------------------------ #
 #  dismiss_previous_reviews                                           #
