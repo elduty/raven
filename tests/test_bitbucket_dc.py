@@ -704,47 +704,6 @@ class TestPostPrComment:
         assert payload["parent"] == {"id": 42}
 
 
-class TestGetCommentThreadAuthors:
-    def test_root_only(self, client):
-        with _mock_get(client,
-                       json_data={"id": 42, "author": {"slug": "alice"}}) as mock_get:
-            authors = client.get_comment_thread_authors("PROJ/repo", 3, 42)
-        assert authors == ["alice"]
-        url = mock_get.call_args[0][0]
-        assert url.endswith("/pull-requests/3/comments/42")
-
-    def test_includes_child_replies(self, client):
-        """Thread walk must pick up authors nested under comments[]."""
-        with _mock_get(client, json_data={
-            "id": 42,
-            "author": {"slug": "alice"},
-            "comments": [
-                {"id": 43, "author": {"slug": "raven-bot"}},
-                {"id": 44, "author": {"slug": "bob"}},
-            ],
-        }):
-            authors = client.get_comment_thread_authors("PROJ/repo", 3, 42)
-        assert set(authors) == {"alice", "raven-bot", "bob"}
-
-    def test_returns_empty_on_404(self, client):
-        mock_resp = MagicMock(status_code=404)
-        mock_resp.raise_for_status = MagicMock()
-        with patch.object(client.session, "get", return_value=mock_resp):
-            assert client.get_comment_thread_authors("PROJ/repo", 3, 999) == []
-
-    def test_handles_nested_replies_defensively(self, client):
-        """Some BB DC versions may nest comments beyond one level."""
-        with _mock_get(client, json_data={
-            "id": 1, "author": {"slug": "a"},
-            "comments": [
-                {"id": 2, "author": {"slug": "b"},
-                 "comments": [{"id": 3, "author": {"slug": "c"}}]},
-            ],
-        }):
-            authors = client.get_comment_thread_authors("PROJ/repo", 3, 1)
-        assert set(authors) == {"a", "b", "c"}
-
-
 # ------------------------------------------------------------------ #
 #  PR head SHA                                                        #
 # ------------------------------------------------------------------ #
@@ -914,16 +873,21 @@ class TestGetPrReviews:
             reviews = client.get_pr_reviews("PROJ/repo", 1)
         assert reviews[0]["state"] == "REQUEST_CHANGES"
 
-    def test_unapproved_maps_to_comment(self, client):
+    def test_unapproved_is_dropped(self, client):
+        """UNAPPROVED is the default status for the PR author and any
+        participant who hasn't formally reviewed. They are NOT reviewers
+        in the Gitea sense the auto-merge gate is built around, so drop
+        them rather than synthesising a fake COMMENT-state review."""
         data = {
             "values": [{"user": {"slug": "carol"}, "status": "UNAPPROVED"}],
             "isLastPage": True,
         }
         with _mock_get(client, json_data=data):
             reviews = client.get_pr_reviews("PROJ/repo", 1)
-        assert reviews[0]["state"] == "COMMENT"
+        assert reviews == []
 
     def test_mixed_statuses(self, client):
+        """APPROVED + NEEDS_WORK come through; UNAPPROVED is filtered."""
         data = {
             "values": [
                 {"user": {"slug": "alice"}, "status": "APPROVED"},
@@ -934,11 +898,32 @@ class TestGetPrReviews:
         }
         with _mock_get(client, json_data=data):
             reviews = client.get_pr_reviews("PROJ/repo", 1)
-        assert len(reviews) == 3
+        assert len(reviews) == 2
         states = {r["user"]["login"]: r["state"] for r in reviews}
-        assert states["alice"] == "APPROVED"
-        assert states["bob"] == "REQUEST_CHANGES"
-        assert states["carol"] == "COMMENT"
+        assert states == {"alice": "APPROVED", "bob": "REQUEST_CHANGES"}
+
+    def test_author_excluded_when_unapproved(self, client):
+        """Regression guard: BB DC's /participants endpoint always
+        includes the PR author with status=UNAPPROVED. Before this filter,
+        the auto-merge gate at server.py:781 would see the author in
+        get_pr_reviews and bail with 'has other reviewers — leaving open
+        for human review' even when Raven was the only formal reviewer."""
+        data = {
+            "values": [
+                {"user": {"slug": "marcin.zasina"}, "status": "UNAPPROVED",
+                 "role": "AUTHOR"},
+                {"user": {"slug": "raven"}, "status": "APPROVED",
+                 "role": "REVIEWER"},
+            ],
+            "isLastPage": True,
+        }
+        with _mock_get(client, json_data=data):
+            reviews = client.get_pr_reviews("PROJ/repo", 15)
+        # Author dropped, Raven kept — the auto-merge gate now sees Raven
+        # as the sole reviewer and can proceed.
+        assert len(reviews) == 1
+        assert reviews[0]["user"]["login"] == "raven"
+        assert reviews[0]["state"] == "APPROVED"
 
 
 # ------------------------------------------------------------------ #
@@ -956,3 +941,233 @@ class TestParseWebhookReviewRequestedWithReviewers:
         event_type, data = client.parse_webhook(req)
         assert event_type == "review_requested"
         assert data["requested_reviewer"] == "dave"
+
+
+# ------------------------------------------------------------------ #
+#  Comment-thread-context feature: get_pr_state                       #
+# ------------------------------------------------------------------ #
+
+class TestGetPrState:
+    def test_open(self, client):
+        with _mock_get(client, status=200, json_data={"state": "OPEN"}):
+            assert client.get_pr_state("proj/repo", 1) == "open"
+
+    def test_merged(self, client):
+        with _mock_get(client, status=200, json_data={"state": "MERGED"}):
+            assert client.get_pr_state("proj/repo", 1) == "merged"
+
+    def test_declined_maps_to_closed(self, client):
+        with _mock_get(client, status=200, json_data={"state": "DECLINED"}):
+            assert client.get_pr_state("proj/repo", 1) == "closed"
+
+
+# ------------------------------------------------------------------ #
+#  Comment-thread-context feature: get_pr_metadata                    #
+# ------------------------------------------------------------------ #
+
+class TestGetPrMetadata:
+    def test_returns_title_and_url(self, client):
+        with _mock_get(client, status=200, json_data={
+            "title": "Add X",
+            "links": {"self": [{"href": "https://bb/u/r/pulls/1"}]},
+        }):
+            meta = client.get_pr_metadata("proj/repo", 1)
+        assert meta == {"title": "Add X", "html_url": "https://bb/u/r/pulls/1"}
+
+    def test_returns_empty_dict_on_http_error(self, client):
+        import requests
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = requests.HTTPError("boom")
+        with patch.object(client.session, "get", return_value=mock_resp):
+            assert client.get_pr_metadata("proj/repo", 1) == {}
+
+
+# ------------------------------------------------------------------ #
+#  Comment-thread-context feature: get_comment_thread                 #
+# ------------------------------------------------------------------ #
+
+class TestGetCommentThread:
+    def test_walks_nested_with_resolved_flag(self, client):
+        response_json = {
+            "id": 100, "author": {"slug": "raven"}, "text": "root",
+            "state": "OPEN",
+            "anchor": {"path": "a.py", "line": 5},
+            "comments": [
+                {"id": 101, "author": {"slug": "alice"}, "text": "reply1",
+                 "state": "OPEN",
+                 "comments": [
+                    {"id": 102, "author": {"slug": "bob"}, "text": "reply2",
+                     "state": "RESOLVED", "comments": []},
+                 ]},
+                {"id": 103, "author": {"slug": "carol"}, "text": "reply3",
+                 "state": "OPEN", "comments": []},
+            ],
+        }
+        with _mock_get(client, status=200, json_data=response_json):
+            thread = client.get_comment_thread("proj/repo", 1, 100)
+        ids = [c["id"] for c in thread]
+        assert ids == [100, 101, 102, 103]
+        assert thread[0]["parent_id"] is None
+        assert thread[1]["parent_id"] == 100
+        assert thread[2]["parent_id"] == 101
+        assert thread[0]["file_path"] == "a.py"
+        assert thread[0]["line"] == 5
+        # Resolved flag derived from state field
+        assert thread[2]["resolved"] is True   # id=102 was RESOLVED
+        assert thread[0]["resolved"] is False
+        assert thread[1]["resolved"] is False
+
+    def test_returns_empty_on_404(self, client):
+        with _mock_get(client, status=404):
+            assert client.get_comment_thread("proj/repo", 1, 999) == []
+
+    def test_walks_up_to_conversation_root(self, client):
+        """Webhook gives immediate parent (id=100, intermediate); the actual
+        conversation root is id=99. get_comment_thread must walk UP first."""
+        root_resp = {
+            "id": 99, "author": {"slug": "raven"}, "text": "root",
+            "state": "OPEN", "anchor": {"path": "a.py", "line": 5},
+            "comments": [
+                {"id": 100, "author": {"slug": "alice"}, "text": "mid",
+                 "state": "OPEN", "comments": [
+                    {"id": 101, "author": {"slug": "bob"}, "text": "leaf",
+                     "state": "OPEN", "comments": []},
+                 ]},
+            ],
+        }
+        intermediate_resp = {
+            "id": 100, "parent": {"id": 99},
+            "author": {"slug": "alice"}, "text": "mid",
+            "state": "OPEN", "anchor": {"path": "a.py", "line": 5},
+            "comments": [],
+        }
+
+        def fake_get(url, **kwargs):
+            mr = MagicMock()
+            mr.raise_for_status = MagicMock()
+            if "/comments/100" in url:
+                mr.status_code = 200
+                mr.json.return_value = intermediate_resp
+            elif "/comments/99" in url:
+                mr.status_code = 200
+                mr.json.return_value = root_resp
+            else:
+                mr.status_code = 404
+            return mr
+
+        with patch.object(client.session, "get", side_effect=fake_get):
+            thread = client.get_comment_thread("proj/repo", 1, 100)
+        ids = [c["id"] for c in thread]
+        assert ids == [99, 100, 101]
+
+
+# ------------------------------------------------------------------ #
+#  Comment-thread-context feature: retract_finding                    #
+# ------------------------------------------------------------------ #
+
+class TestRetractFinding:
+    def test_resolves_comment(self, client):
+        get_resp = MagicMock(status_code=200)
+        get_resp.json.return_value = {"id": 42, "version": 3}
+        get_resp.raise_for_status = MagicMock()
+        put_resp = MagicMock(status_code=200)
+        put_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "get", return_value=get_resp), \
+             patch.object(client.session, "put", return_value=put_resp) as mock_put:
+            assert client.retract_finding("proj/repo", 1, 42) is True
+        _, kwargs = mock_put.call_args
+        assert kwargs["json"] == {"state": "RESOLVED", "version": 3}
+
+    def test_404_returns_false(self, client):
+        get_resp = MagicMock(status_code=404)
+        with patch.object(client.session, "get", return_value=get_resp):
+            assert client.retract_finding("proj/repo", 1, 42) is False
+
+    def test_409_version_conflict_returns_false(self, client):
+        get_resp = MagicMock(status_code=200)
+        get_resp.json.return_value = {"id": 42, "version": 3}
+        get_resp.raise_for_status = MagicMock()
+        put_resp = MagicMock(status_code=409)
+        with patch.object(client.session, "get", return_value=get_resp), \
+             patch.object(client.session, "put", return_value=put_resp):
+            assert client.retract_finding("proj/repo", 1, 42) is False
+
+
+# ------------------------------------------------------------------ #
+#  Comment-thread-context: submit_review returns per-inline IDs       #
+# ------------------------------------------------------------------ #
+
+class TestSubmitReviewInlineIds:
+    def test_returns_per_anchor_comment_ids(self, client):
+        """Each inline anchor's POST response id is captured and aligned
+        with the input. Filtered entries (invalid file/line) get None."""
+        # 4 inputs: 2 valid, 1 missing file, 1 invalid line. Valid ones
+        # get distinct comment_ids; filtered ones get None.
+        inline = [
+            {"file": "a.py", "line": 5, "body": "finding 1"},
+            {"file": "", "line": 10, "body": "no file"},        # filtered
+            {"file": "b.py", "line": 20, "body": "finding 2"},
+            {"file": "c.py", "line": 0, "body": "invalid line"},  # filtered
+        ]
+        posts = []
+        def fake_post(url, json=None, timeout=None):
+            posts.append((url, json))
+            mr = MagicMock(status_code=201)
+            mr.raise_for_status = MagicMock()
+            if "/approve" in url or "/participants/" in url:
+                mr.json.return_value = {}
+            elif "anchor" in (json or {}):
+                # Each inline post returns a unique id, 100 + post index
+                cid = 100 + sum(1 for p in posts[:-1] if "anchor" in (p[1] or {}))
+                mr.json.return_value = {"id": cid}
+            else:
+                mr.json.return_value = {"id": 999}  # main review comment
+            return mr
+        with patch.object(client.session, "post", side_effect=fake_post):
+            result = client.submit_review(
+                "proj/repo", 1, "review body", approve=True,
+                inline_comments=inline,
+            )
+        assert "inline_comments" in result
+        ic = result["inline_comments"]
+        assert len(ic) == 4
+        assert ic[0]["comment_id"] == 100
+        assert ic[1]["comment_id"] is None  # filtered (no file)
+        assert ic[2]["comment_id"] == 101
+        assert ic[3]["comment_id"] is None  # filtered (invalid line)
+
+    def test_returns_none_id_when_post_fails(self, client):
+        """A 4xx on one anchor doesn't break the others; the failed slot
+        gets comment_id=None so retraction-by-id won't target the wrong
+        comment via off-by-one alignment."""
+        import requests
+        inline = [
+            {"file": "a.py", "line": 1, "body": "f1"},
+            {"file": "a.py", "line": 2, "body": "f2"},
+        ]
+        call = [0]
+        def fake_post(url, json=None, timeout=None):
+            call[0] += 1
+            mr = MagicMock()
+            mr.raise_for_status = MagicMock()
+            if "anchor" in (json or {}):
+                if call[0] == 1:
+                    mr.status_code = 200
+                    mr.json.return_value = {"id": 500}
+                else:
+                    mr.status_code = 400
+                    mr.raise_for_status.side_effect = requests.HTTPError("nope")
+            elif "/approve" in url:
+                mr.status_code = 200
+                mr.json.return_value = {}
+            else:
+                mr.status_code = 201
+                mr.json.return_value = {"id": 999}
+            return mr
+        with patch.object(client.session, "post", side_effect=fake_post):
+            result = client.submit_review(
+                "proj/repo", 1, "body", approve=True, inline_comments=inline,
+            )
+        ic = result["inline_comments"]
+        assert ic[0]["comment_id"] == 500
+        assert ic[1]["comment_id"] is None

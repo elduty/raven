@@ -57,6 +57,11 @@ services:
       - RAVEN_AI_MAX_TOKENS=${RAVEN_AI_MAX_TOKENS:-}
       # ── Comment replies (default must match raven/server.py)
       - RAVEN_COMMENT_HISTORY=${RAVEN_COMMENT_HISTORY:-20}
+      # ── Comment reply context budgets (defaults must match raven/reviewer.py).
+      # Thread block preserves root + newest replies, drops the middle.
+      # Verdict body middle-truncates. See config.example.env for details.
+      - RAVEN_RESPOND_THREAD_TOTAL_CHARS=${RAVEN_RESPOND_THREAD_TOTAL_CHARS:-8000}
+      - RAVEN_RESPOND_VERDICT_BODY_CHARS=${RAVEN_RESPOND_VERDICT_BODY_CHARS:-4000}
       # ── Review PR-conversation context (defaults must match raven/reviewer.py)
       - RAVEN_REVIEW_COMMENT_CONTEXT=${RAVEN_REVIEW_COMMENT_CONTEXT:-20}
       - RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS=${RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS:-4000}
@@ -74,6 +79,9 @@ services:
       - RAVEN_CI_WAIT_WORKERS=${RAVEN_CI_WAIT_WORKERS:-32}
       - RAVEN_AI_MAX_CONCURRENT=${RAVEN_AI_MAX_CONCURRENT:-${RAVEN_MAX_CONCURRENT_CLAUDE:-4}}
       - RAVEN_MAX_CACHED_PRS=${RAVEN_MAX_CACHED_PRS:-200}
+      # ── Observability (empty = /metrics returns 404; see raven/server.py).
+      # When set, Prometheus must send `Authorization: Bearer <token>`.
+      - RAVEN_METRICS_TOKEN=${RAVEN_METRICS_TOKEN:-}
       # Cache dir must live on the named volume — override any .env value.
       - RAVEN_CACHE_DIR=/data/raven
     volumes:

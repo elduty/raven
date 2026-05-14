@@ -559,3 +559,261 @@ class TestPromptBuilding:
         assert "Network reliability fix" in prompt
         assert "LGTM conceptually" in prompt
         assert "PR Context" in prompt
+
+
+# ────────────────────────────────────────────────────────────────────── #
+#  Comment-thread-context feature                                        #
+# ────────────────────────────────────────────────────────────────────── #
+
+class TestRespondPromptBuilding:
+    """Verify the new ## Active Thread + ## Your Prior Verdict prompt
+    sections in respond_to_comment, plus the root-preserving thread
+    truncation."""
+
+    def _capture_prompt(self, monkeypatch):
+        """Patch the AI backend to capture the prompt; returns a dict
+        that gets populated when respond_to_comment is invoked."""
+        captured = {}
+        from raven.ai.base import AIBackend
+
+        class _Stub(AIBackend):
+            name = "stub"
+
+            def complete(self, prompt, **kwargs):
+                captured["prompt"] = prompt
+                # Must be valid JSON per the respond_to_comment contract.
+                return '{"response": "ok", "revise": null, "retract_findings": []}'
+
+        monkeypatch.setattr("raven.reviewer.get_backend", lambda: _Stub())
+        return captured
+
+    def test_thread_section_included_when_thread_nonempty(self, monkeypatch):
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        thread = [
+            {"id": 1, "parent_id": None, "user": {"login": "raven"},
+             "body": "Original finding", "file_path": "a.py", "line": 5,
+             "resolved": False},
+            {"id": 2, "parent_id": 1, "user": {"login": "alice"},
+             "body": "Not a bug because X", "file_path": "a.py", "line": 5,
+             "resolved": False},
+        ]
+        respond_to_comment(
+            comment_body="why?", conversation=[], diff="", repo_name="u/r",
+            thread=thread, prior_verdict="needs_work", prior_body="Concerns: ...",
+        )
+        prompt = captured["prompt"]
+        assert "## Active Thread" in prompt
+        assert "**raven:** Original finding" in prompt
+        assert "**alice:** Not a bug because X" in prompt
+
+    def test_prior_verdict_section_included(self, monkeypatch):
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        respond_to_comment(
+            comment_body="why?", conversation=[], diff="", repo_name="u/r",
+            thread=[], prior_verdict="approve", prior_body="LGTM with caveats",
+        )
+        prompt = captured["prompt"]
+        assert "## Your Prior Verdict" in prompt
+        assert "approve" in prompt
+        assert "LGTM with caveats" in prompt
+
+    def test_no_thread_block_when_thread_empty(self, monkeypatch):
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        respond_to_comment(
+            comment_body="hi", conversation=[], diff="", repo_name="u/r",
+            thread=[], prior_verdict=None, prior_body=None,
+        )
+        assert "## Active Thread" not in captured["prompt"]
+
+    def test_no_verdict_block_when_prior_none(self, monkeypatch):
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        respond_to_comment(
+            comment_body="hi", conversation=[], diff="", repo_name="u/r",
+            thread=[], prior_verdict=None, prior_body=None,
+        )
+        assert "## Your Prior Verdict" not in captured["prompt"]
+
+    def test_resolved_flag_rendered(self, monkeypatch):
+        """Resolved entries get a '[resolved]' tag so the AI knows the
+        dev already marked them done."""
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        thread = [
+            {"id": 1, "parent_id": None, "user": {"login": "raven"},
+             "body": "Original finding", "file_path": "a.py", "line": 5,
+             "resolved": True},
+            {"id": 2, "parent_id": 1, "user": {"login": "alice"},
+             "body": "Reply", "file_path": "a.py", "line": 5,
+             "resolved": False},
+        ]
+        respond_to_comment(
+            comment_body="why?", conversation=[], diff="", repo_name="u/r",
+            thread=thread, prior_verdict="needs_work", prior_body="x",
+        )
+        prompt = captured["prompt"]
+        assert "**raven [resolved]:** Original finding" in prompt
+        assert "**alice:** Reply" in prompt
+
+    def test_thread_truncation_preserves_root(self, monkeypatch):
+        """CRITICAL — regression guard: oldest-first truncation would drop
+        the thread root (Raven's own original finding), leaving the AI
+        replying without knowing what was originally flagged. Strategy is
+        always-keep-root, keep-newest, drop-middle."""
+        captured = self._capture_prompt(monkeypatch)
+        monkeypatch.setenv("RAVEN_RESPOND_THREAD_TOTAL_CHARS", "600")
+        from raven.reviewer import respond_to_comment
+        thread = [
+            {"id": i, "parent_id": None, "user": {"login": f"u{i}"},
+             "body": "x" * 200, "file_path": None, "line": None,
+             "resolved": False}
+            for i in range(6)
+        ]
+        respond_to_comment(
+            comment_body="?", conversation=[], diff="", repo_name="u/r",
+            thread=thread, prior_verdict=None, prior_body=None,
+        )
+        prompt = captured["prompt"]
+        # Root MUST be preserved
+        assert "**u0:**" in prompt, "Thread root was dropped — regression!"
+        # Newest MUST be preserved
+        assert "**u5:**" in prompt
+        # Some middle entries MUST be dropped at this cap
+        assert ("**u2:**" not in prompt) or ("**u3:**" not in prompt)
+        # Truncation marker present when entries were dropped
+        assert "earlier replies truncated" in prompt
+
+    def test_thread_truncation_no_op_when_under_budget(self, monkeypatch):
+        """Small threads pass through untouched, no marker inserted."""
+        captured = self._capture_prompt(monkeypatch)
+        monkeypatch.setenv("RAVEN_RESPOND_THREAD_TOTAL_CHARS", "8000")
+        from raven.reviewer import respond_to_comment
+        thread = [
+            {"id": 1, "parent_id": None, "user": {"login": "raven"},
+             "body": "Finding", "file_path": "a.py", "line": 5,
+             "resolved": False},
+            {"id": 2, "parent_id": 1, "user": {"login": "alice"},
+             "body": "Reply", "file_path": "a.py", "line": 5,
+             "resolved": False},
+        ]
+        respond_to_comment(
+            comment_body="?", conversation=[], diff="", repo_name="u/r",
+            thread=thread, prior_verdict=None, prior_body=None,
+        )
+        prompt = captured["prompt"]
+        assert "**raven:** Finding" in prompt
+        assert "**alice:** Reply" in prompt
+        assert "earlier replies truncated" not in prompt
+
+
+class TestRespondJsonContract:
+    """Verify _parse_respond_output's enforcement of the JSON schema."""
+
+    def _stub_backend(self, monkeypatch, raw_response: str):
+        from raven.ai.base import AIBackend
+
+        class _Stub(AIBackend):
+            name = "stub"
+
+            def complete(self, prompt, **kwargs):
+                return raw_response
+
+        monkeypatch.setattr("raven.reviewer.get_backend", lambda: _Stub())
+
+    def test_valid_json_with_null_revise(self, monkeypatch):
+        self._stub_backend(monkeypatch,
+                           '{"response": "hi", "revise": null, "retract_findings": []}')
+        from raven.reviewer import respond_to_comment
+        out = respond_to_comment(comment_body="?", conversation=[], diff="",
+                                 repo_name="u/r")
+        assert out == {"response": "hi", "revise": None, "retract_findings": []}
+
+    def test_valid_json_with_revise(self, monkeypatch):
+        self._stub_backend(monkeypatch,
+                           '{"response": "fixed", "revise": {"verdict": "approve", '
+                           '"body": "now LGTM"}, "retract_findings": [42]}')
+        from raven.reviewer import respond_to_comment
+        out = respond_to_comment(comment_body="?", conversation=[], diff="",
+                                 repo_name="u/r")
+        assert out["revise"] == {"verdict": "approve", "body": "now LGTM"}
+        assert out["retract_findings"] == [42]
+
+    def test_invalid_json_raises_parse_error(self, monkeypatch):
+        self._stub_backend(monkeypatch, "not json at all")
+        from raven.reviewer import respond_to_comment, RespondParseError
+        import pytest
+        with pytest.raises(RespondParseError):
+            respond_to_comment(comment_body="?", conversation=[], diff="",
+                               repo_name="u/r")
+
+    def test_missing_response_field_raises(self, monkeypatch):
+        self._stub_backend(monkeypatch, '{"revise": null, "retract_findings": []}')
+        from raven.reviewer import respond_to_comment, RespondParseError
+        import pytest
+        with pytest.raises(RespondParseError):
+            respond_to_comment(comment_body="?", conversation=[], diff="",
+                               repo_name="u/r")
+
+    def test_invalid_verdict_value_raises(self, monkeypatch):
+        self._stub_backend(monkeypatch,
+                           '{"response": "x", "revise": {"verdict": "maybe", '
+                           '"body": "y"}, "retract_findings": []}')
+        from raven.reviewer import respond_to_comment, RespondParseError
+        import pytest
+        with pytest.raises(RespondParseError):
+            respond_to_comment(comment_body="?", conversation=[], diff="",
+                               repo_name="u/r")
+
+    def test_retract_findings_defaults_to_empty_list(self, monkeypatch):
+        """Missing retract_findings -> []."""
+        self._stub_backend(monkeypatch, '{"response": "x", "revise": null}')
+        from raven.reviewer import respond_to_comment
+        out = respond_to_comment(comment_body="?", conversation=[], diff="",
+                                 repo_name="u/r")
+        assert out["retract_findings"] == []
+
+    def test_retract_findings_null_accepted(self, monkeypatch):
+        """`null` -> [] (AI laziness defence)."""
+        self._stub_backend(monkeypatch,
+                           '{"response": "x", "revise": null, "retract_findings": null}')
+        from raven.reviewer import respond_to_comment
+        out = respond_to_comment(comment_body="?", conversation=[], diff="",
+                                 repo_name="u/r")
+        assert out["retract_findings"] == []
+
+    def test_fenced_json_block(self, monkeypatch):
+        """AI sometimes wraps JSON in ```json ... ``` — must still parse."""
+        self._stub_backend(monkeypatch,
+                           'Here is my response:\n```json\n{"response": "ok", '
+                           '"revise": null, "retract_findings": []}\n```')
+        from raven.reviewer import respond_to_comment
+        out = respond_to_comment(comment_body="?", conversation=[], diff="",
+                                 repo_name="u/r")
+        assert out["response"] == "ok"
+
+    def test_override_still_produces_json_output(self, monkeypatch):
+        """A per-repo override that says 'plain text' still gets the JSON
+        schema suffix appended unconditionally — Goal 3 backward-compat."""
+        captured = {}
+        from raven.ai.base import AIBackend
+
+        class _Stub(AIBackend):
+            name = "stub"
+
+            def complete(self, prompt, **kwargs):
+                captured["prompt"] = prompt
+                return '{"response": "ok", "revise": null, "retract_findings": []}'
+
+        monkeypatch.setattr("raven.reviewer.get_backend", lambda: _Stub())
+        from raven.reviewer import respond_to_comment
+        free_form_override = "Respond with plain text. Be terse. No JSON."
+        respond_to_comment(
+            comment_body="?", conversation=[], diff="", repo_name="u/r",
+            prompt_override=free_form_override,
+        )
+        assert "## Output format (required)" in captured["prompt"]
+        assert "JSON object" in captured["prompt"]
+        assert free_form_override in captured["prompt"]

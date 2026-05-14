@@ -50,7 +50,10 @@ Developers can @mention Raven in PR comments to ask questions or dispute finding
 - **Immediate acknowledgment** — on Gitea, Raven reacts 👀 to the triggering comment within a second so you know it was picked up, even though the Claude response takes 10–30s.
 - **Threaded replies** — on platforms that support comment threads (Bitbucket Data Center), Raven replies inside the thread rather than posting a top-level comment.
 - **No re-@mention inside Raven's threads** — any reply in a thread where Raven has already participated triggers a follow-up, so the conversation flows naturally.
+- **Active-thread context** — Raven sees the whole conversation it's replying inside (root + replies), not just the last 20 PR-wide comments. The thread root (usually Raven's own original finding) is always preserved through truncation. Cap via `RAVEN_RESPOND_THREAD_TOTAL_CHARS` (default 8000).
 - **Line-aware context** — inline diff comments get a line-numbered snippet of the file injected into the prompt, so Raven answers about the exact code without having to parse hunk headers.
+- **Verdict re-evaluation** — when the conversation provides substantive new information (e.g. "this isn't a bug because the path is unreachable", "this pattern is intentional convention"), Raven can submit a NEW formal review revising its prior verdict. Auto-merge gates fire on `needs_work → approve` flips and also on retraction-only paths when the prior verdict was already approve (Bitbucket DC "all comments resolved" unblock). Cap via `RAVEN_RESPOND_VERDICT_BODY_CHARS` (default 4000).
+- **Finding retraction** — when the discussion explicitly invalidates a specific inline finding, Raven retracts it using the provider's native resolve action: Bitbucket Data Center marks the comment `state=RESOLVED`; **Gitea ≥1.24** uses `POST /pulls/comments/{id}/resolve`. On older Gitea instances retraction logs a warning and no-ops; verdict revision and thread context still work normally.
 - **Faster effort** — comment replies default to `RAVEN_AI_EFFORT_COMMENT=medium`; PR reviews still use max.
 
 ## Quick start
@@ -319,6 +322,23 @@ entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start
 - `raven_ci_failures_total{repo}` — CI failures
 - `raven_responses_total{repo}` — comment responses
 - `raven_reviews_skipped_total{reason,repo}` — skipped reviews
+- `raven_verdict_revisions_total{repo,from,to}` — comment-driven verdict revisions
+- `raven_retractions_total{repo,result}` — comment-driven finding retractions
+- `raven_response_parse_errors_total{repo}` — AI JSON parse failures
+- `raven_revision_submit_errors_total{repo}` — verdict-revision `submit_review` failures
+
+**Authentication**: the `/metrics` endpoint requires a bearer token. Set `RAVEN_METRICS_TOKEN` to enable; leave unset and the endpoint returns 404 (it doesn't advertise itself). Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: raven
+    static_configs:
+      - targets: ['raven:8080']
+    authorization:
+      credentials_file: /etc/prom/raven_metrics_token
+```
+
+`/healthz` stays open for load balancers — no auth required.
 
 ## Development
 
@@ -327,7 +347,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-512 tests across 11 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics, SHA-aware PR dedup, incremental reviews, findings cache persistence, conversational follow-up (mention, thread, reply-in-Raven-thread, line-windowed truncation, code-snippet injection), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
+585 tests across 13 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
 
 ## CI
 

@@ -73,18 +73,6 @@ class GitProvider(ABC):
         return ""
 
     @abstractmethod
-    def get_comment_thread_authors(self, repo: str, pr_number: int,
-                                   comment_id: int) -> list[str]:
-        """Return the set of unique author logins/slugs in the comment's
-        thread — the comment at ``comment_id`` plus any replies below it.
-
-        Used to detect replies inside a Raven-involved thread so Raven can
-        answer without being re-@mentioned, even when Raven wasn't the thread
-        root. Providers without threaded comments return an empty list.
-        """
-        ...
-
-    @abstractmethod
     def post_pr_comment(self, repo: str, pr_number: int, body: str,
                         parent_comment_id: int | None = None) -> dict:
         """Post a comment. If parent_comment_id is set and the provider supports
@@ -154,6 +142,64 @@ class GitProvider(ABC):
 
     @abstractmethod
     def parse_webhook(self, request) -> tuple[str, dict] | None: ...
+
+    # ── Comment-thread-context feature (concrete defaults so out-of-tree ──
+    # ── providers degrade gracefully; in-tree providers override).        ──
+
+    def get_comment_thread(self, repo: str, pr_number: int,
+                           root_comment_id: int) -> list[dict]:
+        """Return the thread containing root_comment_id, chronologically
+        ordered. Provider-specific notion of 'thread':
+          - BB DC: the genuine reply-tree rooted at root_comment_id (DFS).
+          - Gitea: all review comments sharing the same (path, position).
+
+        Each entry::
+
+            {"id": int, "parent_id": int | None,
+             "user": {"login": str}, "body": str,
+             "file_path": str | None, "line": int | None,
+             "resolved": bool}
+
+        ``parent_id`` is None on Gitea (no reply tree); reflects nesting
+        on BB DC. ``resolved`` is True when the provider marks the comment
+        resolved.
+
+        Default returns []. Providers without threaded review comments
+        inherit this; the thread-context feature degrades to the existing
+        flat last-N conversation behaviour.
+        """
+        return []
+
+    def get_pr_state(self, repo: str, pr_number: int) -> str:
+        """Return one of 'open', 'merged', 'closed'. Default returns
+        'open' so providers that don't implement this still allow
+        comment-driven mutations (the existing safety gates in
+        ``_safe_do_merge`` still catch a real state mismatch via the
+        head-SHA recheck).
+        """
+        return "open"
+
+    def retract_finding(self, repo: str, pr_number: int,
+                        comment_id: int) -> bool:
+        """Retract a Raven-authored inline finding that the conversation
+        proved invalid. Returns True on success, False on no-op or
+        non-fatal failure. Must not raise on 403 / 404 — log and return
+        False.
+
+        Default returns False. Out-of-tree providers without a native
+        resolve action see retract calls become silent no-ops; AI-flagged
+        retractions log a warning and the comment stays open in the UI.
+        Verdict revision and thread context still work normally.
+        """
+        return False
+
+    def get_pr_metadata(self, repo: str, pr_number: int) -> dict:
+        """Return ``{'title': str, 'html_url': str}`` for log /
+        notification / merge-commit-title purposes. Default returns
+        ``{}`` — caller falls back to defaults. Auto-merge dispatch
+        still works; merge-commit titles and notifications are less rich.
+        """
+        return {}
 
 
 # Provider registry — populated at app startup

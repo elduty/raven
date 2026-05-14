@@ -356,7 +356,11 @@ class TestSeverityGte:
 # ------------------------------------------------------------------ #
 
 class TestRespondToCommentFileContext:
-    def _make_backend(self, monkeypatch, return_value="Response text"):
+    def _make_backend(self, monkeypatch, return_value=None):
+        """Default return is valid JSON matching the respond_to_comment
+        contract since the comment-thread-context feature."""
+        if return_value is None:
+            return_value = '{"response": "Response text", "revise": null, "retract_findings": []}'
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
         fake_backend.complete.return_value = return_value
@@ -532,7 +536,7 @@ class TestRespondToCommentPromptOverride:
         """
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.return_value = "A response body"
+        fake_backend.complete.return_value = '{"response": "A response body", "revise": null, "retract_findings": []}'
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
         respond_to_comment(
             comment_body="please elaborate",
@@ -600,14 +604,14 @@ class TestReviewerDelegatesToBackend:
 
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.return_value = "Thanks for the comment."
+        fake_backend.complete.return_value = '{"response": "Thanks for the comment.", "revise": null, "retract_findings": []}'
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
 
         result = rv.respond_to_comment(
             "LGTM?", [], "diff --git a/f b/f\n", "repo",
         )
 
-        assert result == "Thanks for the comment."
+        assert result == {"response": "Thanks for the comment.", "revise": None, "retract_findings": []}
         _, kwargs = fake_backend.complete.call_args
         assert kwargs["purpose"] == "respond"
         assert kwargs["effort"] == rv.CLAUDE_EFFORT_COMMENT

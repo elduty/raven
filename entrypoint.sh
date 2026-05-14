@@ -43,10 +43,24 @@ if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
             printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" > "$CRED_FILE"
             ;;
         *)
-            # Bare access token — wrap in expected format
-            cat > "$CRED_FILE" <<EOF
-{"claudeAiOauth":{"accessToken":"${CLAUDE_CODE_OAUTH_TOKEN}","refreshToken":"${CLAUDE_CODE_OAUTH_REFRESH_TOKEN:-}","scopes":["user:inference","user:profile"]}}
-EOF
+            # Bare access token — wrap in expected format. Build the JSON
+            # via python3 so tokens containing " or \ get properly escaped.
+            # Heredoc shell-interpolation produced invalid JSON for such
+            # tokens (a stray " closes the field early; the CLI then fails
+            # to load credentials and presents as an opaque "auth failed"
+            # at startup). Forward-compatible: alphanumeric tokens produce
+            # identical output to the heredoc; the difference only matters
+            # for tokens that previously broke.
+            CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN" \
+            CLAUDE_CODE_OAUTH_REFRESH_TOKEN="${CLAUDE_CODE_OAUTH_REFRESH_TOKEN:-}" \
+            python3 -c 'import json, os, sys
+sys.stdout.write(json.dumps({
+    "claudeAiOauth": {
+        "accessToken": os.environ["CLAUDE_CODE_OAUTH_TOKEN"],
+        "refreshToken": os.environ.get("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", ""),
+        "scopes": ["user:inference", "user:profile"],
+    },
+}))' > "$CRED_FILE"
             ;;
     esac
 

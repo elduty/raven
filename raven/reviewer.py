@@ -736,23 +736,221 @@ def severity_gte(a: str, b: str) -> bool:
     return SEVERITY_ORDER.get(a, 0) >= SEVERITY_ORDER.get(b, 0)
 
 
+def _parse_int_env(name: str, default: int) -> int:
+    """Read an int env var, falling back to ``default`` on missing or
+    non-numeric values. Logs a warning on bad values so operators see
+    the typo, but degrades safely rather than crashing the respond flow."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Bad value for %s=%r — falling back to default %d",
+                       name, raw, default)
+        return default
+
+
+def _respond_thread_total_chars() -> int:
+    """Env-driven cap (read on each call so tests can monkeypatch.setenv)."""
+    return _parse_int_env("RAVEN_RESPOND_THREAD_TOTAL_CHARS", 8000)
+
+
+def _respond_verdict_body_chars() -> int:
+    """Env-driven cap (read on each call so tests can monkeypatch.setenv)."""
+    return _parse_int_env("RAVEN_RESPOND_VERDICT_BODY_CHARS", 4000)
+
+
+def _truncate_thread(thread: list[dict], total_chars: int | None = None) -> list[dict]:
+    """Trim the thread to fit within total_chars.
+
+    Strategy: **always preserve the root** (thread[0]) — typically Raven's
+    own original inline finding being discussed, the single highest-value
+    piece of context. Then preserve the newest entries; drop from the
+    middle inward. Inserts a synthetic '[N earlier replies truncated]'
+    marker so the model sees that context was cut.
+
+    Naive oldest-first truncation would drop the root, which would leave
+    the AI replying inside a thread without knowing what was originally
+    flagged.
+
+    Note: ``total_chars`` is a **soft target**. The root is preserved
+    unconditionally even if its rendered size alone exceeds the cap —
+    truncating the root body would destroy the context this function
+    exists to protect. In practice Raven's findings are <2KB so the
+    cap is easily met; if a future pathological case ships a >50KB
+    root, the rendered prompt may exceed the budget by that delta.
+    """
+    cap = _respond_thread_total_chars() if total_chars is None else total_chars
+    if cap <= 0 or not thread:
+        return list(thread)
+
+    def _render_size(c: dict) -> int:
+        return len(c.get("user", {}).get("login", "")) + len(c.get("body", "")) + 8
+
+    if sum(_render_size(c) for c in thread) <= cap:
+        return list(thread)
+
+    root, *rest = thread
+    root_size = _render_size(root)
+    marker_size = 50  # rough fixed cost of the truncation marker
+    budget = max(0, cap - root_size - marker_size)
+
+    kept_tail: list[dict] = []
+    running = 0
+    for c in reversed(rest):
+        size = _render_size(c)
+        if running + size > budget:
+            break
+        kept_tail.append(c)
+        running += size
+    kept_tail.reverse()
+    dropped = len(rest) - len(kept_tail)
+
+    if dropped <= 0:
+        return [root] + kept_tail
+    marker = {
+        "id": None, "parent_id": None,
+        "user": {"login": "_marker_"},
+        "body": f"[{dropped} earlier replies truncated]",
+        "file_path": None, "line": None, "resolved": False,
+    }
+    return [root, marker] + kept_tail
+
+
+def _truncate_verdict_body(body: str, max_chars: int | None = None) -> str:
+    """Keep first + last paragraphs, drop middle. Bounded by env var."""
+    cap = _respond_verdict_body_chars() if max_chars is None else max_chars
+    if not body or cap <= 0 or len(body) <= cap:
+        return body
+    half = cap // 2
+    return body[:half] + "\n\n…[truncated]…\n\n" + body[-half:]
+
+
+class RespondParseError(ValueError):
+    """The AI's response did not match the respond.md JSON contract."""
+
+
+def _parse_respond_output(raw: str) -> dict:
+    """Parse the AI's JSON output. Returns a dict with keys:
+      - 'response' (str, required, non-empty)
+      - 'revise' (dict|None: {'verdict': 'approve'|'needs_work', 'body': str})
+      - 'retract_findings' (list[int]; missing or null -> []).
+
+    Mirrors the pattern in _parse_response (reviewer.py): try fenced
+    ```json ... ``` first, then JSONDecoder.raw_decode scanning from
+    each '{' position. Replicated (not reused) because _parse_response
+    finishes with _validate_review which is review-specific.
+
+    Raises RespondParseError on shape violations.
+    """
+    raw = raw.strip()
+    data = None
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    if fence_match:
+        try:
+            data = json.loads(fence_match.group(1))
+        except json.JSONDecodeError:
+            data = None
+    if data is None:
+        decoder = json.JSONDecoder()
+        for i, ch in enumerate(raw):
+            if ch == "{":
+                try:
+                    data, _ = decoder.raw_decode(raw, i)
+                    break
+                except json.JSONDecodeError:
+                    continue
+    if data is None:
+        raise RespondParseError("Could not parse JSON from AI output")
+    if not isinstance(data, dict):
+        raise RespondParseError("Top-level is not a JSON object")
+    response = data.get("response")
+    if not isinstance(response, str) or not response.strip():
+        raise RespondParseError("Missing or empty 'response' field")
+    revise = data.get("revise")
+    if revise is not None:
+        if not isinstance(revise, dict):
+            raise RespondParseError("'revise' must be null or an object")
+        verdict = revise.get("verdict")
+        if verdict not in ("approve", "needs_work"):
+            raise RespondParseError(f"Invalid revise.verdict: {verdict!r}")
+        if not isinstance(revise.get("body"), str):
+            raise RespondParseError("revise.body must be a string")
+    retract = data.get("retract_findings", [])
+    # Be lenient: AIs occasionally emit null instead of [].
+    if retract is None:
+        retract = []
+    if not isinstance(retract, list) or not all(isinstance(x, int) for x in retract):
+        raise RespondParseError("'retract_findings' must be a list of ints (or null)")
+    return {
+        "response": response,
+        "revise": revise,
+        "retract_findings": retract,
+    }
+
+
+# Module-level constant: a non-overridable JSON-schema suffix appended
+# AFTER the (built-in or per-repo) respond.md template. Pre-existing
+# free-form-text overrides would otherwise produce un-parseable output
+# and break every comment reply silently.
+_RESPOND_JSON_SUFFIX = """
+
+## Output format (required)
+
+Respond with a JSON object exactly matching this schema:
+
+```
+{
+  "response": "<markdown for the in-thread reply — required, non-empty>",
+  "revise": null,
+  "retract_findings": []
+}
+```
+
+Or with a revision + retractions:
+
+```
+{
+  "response": "...",
+  "revise": {"verdict": "approve" | "needs_work", "body": "..."},
+  "retract_findings": [<comment_id>, ...]
+}
+```
+
+- `response` is required and non-empty.
+- `revise` is optional (null when not revising the verdict).
+- `retract_findings` is a list of integer comment IDs from the active thread shown above; empty list when nothing to retract.
+- `verdict` is exactly `"approve"` or `"needs_work"`. No other values.
+
+Do not include preamble outside the JSON object.
+"""
+
+
 def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
                         repo_name: str, claude_md: str = "",
                         file_path: str = "", line: int = 0,
                         code_snippet: str = "",
-                        prompt_override: str | None = None) -> str:
+                        prompt_override: str | None = None,
+                        thread: list[dict] | None = None,
+                        prior_verdict: str | None = None,
+                        prior_body: str | None = None) -> dict:
     """Generate a conversational response to a developer's comment.
 
-    Returns plain text (markdown). Raises RuntimeError on CLI failure.
+    Returns a dict ``{response: str, revise: dict|None, retract_findings: list[int]}``.
+    Raises ``RespondParseError`` on AI output shape violations.
 
-    ``code_snippet`` is an optional numbered window of the file around the
-    commented line; when present, it's included in the prompt so Claude
-    doesn't have to hunt through the diff to locate the referenced code.
+    ``thread``, ``prior_verdict``, ``prior_body`` carry the active-thread +
+    prior-review-state context for the comment-thread-context feature.
+    When non-empty, the prompt includes ``## Active Thread`` and
+    ``## Your Prior Verdict on This PR`` blocks; when empty, those sections
+    are omitted.
     """
     # User-controlled content (claude_md, diff, conversation, triggering
-    # comment, code snippet) is wrapped in randomised
-    # <untrusted_input_<tag_id>> tags framed by a preamble using the same
-    # id. Fresh id per invocation prevents tag-breakout attacks.
+    # comment, code snippet, thread bodies, prior verdict body) is wrapped
+    # in randomised <untrusted_input_<tag_id>> tags framed by a preamble
+    # using the same id. Fresh id per invocation prevents tag-breakout
+    # attacks.
     tag_id = _make_tag_id()
     preamble = _build_trust_preamble(tag_id)
 
@@ -776,6 +974,31 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
             + _wrap_untrusted("repo_file", code_snippet, tag_id)
         )
 
+    # Prior verdict block (only when we have a verdict to revise from)
+    verdict_section = ""
+    if prior_verdict:
+        body = _truncate_verdict_body(prior_body or "")
+        verdict_section = (
+            "\n\n## Your Prior Verdict on This PR\n"
+            f"{prior_verdict}\n\n"
+            + _wrap_untrusted("prior_verdict", body, tag_id)
+        )
+
+    # Active thread block (only when fetched non-empty)
+    thread_section = ""
+    thread_for_prompt = _truncate_thread(thread or [])
+    if thread_for_prompt:
+        thread_lines = []
+        for c in thread_for_prompt:
+            user = c.get('user', {}).get('login', 'unknown')
+            resolved = " [resolved]" if c.get("resolved") else ""
+            thread_lines.append(f"**{user}{resolved}:** {c.get('body', '')}")
+        thread_text = "\n\n".join(thread_lines)
+        thread_section = (
+            "\n\n## Active Thread (you are replying inside this)\n"
+            + _wrap_untrusted("thread", thread_text, tag_id)
+        )
+
     conv_lines = []
     for c in conversation:
         user = c.get("user", {}).get("login", "unknown")
@@ -786,10 +1009,12 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
     effective_template = prompt_override if (prompt_override and prompt_override.strip()) else _RESPOND_PROMPT_TEMPLATE
     prompt = (
         f"{preamble}\n\n"
-        f"## Repository: {repo_name}{repo_context}{location}{snippet_section}\n\n"
-        f"{effective_template}\n\n"
+        f"## Repository: {repo_name}{repo_context}{location}{snippet_section}"
+        f"{verdict_section}{thread_section}\n\n"
+        f"{effective_template}\n"
+        f"{_RESPOND_JSON_SUFFIX}\n\n"
         f"## PR Diff\n\n" + _wrap_untrusted("pr_diff", diff, tag_id) + "\n\n"
-        f"## Conversation (other users' comments)\n\n"
+        f"## Other PR Conversation\n\n"
         + _wrap_untrusted("conversation", conv_text, tag_id) + "\n\n"
         f"## Comment to respond to\n\n"
         + _wrap_untrusted("comment", comment_body, tag_id) + "\n\n"
@@ -802,10 +1027,11 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
         f" {file_path}:{line}" if file_path and line else (f" {file_path}" if file_path else ""),
         CLAUDE_MODEL, CLAUDE_EFFORT_COMMENT,
     )
-    return get_backend().complete(
+    raw = get_backend().complete(
         prompt,
         model=CLAUDE_MODEL,
         effort=CLAUDE_EFFORT_COMMENT,
         timeout=CLAUDE_TIMEOUT,
         purpose="respond",
     ).strip()
+    return _parse_respond_output(raw)

@@ -649,3 +649,251 @@ class TestParseWebhook:
         payload = {"ref": "refs/tags/v1.0", "repository": {"full_name": "owner/repo"}}
         result = client.parse_webhook(self._make_request("push", payload))
         assert result is None
+
+
+# ------------------------------------------------------------------ #
+#  Comment-thread-context feature: get_pr_state                       #
+# ------------------------------------------------------------------ #
+
+class TestGetPrState:
+    def test_open(self, client):
+        with _mock_get(client, status=200, json_data={"state": "open", "merged": False}):
+            assert client.get_pr_state("u/r", 1) == "open"
+
+    def test_merged(self, client):
+        with _mock_get(client, status=200, json_data={"state": "closed", "merged": True}):
+            assert client.get_pr_state("u/r", 1) == "merged"
+
+    def test_closed_without_merge(self, client):
+        with _mock_get(client, status=200, json_data={"state": "closed", "merged": False}):
+            assert client.get_pr_state("u/r", 1) == "closed"
+
+
+# ------------------------------------------------------------------ #
+#  Comment-thread-context feature: get_pr_metadata                    #
+# ------------------------------------------------------------------ #
+
+class TestGetPrMetadata:
+    def test_returns_title_and_url(self, client):
+        with _mock_get(client, status=200, json_data={
+            "title": "Add X",
+            "html_url": "https://x/u/r/pulls/1",
+        }):
+            meta = client.get_pr_metadata("u/r", 1)
+        assert meta == {"title": "Add X", "html_url": "https://x/u/r/pulls/1"}
+
+    def test_returns_empty_dict_on_http_error(self, client):
+        import requests
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = requests.HTTPError("boom")
+        with patch.object(client.session, "get", return_value=mock_resp):
+            assert client.get_pr_metadata("u/r", 1) == {}
+
+
+# ------------------------------------------------------------------ #
+#  Comment-thread-context feature: get_comment_thread                 #
+# ------------------------------------------------------------------ #
+
+class TestGetCommentThread:
+    def test_groups_by_path_and_position(self, client):
+        """All review comments at same (path, position) form a thread,
+        ordered chronologically. Different positions excluded."""
+        reviews = [{"id": 10, "comments_count": 4}]
+        review_comments = [
+            {"id": 100, "user": {"login": "raven"}, "body": "Finding!",
+             "path": "a.py", "position": 5, "resolver": None,
+             "created_at": "2026-05-13T10:00:00Z"},
+            {"id": 101, "user": {"login": "alice"}, "body": "Why?",
+             "path": "a.py", "position": 5, "resolver": None,
+             "created_at": "2026-05-13T10:05:00Z"},
+            {"id": 102, "user": {"login": "raven"}, "body": "Because X",
+             "path": "a.py", "position": 5, "resolver": {"login": "alice"},
+             "created_at": "2026-05-13T10:10:00Z"},
+            # Different position
+            {"id": 200, "user": {"login": "carol"}, "body": "other thread",
+             "path": "a.py", "position": 99, "resolver": None,
+             "created_at": "2026-05-13T10:00:00Z"},
+            # Different file
+            {"id": 300, "user": {"login": "dave"}, "body": "unrelated",
+             "path": "b.py", "position": 5, "resolver": None,
+             "created_at": "2026-05-13T10:00:00Z"},
+        ]
+
+        def fake_get(url, **kwargs):
+            mr = MagicMock()
+            mr.raise_for_status = MagicMock()
+            if url.endswith("/reviews"):
+                mr.status_code = 200
+                mr.json.return_value = reviews
+            elif "/reviews/10/comments" in url:
+                mr.status_code = 200
+                mr.json.return_value = review_comments
+            else:
+                mr.status_code = 404
+            return mr
+
+        with patch.object(client.session, "get", side_effect=fake_get):
+            thread = client.get_comment_thread("u/r", 1, 100)
+        ids = [c["id"] for c in thread]
+        assert ids == [100, 101, 102]
+        assert all(c["parent_id"] is None for c in thread)
+        assert thread[0]["file_path"] == "a.py"
+        assert thread[0]["line"] == 5
+        assert thread[2]["resolved"] is True
+        assert thread[0]["resolved"] is False
+
+    def test_thread_lookup_works_from_any_member(self, client):
+        reviews = [{"id": 10, "comments_count": 2}]
+        review_comments = [
+            {"id": 100, "user": {"login": "x"}, "body": "a",
+             "path": "a.py", "position": 5, "resolver": None,
+             "created_at": "2026-05-13T10:00:00Z"},
+            {"id": 101, "user": {"login": "y"}, "body": "b",
+             "path": "a.py", "position": 5, "resolver": None,
+             "created_at": "2026-05-13T10:05:00Z"},
+        ]
+
+        def fake_get(url, **kwargs):
+            mr = MagicMock()
+            mr.raise_for_status = MagicMock()
+            if url.endswith("/reviews"):
+                mr.status_code = 200
+                mr.json.return_value = reviews
+            elif "/reviews/10/comments" in url:
+                mr.status_code = 200
+                mr.json.return_value = review_comments
+            else:
+                mr.status_code = 404
+            return mr
+
+        with patch.object(client.session, "get", side_effect=fake_get):
+            t1 = client.get_comment_thread("u/r", 1, 100)
+            t2 = client.get_comment_thread("u/r", 1, 101)
+        assert [c["id"] for c in t1] == [100, 101]
+        assert [c["id"] for c in t2] == [100, 101]
+
+    def test_returns_empty_when_root_not_found(self, client):
+        reviews = [{"id": 10, "comments_count": 1}]
+        review_comments = [{"id": 100, "user": {"login": "x"}, "body": "t",
+                            "path": "a.py", "position": 1, "resolver": None,
+                            "created_at": "2026-05-13T10:00:00Z"}]
+
+        def fake_get(url, **kwargs):
+            mr = MagicMock()
+            mr.raise_for_status = MagicMock()
+            if url.endswith("/reviews"):
+                mr.status_code = 200
+                mr.json.return_value = reviews
+            elif "/reviews/10/comments" in url:
+                mr.status_code = 200
+                mr.json.return_value = review_comments
+            else:
+                mr.status_code = 404
+            return mr
+
+        with patch.object(client.session, "get", side_effect=fake_get):
+            thread = client.get_comment_thread("u/r", 1, 999)
+        assert thread == []
+
+
+# ------------------------------------------------------------------ #
+#  Comment-thread-context feature: retract_finding                    #
+# ------------------------------------------------------------------ #
+
+class TestRetractFinding:
+    def test_posts_to_native_resolve_endpoint(self, client):
+        post_resp = MagicMock(status_code=204)
+        post_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "post", return_value=post_resp) as mock_post:
+            assert client.retract_finding("u/r", 1, 42) is True
+        url = mock_post.call_args.args[0]
+        assert url.endswith("/repos/u/r/pulls/comments/42/resolve")
+
+    def test_404_returns_false(self, client):
+        post_resp = MagicMock(status_code=404)
+        with patch.object(client.session, "post", return_value=post_resp):
+            assert client.retract_finding("u/r", 1, 42) is False
+
+    def test_403_returns_false(self, client):
+        post_resp = MagicMock(status_code=403)
+        with patch.object(client.session, "post", return_value=post_resp):
+            assert client.retract_finding("u/r", 1, 42) is False
+
+
+# ------------------------------------------------------------------ #
+#  Comment-thread-context: submit_review returns per-inline IDs       #
+# ------------------------------------------------------------------ #
+
+class TestSubmitReviewInlineIds:
+    def test_returns_per_inline_comment_ids(self, client):
+        """After POST /reviews, a follow-up GET /reviews/{id}/comments
+        returns each inline comment's id. submit_review matches them by
+        (path, position, body) and returns inline_comments aligned with
+        input."""
+        inline = [
+            {"file": "a.py", "line": 5, "body": "finding 1"},
+            {"file": "b.py", "line": 20, "body": "finding 2"},
+        ]
+        post_resp = MagicMock(status_code=200)
+        post_resp.raise_for_status = MagicMock()
+        post_resp.json.return_value = {"id": 700}  # review id
+        get_resp = MagicMock(status_code=200)
+        get_resp.raise_for_status = MagicMock()
+        get_resp.json.return_value = [
+            {"id": 800, "path": "a.py", "position": 5, "body": "finding 1"},
+            {"id": 801, "path": "b.py", "position": 20, "body": "finding 2"},
+        ]
+        with patch.object(client.session, "post", return_value=post_resp), \
+             patch.object(client.session, "get", return_value=get_resp):
+            result = client.submit_review(
+                "u/r", 1, "review body", approve=True,
+                inline_comments=inline,
+            )
+        ic = result["inline_comments"]
+        assert len(ic) == 2
+        assert ic[0] == {"file": "a.py", "line": 5, "comment_id": 800}
+        assert ic[1] == {"file": "b.py", "line": 20, "comment_id": 801}
+
+    def test_filtered_input_gets_none_id(self, client):
+        """Inputs missing file/line are filtered before posting. The
+        returned list stays aligned with input — filtered entries get
+        comment_id=None."""
+        inline = [
+            {"file": "a.py", "line": 5, "body": "ok"},
+            {"file": "", "line": 0, "body": "no file"},
+        ]
+        post_resp = MagicMock(status_code=200)
+        post_resp.raise_for_status = MagicMock()
+        post_resp.json.return_value = {"id": 700}
+        get_resp = MagicMock(status_code=200)
+        get_resp.raise_for_status = MagicMock()
+        get_resp.json.return_value = [
+            {"id": 800, "path": "a.py", "position": 5, "body": "ok"},
+        ]
+        with patch.object(client.session, "post", return_value=post_resp), \
+             patch.object(client.session, "get", return_value=get_resp):
+            result = client.submit_review(
+                "u/r", 1, "body", approve=True, inline_comments=inline,
+            )
+        ic = result["inline_comments"]
+        assert len(ic) == 2
+        assert ic[0]["comment_id"] == 800
+        assert ic[1]["comment_id"] is None
+
+    def test_follow_up_get_failure_returns_none_ids(self, client):
+        """If the GET fails after a successful review post, comment_ids
+        fall back to None — the review still landed; we just couldn't
+        capture the IDs for retraction matching."""
+        import requests
+        inline = [{"file": "a.py", "line": 5, "body": "f"}]
+        post_resp = MagicMock(status_code=200)
+        post_resp.raise_for_status = MagicMock()
+        post_resp.json.return_value = {"id": 700}
+        get_resp = MagicMock()
+        get_resp.raise_for_status.side_effect = requests.HTTPError("boom")
+        with patch.object(client.session, "post", return_value=post_resp), \
+             patch.object(client.session, "get", return_value=get_resp):
+            result = client.submit_review(
+                "u/r", 1, "body", approve=True, inline_comments=inline,
+            )
+        assert result["inline_comments"][0]["comment_id"] is None

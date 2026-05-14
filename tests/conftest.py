@@ -12,6 +12,17 @@ and properly restored at teardown.
 
 import os
 
+
+def pytest_configure(config):
+    """Register custom markers so pytest doesn't emit unknown-marker
+    warnings. ``slow`` is used for tests that hit real external APIs
+    (Claude / Anthropic) and only run with explicit opt-in
+    (RAVEN_LIVE_AI_TESTS=1)."""
+    config.addinivalue_line(
+        "markers",
+        "slow: real-AI integration tests; opt-in via RAVEN_LIVE_AI_TESTS=1",
+    )
+
 # Provider config — required by raven.providers and raven.server imports
 os.environ.setdefault("GITEA_URL", "https://gitea.example.com")
 os.environ.setdefault("GITEA_TOKEN", "test-token")

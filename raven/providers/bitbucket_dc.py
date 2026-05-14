@@ -275,17 +275,11 @@ class BitbucketDCProvider(GitProvider):
     #  Comments                                                           #
     # ------------------------------------------------------------------ #
 
-    def get_comment_thread_authors(self, repo_full_name: str, pr_number: int,
-                                   comment_id: int) -> list[str]:
-        """Fetch the thread rooted at ``comment_id`` and return unique author
-        slugs (root plus any nested ``comments[]`` replies).
+    # ── New methods for the comment-thread-context feature ───────────── #
 
-        BB DC returns the root's replies inline in a single GET — the
-        conceptual thread is flat but the response nests child comments one
-        level. Walk recursively just in case a server returns deeper nesting.
-        Returns [] on 404 so the caller can treat missing comments as an
-        unknown thread.
-        """
+    def _fetch_bbdc_comment(self, repo_full_name: str, pr_number: int,
+                            comment_id: int) -> dict | None:
+        """Fetch a single BB DC comment. Returns None on 404."""
         project, repo = _split_repo(repo_full_name)
         url = (
             f"{self.api_url}/projects/{project}/repos/{repo}"
@@ -293,20 +287,111 @@ class BitbucketDCProvider(GitProvider):
         )
         resp = self.session.get(url, timeout=10)
         if resp.status_code == 404:
-            return []
+            return None
         resp.raise_for_status()
-        seen: list[str] = []
+        return resp.json()
 
-        def _walk(node: dict) -> None:
-            slug = (node.get("author") or {}).get("slug", "")
-            if slug and slug not in seen:
-                seen.append(slug)
+    def get_comment_thread(self, repo_full_name: str, pr_number: int,
+                           root_comment_id: int) -> list[dict]:
+        """Return the full thread rooted at the CONVERSATION ROOT, parent-
+        first DFS. The webhook gives us the immediate parent of the trigger
+        which on threads deeper than 2 levels is NOT the conversation root,
+        so we walk UP via comment.parent.id first."""
+        seed = self._fetch_bbdc_comment(repo_full_name, pr_number, root_comment_id)
+        if seed is None:
+            return []
+        # Walk UP (bounded depth, cycle-safe).
+        visited: set[int] = {seed.get("id")} if seed.get("id") is not None else set()
+        current = seed
+        for _ in range(20):
+            parent_ref = (current.get("parent") or {}).get("id")
+            if not parent_ref or parent_ref in visited:
+                break
+            parent = self._fetch_bbdc_comment(repo_full_name, pr_number, parent_ref)
+            if parent is None:
+                break
+            visited.add(parent_ref)
+            current = parent
+        root_node = current
+
+        out: list[dict] = []
+
+        def _walk(node: dict, parent_id: int | None) -> None:
+            anchor = node.get("anchor") or {}
+            out.append({
+                "id": node.get("id"),
+                "parent_id": parent_id,
+                "user": {"login": (node.get("author") or {}).get("slug", "")},
+                "body": node.get("text", ""),
+                "file_path": anchor.get("path"),
+                "line": anchor.get("line"),
+                "resolved": node.get("state") == "RESOLVED",
+            })
             for child in node.get("comments") or []:
                 if isinstance(child, dict):
-                    _walk(child)
+                    _walk(child, node.get("id"))
 
-        _walk(resp.json())
-        return seen
+        _walk(root_node, None)
+        return out
+
+    def get_pr_state(self, repo_full_name: str, pr_number: int) -> str:
+        """Map BB DC PR state to canonical 'open' / 'merged' / 'closed'.
+        BB DC values: OPEN, MERGED, DECLINED. DECLINED maps to 'closed'."""
+        project, repo = _split_repo(repo_full_name)
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}"
+        resp = self.session.get(url, timeout=10)
+        resp.raise_for_status()
+        state = resp.json().get("state", "OPEN").upper()
+        return {"OPEN": "open", "MERGED": "merged", "DECLINED": "closed"}.get(state, "open")
+
+    def get_pr_metadata(self, repo_full_name: str, pr_number: int) -> dict:
+        """Return {'title', 'html_url'} for log/notification/merge-commit-title.
+        Returns {} on fetch failure; caller falls back to defaults."""
+        project, repo = _split_repo(repo_full_name)
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}"
+        try:
+            resp = self.session.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.HTTPError as e:
+            logger.warning("BB DC get_pr_metadata for PR #%d failed: %s", pr_number, e)
+            return {}
+        self_link = ""
+        for link in (data.get("links") or {}).get("self", []):
+            if link.get("href"):
+                self_link = link["href"]
+                break
+        return {"title": data.get("title", ""), "html_url": self_link}
+
+    def retract_finding(self, repo_full_name: str, pr_number: int,
+                        comment_id: int) -> bool:
+        """Resolve a previously-posted inline review comment.
+        Uses BB DC's PUT /comments/{id} with state=RESOLVED + version.
+        Returns False on 403/404/409 without raising."""
+        project, repo = _split_repo(repo_full_name)
+        base = (
+            f"{self.api_url}/projects/{project}/repos/{repo}"
+            f"/pull-requests/{pr_number}/comments/{comment_id}"
+        )
+        try:
+            get_resp = self.session.get(base, timeout=10)
+            if get_resp.status_code == 404:
+                logger.debug("Cannot retract BB DC comment %s — 404", comment_id)
+                return False
+            get_resp.raise_for_status()
+            version = get_resp.json().get("version", 0)
+            put_resp = self.session.put(
+                base, json={"state": "RESOLVED", "version": version}, timeout=10,
+            )
+            if put_resp.status_code in (403, 404, 409):
+                logger.warning("BB DC retract comment %s failed: HTTP %s",
+                               comment_id, put_resp.status_code)
+                return False
+            put_resp.raise_for_status()
+            return True
+        except requests.HTTPError as e:
+            logger.warning("BB DC retract comment %s failed: %s", comment_id, e)
+            return False
 
     def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
         """Return all comments on a PR via the activities endpoint."""
@@ -363,18 +448,27 @@ class BitbucketDCProvider(GitProvider):
         approve=True  -> post comment + POST /approve
         approve=False -> post comment + PUT /participants/{user} with NEEDS_WORK
         commit_id is accepted for ABC compatibility but not used by BB DC.
+
+        Returns the BB DC main-comment dict, extended with an
+        `inline_comments` key carrying per-input-entry `{file, line,
+        comment_id}` — same length as input, with comment_id=None for
+        any post that failed or was filtered out. Used by the
+        comment-thread-context retraction cache cleanup.
         """
         project, repo = _split_repo(repo_full_name)
 
-        # Post inline comments first
-        if inline_comments:
+        # Post inline comments first; capture per-anchor returned IDs.
+        posted_inline = (
             self._post_inline_comments(project, repo, pr_number, inline_comments)
+            if inline_comments else []
+        )
 
         # Post the main review comment
         comment_url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/comments"
         resp = self.session.post(comment_url, json={"text": body}, timeout=15)
         resp.raise_for_status()
         result = resp.json()
+        result["inline_comments"] = posted_inline
 
         # Approve or set needs-work
         if approve:
@@ -397,19 +491,28 @@ class BitbucketDCProvider(GitProvider):
         return result
 
     def _post_inline_comments(self, project: str, repo: str, pr_number: int,
-                              comments: list[dict]) -> None:
+                              comments: list[dict]) -> list[dict]:
         """Post inline (anchor) comments on a PR diff.
 
         Anchors use lineType=ADDED and fileType=TO because Raven's findings
         target new/changed code (the + side of the diff). BB DC also supports
         REMOVED/FROM for deleted lines and CONTEXT for unchanged context lines,
         but those don't apply to review findings.
+
+        Returns a list aligned by index with the input ``comments`` list.
+        Each entry is ``{file, line, comment_id}``; ``comment_id`` is None
+        when the anchor was filtered (missing/invalid file/line) or the
+        post failed. Same-length-as-input is the invariant the
+        ``_process_pr`` cache-write step relies on to zip submitted
+        findings with returned IDs.
         """
         url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/comments"
+        posted: list[dict] = []
         for c in comments:
             file_path = c.get("file", "")
             line = c.get("line", 0)
             body = c.get("body", "")
+            entry = {"file": file_path, "line": line, "comment_id": None}
             if file_path and isinstance(line, int) and line > 0:
                 payload = {
                     "text": body,
@@ -423,8 +526,11 @@ class BitbucketDCProvider(GitProvider):
                 try:
                     resp = self.session.post(url, json=payload, timeout=10)
                     resp.raise_for_status()
+                    entry["comment_id"] = resp.json().get("id")
                 except Exception as e:
                     logger.warning("Failed to post inline comment on %s:%d: %s", file_path, line, e)
+            posted.append(entry)
+        return posted
 
     def dismiss_previous_reviews(self, repo_full_name: str, pr_number: int, bot_user: str,
                                   exclude_id: int | None = None) -> None:
@@ -432,7 +538,23 @@ class BitbucketDCProvider(GitProvider):
         logger.debug("dismiss_previous_reviews is a no-op on Bitbucket DC (status already overwritten)")
 
     def get_pr_reviews(self, repo_full_name: str, pr_number: int) -> list[dict]:
-        """Return participants with their review status, normalized for server.py."""
+        """Return participants who have submitted a real review, normalized
+        for server.py.
+
+        Bitbucket DC's ``/participants`` endpoint returns *every* user who
+        has touched the PR — the author, watchers, anyone who commented or
+        reacted — each with a ``status`` field. Most of those have
+        ``status=UNAPPROVED`` (the default — they haven't reviewed). On
+        Gitea the equivalent ``/reviews`` endpoint only returns people who
+        formally submitted an approval or change-request, which is the
+        semantic the auto-merge gate is designed around.
+
+        To preserve that semantic across providers, only return
+        participants whose status is ``APPROVED`` or ``NEEDS_WORK``. This
+        drops the author (who is always a participant), drops watchers,
+        and drops random commenters — none of whom should count as
+        reviewers gating the auto-merge.
+        """
         project, repo = _split_repo(repo_full_name)
         url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/participants"
         all_participants: list[dict] = []
@@ -448,15 +570,16 @@ class BitbucketDCProvider(GitProvider):
             start = data.get("nextPageStart", start + 50)
         normalized: list[dict] = []
         for p in all_participants:
-            user = p.get("user", {})
             status = p.get("status", "UNAPPROVED")
-            # Map BB DC status to Gitea-compatible state
             if status == "APPROVED":
                 state = "APPROVED"
             elif status == "NEEDS_WORK":
                 state = "REQUEST_CHANGES"
             else:
-                state = "COMMENT"
+                # UNAPPROVED / unknown — author or non-reviewing participant.
+                # Skip; they don't represent a formal review submission.
+                continue
+            user = p.get("user", {})
             normalized.append({
                 "user": {"login": user.get("slug", "")},
                 "state": state,

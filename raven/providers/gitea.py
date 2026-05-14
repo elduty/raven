@@ -121,14 +121,157 @@ class GiteaProvider(GitProvider):
     #  Comment posting                                                     #
     # ------------------------------------------------------------------ #
 
-    def get_comment_thread_authors(self, repo_full_name: str, pr_number: int,
-                                   comment_id: int) -> list[str]:
-        """Gitea issue comments are flat — always returns [].
+    # ── New methods for the comment-thread-context feature ───────────── #
 
-        Without threads there is no meaningful "reply in Raven's thread" flow
-        to enable, so the auto-respond-without-mention feature is skipped.
+    def _fetch_review_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
+        """Return all PR review comments (paginated). Internal helper.
+
+        Both the reviews list and each review's comments list are paginated
+        — long-running PRs are where thread context matters most, so we
+        iterate all pages (capped at max_pages=10) rather than silently
+        dropping older reviews.
         """
-        return []
+        owner, repo = _split_repo(repo_full_name)
+        reviews_url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+        max_pages = 10
+        reviews: list[dict] = []
+        for page in range(1, max_pages + 1):
+            try:
+                resp = self.session.get(reviews_url, params={"limit": 50, "page": page}, timeout=10)
+                resp.raise_for_status()
+            except requests.HTTPError:
+                return reviews
+            batch = resp.json()
+            if not batch:
+                break
+            reviews.extend(batch)
+            if len(batch) < 50:
+                break
+        all_comments: list[dict] = []
+        for review in reviews:
+            if not review.get("comments_count"):
+                continue
+            rid = review["id"]
+            comments_url = (
+                f"{self.base_url}/api/v1/repos/{owner}/{repo}"
+                f"/pulls/{pr_number}/reviews/{rid}/comments"
+            )
+            for page in range(1, max_pages + 1):
+                try:
+                    r = self.session.get(comments_url, params={"limit": 50, "page": page}, timeout=10)
+                    r.raise_for_status()
+                except requests.HTTPError:
+                    break
+                batch = r.json()
+                if not batch:
+                    break
+                all_comments.extend(batch)
+                if len(batch) < 50:
+                    break
+        return all_comments
+
+    def get_comment_thread(self, repo_full_name: str, pr_number: int,
+                           root_comment_id: int) -> list[dict]:
+        """Return the conversation thread containing root_comment_id,
+        chronologically ordered.
+
+        Gitea has no in_reply_to_id on review comments. What the UI calls
+        a "conversation" is the group of comments sharing the same
+        (path, position) across the PR's reviews. So we fetch all review
+        comments, find the root, and return every comment with the same
+        anchor in created_at order.
+
+        Outdated comments (force-push/rebase moved or deleted the line)
+        have position=null. Falls back to original_position to keep the
+        anchor stable; if the root has no usable position at all (both
+        null), return only the root so we don't over-group every
+        outdated comment at the same path into one synthetic thread.
+        """
+        all_comments = self._fetch_review_comments(repo_full_name, pr_number)
+        by_id = {c["id"]: c for c in all_comments}
+        root = by_id.get(root_comment_id)
+        if not root:
+            return []
+
+        def _anchor(c: dict) -> tuple:
+            # Prefer current position; fall back to original_position for
+            # outdated comments (force-push moved/deleted the line).
+            pos = c.get("position") or c.get("original_position")
+            return (c.get("path"), pos)
+
+        def _render(c: dict) -> dict:
+            pos = c.get("position") or c.get("original_position")
+            return {
+                "id": c["id"],
+                "parent_id": None,  # Gitea has no reply tree
+                "user": {"login": (c.get("user") or {}).get("login", "")},
+                "body": c.get("body", ""),
+                "file_path": c.get("path"),
+                "line": pos,
+                "resolved": c.get("resolver") is not None,
+            }
+
+        root_anchor = _anchor(root)
+        if root_anchor[1] is None:
+            # No usable position on either field — don't over-group every
+            # null-anchored comment on the same file into one synthetic
+            # thread. Return just the root.
+            return [_render(root)]
+
+        thread_comments = [
+            c for c in all_comments if _anchor(c) == root_anchor
+        ]
+        thread_comments.sort(key=lambda c: c.get("created_at", ""))
+        return [_render(c) for c in thread_comments]
+
+    def get_pr_state(self, repo_full_name: str, pr_number: int) -> str:
+        """Map Gitea PR state to canonical 'open' / 'merged' / 'closed'."""
+        owner, repo = _split_repo(repo_full_name)
+        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}"
+        resp = self.session.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("merged"):
+            return "merged"
+        return "open" if data.get("state") == "open" else "closed"
+
+    def get_pr_metadata(self, repo_full_name: str, pr_number: int) -> dict:
+        """Return {'title', 'html_url'}. Best-effort; returns {} on
+        fetch failure so callers can degrade to defaults."""
+        owner, repo = _split_repo(repo_full_name)
+        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}"
+        try:
+            resp = self.session.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.HTTPError as e:
+            logger.warning("Gitea get_pr_metadata for PR #%d failed: %s", pr_number, e)
+            return {}
+        return {"title": data.get("title", ""), "html_url": data.get("html_url", "")}
+
+    def retract_finding(self, repo_full_name: str, pr_number: int,
+                        comment_id: int) -> bool:
+        """Resolve a previously-posted inline review comment.
+
+        Uses Gitea's native ``POST /pulls/comments/{id}/resolve`` endpoint
+        (added in Gitea 1.24). The comment body is preserved; only the
+        resolved state changes. On older Gitea the endpoint returns 404
+        and we log + return False; the dev can manually resolve via UI.
+        403/404 do not raise.
+        """
+        owner, repo = _split_repo(repo_full_name)
+        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/comments/{comment_id}/resolve"
+        try:
+            resp = self.session.post(url, timeout=10)
+            if resp.status_code in (403, 404):
+                logger.warning("Gitea retract comment %s failed: HTTP %s",
+                               comment_id, resp.status_code)
+                return False
+            resp.raise_for_status()
+            return True
+        except requests.HTTPError as e:
+            logger.warning("Gitea retract comment %s failed: %s", comment_id, e)
+            return False
 
     def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
         """Return all comments on a PR (paginated)."""
@@ -187,6 +330,13 @@ class GiteaProvider(GitProvider):
         approve: True -> APPROVED, False -> REQUEST_CHANGES.
         inline_comments: normalized [{"file": "...", "line": N, "body": "..."}] dicts.
         commit_id: pin review to a specific commit SHA (prevents stale reviews on force-push).
+
+        Returns the Gitea review dict, extended with an ``inline_comments``
+        key carrying per-input-entry ``{file, line, comment_id}`` — same
+        length as input, with comment_id=None for any entry that was
+        filtered (missing/invalid file/line) or whose returned ID we
+        couldn't match. Used by the comment-thread-context retraction
+        cache cleanup.
         """
         owner, repo = _split_repo(repo_full_name)
         url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
@@ -194,11 +344,99 @@ class GiteaProvider(GitProvider):
         payload: dict = {"body": body, "event": event}
         if commit_id:
             payload["commit_id"] = commit_id
-        if inline_comments:
-            payload["comments"] = self._normalize_inline_comments(inline_comments)
+        normalized = self._normalize_inline_comments(inline_comments) if inline_comments else []
+        if normalized:
+            payload["comments"] = normalized
         resp = self.session.post(url, json=payload, timeout=15)
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+
+        # Capture per-inline-comment IDs by following up with a GET on
+        # the new review. Match by (path, new_position, body). Body is
+        # unique per finding (severity emoji + message). Filtered entries
+        # (invalid file/line) get comment_id=None.
+        posted_inline: list[dict] = []
+        if inline_comments:
+            lookup: dict[tuple, int] = {}
+            review_id = result.get("id")
+            if review_id and normalized:
+                comments_url = (
+                    f"{self.base_url}/api/v1/repos/{owner}/{repo}"
+                    f"/pulls/{pr_number}/reviews/{review_id}/comments"
+                )
+                # Paginate — Gitea defaults to 50/page on this endpoint
+                # too; reviews with >50 inline findings would otherwise
+                # lose IDs beyond page 1 and break retraction matching.
+                max_pages = 10
+                try:
+                    for page in range(1, max_pages + 1):
+                        cresp = self.session.get(
+                            comments_url, params={"limit": 50, "page": page},
+                            timeout=10,
+                        )
+                        cresp.raise_for_status()
+                        batch = cresp.json()
+                        if not batch:
+                            break
+                        for rc in batch:
+                            key = (
+                                rc.get("path"),
+                                rc.get("position") or rc.get("new_position"),
+                                rc.get("body"),
+                            )
+                            lookup[key] = rc.get("id")
+                        if len(batch) < 50:
+                            break
+                except requests.HTTPError as e:
+                    logger.warning("Could not fetch inline comment IDs for review %s: %s",
+                                   review_id, e)
+            # Anchor-only fallback: when exact body match misses (e.g.
+            # Gitea server-side normalises whitespace), fall back to
+            # (path, position) IF exactly one returned comment sits at
+            # that anchor. Per-hit logged at DEBUG so a review with N
+            # findings doesn't emit N WARNING lines; a single summary
+            # WARNING fires below when fallback_count > 0.
+            anchor_lookup: dict[tuple, list[int]] = {}
+            for (rpath, rpos, _rbody), rid in lookup.items():
+                anchor_lookup.setdefault((rpath, rpos), []).append(rid)
+            unmatched = 0
+            fallback_count = 0
+            for c in inline_comments:
+                file_path = c.get("file", "")
+                line = c.get("line", 0)
+                body_text = c.get("body", "")
+                cid = None
+                if file_path and isinstance(line, int) and line > 0:
+                    cid = lookup.get((file_path, line, body_text))
+                    if cid is None:
+                        ids = anchor_lookup.get((file_path, line), [])
+                        if len(ids) == 1:
+                            cid = ids[0]
+                            fallback_count += 1
+                            logger.debug(
+                                "Inline comment ID matched by (path, line) fallback for %s:%d",
+                                file_path, line,
+                            )
+                        elif normalized:
+                            unmatched += 1
+                posted_inline.append({
+                    "file": file_path, "line": line, "comment_id": cid,
+                })
+            if fallback_count:
+                logger.warning(
+                    "%d/%d inline comments matched by (path, line) fallback on review %s — "
+                    "Gitea may have normalised the bodies",
+                    fallback_count, len(normalized), review_id,
+                )
+            if unmatched:
+                logger.warning(
+                    "Could not match %d/%d inline comments to returned IDs on review %s — "
+                    "retraction-by-id will be unavailable for those entries",
+                    unmatched, len(normalized), review_id,
+                )
+
+        result["inline_comments"] = posted_inline
+        return result
 
     @staticmethod
     def _normalize_inline_comments(comments: list[dict]) -> list[dict]:

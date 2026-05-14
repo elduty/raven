@@ -4,6 +4,7 @@ import atexit
 import contextlib
 import functools
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,7 +23,7 @@ from .providers import GitProvider, get_provider, register_provider, registered_
 from .providers.gitea import GiteaProvider
 from .metrics import inc, Timer, format_prometheus
 from .notifier import notify
-from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, MAX_DIFF_LINES, terminate_active_processes
+from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, MAX_DIFF_LINES, terminate_active_processes, RespondParseError
 
 _SEVERITY_NAME = {v: k for k, v in SEVERITY_ORDER.items()}
 
@@ -144,14 +146,34 @@ DEDUP_WINDOW = 30  # seconds
 # being processed by _process_pr; a second concurrent review on the
 # same PR exits immediately.
 _in_progress_prs: set[str] = set()
+# Separate set for comment-driven mutations: gives push priority (push
+# webhooks check ONLY _in_progress_prs and never wait on a comment-flow)
+# AND serializes concurrent comment-flows on the same PR (without it, two
+# comments arriving within ~10s would both pass the TOCTOU re-check before
+# either wrote the cache, then both submit_review + dismiss each other's
+# review).
+_comment_mutating_prs: set[str] = set()
 _in_progress_lock = threading.Lock()
 
 # ── Comment response history window ──────────────────────────────── #
 COMMENT_HISTORY = int(os.environ.get("RAVEN_COMMENT_HISTORY", "20"))
 
 # ── Previous diff cache for incremental reviews ──────────────────── #
-_previous_diffs: dict[str, tuple[float, dict[str, str], dict[str, list[dict]]]] = {}
-# key -> (timestamp, {filename: diff_hash}, {filename: [findings]})
+@dataclass
+class CacheEntry:
+    """A cached PR review state. Verdict + summary are populated since the
+    comment-thread-context feature (2026-05-13); legacy 3-tuple entries
+    loaded from older cache files default these to None. Per-finding
+    `comment_id` (set at submit time) lives inside `findings[fname][i]`
+    so retraction can match cached findings back to provider comments."""
+    timestamp: float
+    hashes: dict[str, str]            # filename -> diff_hash
+    findings: dict[str, list]         # filename -> [findings]
+    verdict: str | None = None        # 'approve' | 'needs_work' | None
+    summary: str | None = None        # last review's top-level body
+
+
+_previous_diffs: dict[str, CacheEntry] = {}
 _previous_diffs_lock = threading.Lock()
 _MAX_CACHED_PRS = int(os.environ.get("RAVEN_MAX_CACHED_PRS", "200"))
 _CACHE_DIR = Path(os.environ.get("RAVEN_CACHE_DIR", os.path.join(tempfile.gettempdir(), "raven")))
@@ -159,8 +181,12 @@ _CACHE_FILE = _CACHE_DIR / "findings_cache.json"
 
 
 def _load_cache() -> None:
-    """Load findings cache from disk on startup. Wipes cache if config changed."""
-    global _previous_diffs
+    """Load findings cache from disk on startup. Wipes cache if config changed.
+
+    Backwards-compatible: legacy entries serialized as 3-tuples (pre-2026-05-13)
+    load with verdict=None / summary=None; new entries are serialized as
+    dicts with the full schema.
+    """
     try:
         if not _CACHE_FILE.exists():
             return
@@ -173,11 +199,35 @@ def _load_cache() -> None:
                         stored_hash[:8] or "none", current_hash[:8])
             return
         entries = data.get("entries", {})
+        skipped = 0
         with _previous_diffs_lock:
             for key, entry in entries.items():
-                if isinstance(entry, list) and len(entry) >= 3:
-                    _previous_diffs[key] = (entry[0], entry[1], entry[2])
-        logger.info("Loaded %d cached PR reviews from %s", len(_previous_diffs), _CACHE_FILE)
+                # Per-entry guard: one corrupt row (missing required key,
+                # wrong type) must not abort the load loop and leave the
+                # other 199 healthy entries behind.
+                try:
+                    if isinstance(entry, list) and len(entry) >= 3:
+                        # Legacy 3-tuple: (timestamp, hashes, findings)
+                        _previous_diffs[key] = CacheEntry(
+                            timestamp=entry[0], hashes=entry[1], findings=entry[2],
+                        )
+                    elif isinstance(entry, dict):
+                        _previous_diffs[key] = CacheEntry(
+                            timestamp=entry["timestamp"],
+                            hashes=entry["hashes"],
+                            findings=entry["findings"],
+                            verdict=entry.get("verdict"),
+                            summary=entry.get("summary"),
+                        )
+                except (KeyError, TypeError, ValueError) as e:
+                    logger.warning("Skipping malformed cache entry %s: %s", key, e)
+                    skipped += 1
+        if skipped:
+            logger.warning("Loaded %d cached PR reviews from %s (skipped %d malformed)",
+                           len(_previous_diffs), _CACHE_FILE, skipped)
+        else:
+            logger.info("Loaded %d cached PR reviews from %s",
+                        len(_previous_diffs), _CACHE_FILE)
     except Exception as e:
         logger.warning("Could not load findings cache from %s: %s", _CACHE_FILE, e)
 
@@ -189,7 +239,7 @@ def _save_cache() -> None:
         with _previous_diffs_lock:
             data = {
                 "_config_hash": review_config_hash(),
-                "entries": {k: list(v) for k, v in _previous_diffs.items()},
+                "entries": {k: asdict(v) for k, v in _previous_diffs.items()},
             }
         tmp_fd, tmp_path = tempfile.mkstemp(dir=_CACHE_DIR, suffix=".tmp")
         try:
@@ -213,7 +263,7 @@ def _evict_cache() -> None:
     with _previous_diffs_lock:
         if len(_previous_diffs) <= _MAX_CACHED_PRS:
             return
-        sorted_keys = sorted(_previous_diffs, key=lambda k: _previous_diffs[k][0])
+        sorted_keys = sorted(_previous_diffs, key=lambda k: _previous_diffs[k].timestamp)
         to_remove = len(_previous_diffs) - _MAX_CACHED_PRS
         for key in sorted_keys[:to_remove]:
             del _previous_diffs[key]
@@ -282,12 +332,22 @@ def create_app() -> Flask:
 
     _load_cache()
 
+    metrics_token = os.environ.get("RAVEN_METRICS_TOKEN", "")
+    if not metrics_token:
+        logging.warning("RAVEN_METRICS_TOKEN not set — /metrics endpoint disabled (returns 404)")
+
     @app.route("/healthz")
     def healthz():
         return jsonify({"status": "ok"})
 
     @app.route("/metrics")
     def metrics():
+        if not metrics_token:
+            abort(404)
+        header = request.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not header.startswith(prefix) or not hmac.compare_digest(header[len(prefix):], metrics_token):
+            abort(404)
         return format_prometheus(), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
     @app.route("/hook", methods=["POST"])
@@ -442,8 +502,16 @@ def create_app() -> Flask:
 # ------------------------------------------------------------------ #
 
 def _should_auto_add_reviewer(provider: GitProvider, repo_full_name: str,
-                               pr_number: int) -> bool:
-    """Return True if Raven should auto-add itself as a reviewer on this PR.
+                               pr_number: int) -> bool | None:
+    """Return:
+      * ``True``  — auto-add Raven.
+      * ``False`` — don't auto-add; reviewer state confirmed (Raven
+        already listed, or fill-gap mode and other reviewers present).
+      * ``None``  — couldn't determine; an upstream call (auth, transport)
+        failed. Caller should treat this as "conservatively don't
+        auto-add" but log it distinctly so the operator sees the auth
+        failure rather than thinking the PR legitimately has other
+        reviewers.
 
     Behaviour depends on the RAVEN_REVIEW_ALL_PRS switch:
 
@@ -458,18 +526,21 @@ def _should_auto_add_reviewer(provider: GitProvider, repo_full_name: str,
     try:
         raven_user = provider.get_authenticated_user().lower()
     except Exception as e:
-        logger.warning("Could not resolve bot user for auto-add check: %s", e)
-        return False
+        logger.warning("Could not resolve bot user for auto-add check on %s PR #%d: %s — service account may lack repo access",
+                       repo_full_name, pr_number, e)
+        return None
     try:
         existing = provider.get_pr_reviews(repo_full_name, pr_number)
     except Exception as e:
-        logger.warning("Could not list reviews on %s PR #%d: %s", repo_full_name, pr_number, e)
-        return False
+        logger.warning("Could not list reviews on %s PR #%d: %s — service account may lack repo access",
+                       repo_full_name, pr_number, e)
+        return None
     try:
         requested = provider.get_pr_requested_reviewers(repo_full_name, pr_number)
     except Exception as e:
-        logger.warning("Could not list requested reviewers on %s PR #%d: %s", repo_full_name, pr_number, e)
-        return False
+        logger.warning("Could not list requested reviewers on %s PR #%d: %s — service account may lack repo access",
+                       repo_full_name, pr_number, e)
+        return None
 
     raven_already_listed = any(
         ((r.get("user") or {}).get("login") or "").lower() == raven_user
@@ -528,10 +599,17 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # Best-effort — failures on the check or the add don't block
         # the review itself.
         try:
-            if _should_auto_add_reviewer(provider, repo_full_name, pr_number):
+            should_add = _should_auto_add_reviewer(provider, repo_full_name, pr_number)
+            if should_add is True:
                 provider.add_self_as_reviewer(repo_full_name, pr_number)
-            else:
+            elif should_add is False:
                 logger.info("PR #%d already has other reviewers — not auto-adding Raven", pr_number)
+            else:
+                # None = couldn't verify reviewer state due to API error;
+                # the helper already warned with the auth-failure detail.
+                # Stay conservative and skip auto-add; the review itself
+                # still runs below.
+                logger.info("PR #%d — couldn't verify reviewer state; not auto-adding Raven", pr_number)
         except Exception as e:
             logger.warning("Failed to add Raven as reviewer on PR #%d: %s", pr_number, e)
             inc("raven_errors_total", {"type": "self_reviewer_failed", "repo": repo_full_name})
@@ -586,13 +664,16 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         try:
             claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref=head_sha)
         except Exception as e:
-            logger.debug("CLAUDE.md fetch for %s@%s: %s", repo_full_name, head_sha[:8], e)
+            # 404 (missing file) returns "" without raising; reaching this
+            # except means an auth/transport/server-side failure that the
+            # operator probably wants to see. Warn instead of debug.
+            logger.warning("CLAUDE.md fetch for %s@%s failed (review proceeds without repo context): %s",
+                           repo_full_name, head_sha[:8], e)
 
         base_ref = payload.get("base_ref") or "HEAD"
-        rules = _fetch_rules(provider, repo_full_name, base_ref)
-        review_prompt_override = _fetch_prompt_override(
-            provider, repo_full_name, base_ref, "review",
-        )
+        # NOTE: rule + prompt-override fetches deferred to after the
+        # no-changes-skip path below so a re-review on an unchanged diff
+        # doesn't incur those network calls only to return early.
 
         # Guard: empty diff after stripping lockfiles/binaries
         clean_diff = _strip_lockfiles_and_binaries(diff)
@@ -610,8 +691,8 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         with _previous_diffs_lock:
             cached = _previous_diffs.get(pr_key)
             if cached:
-                previous_hashes = cached[1]
-                cached_findings = cached[2] if len(cached) > 2 else {}
+                previous_hashes = cached.hashes
+                cached_findings = cached.findings
             else:
                 previous_hashes = {}
                 cached_findings = {}
@@ -665,6 +746,15 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             bot_user = provider.get_authenticated_user()
         except Exception as e:
             logger.warning("Failed to resolve bot user for PR #%d context filter: %s", pr_number, e)
+
+        # Fetch rules + prompt override now (after the no-changes-skip
+        # path returned). Doing it here keeps re-reviews of unchanged
+        # diffs from incurring rules/list_directory + per-file fetches
+        # only to bail before the AI call.
+        rules = _fetch_rules(provider, repo_full_name, base_ref)
+        review_prompt_override = _fetch_prompt_override(
+            provider, repo_full_name, base_ref, "review",
+        )
 
         # Run review
         with Timer("raven_review_duration_seconds", {"repo": repo_full_name}):
@@ -746,6 +836,45 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 logger.warning("Failed to dismiss old reviews on PR #%d: %s", pr_number, e)
                 inc("raven_errors_total", {"type": "dismiss_failed", "repo": repo_full_name})
 
+        # Tag findings with comment_id from the provider's submit_review
+        # return BEFORE building findings_map. _findings_by_file groups by
+        # reference (no copy), so tagging here propagates to the cached
+        # dict. Retraction (comment-thread-context feature) later matches
+        # by comment_id to drop the right entry on a successful retract.
+        #
+        # CRITICAL: iterate review["findings"] (post-carry-forward merge)
+        # — NOT fresh_findings — to mirror the inline_comments filter at
+        # line ~776. On incremental reviews, review["findings"] also
+        # contains carried findings whose previous IDs were dismissed
+        # alongside the prior review (server.py:794 dismiss_previous_reviews).
+        # submit_review re-posts them with fresh IDs; the carried-finding
+        # dicts in cache get retagged with those new IDs via shared
+        # references (carried = list of dict refs from cached_findings,
+        # which are the same dicts as _previous_diffs[pr_key].findings).
+        submitted_findings = [
+            f for f in review.get("findings", [])
+            if f.get("file") and isinstance(f.get("line"), int) and f["line"] > 0
+        ]
+        posted_inline = (new_review or {}).get("inline_comments") or []
+        # Defensive: providers MUST return inline_comments aligned by
+        # index with input (None for failed posts). If lengths diverge —
+        # filter drift in either side, or a provider returning a different
+        # shape — silently zipping would land comment_ids on the wrong
+        # findings, breaking retraction. Skip tagging and warn.
+        if len(submitted_findings) != len(posted_inline):
+            logger.warning(
+                "comment_id propagation length mismatch on PR #%d: %d "
+                "submitted findings vs %d posted inline_comments — "
+                "skipping comment_id tagging this round; retraction-by-id "
+                "is unavailable for these findings until the next "
+                "push-driven re-review.",
+                pr_number, len(submitted_findings), len(posted_inline),
+            )
+        else:
+            for f, p in zip(submitted_findings, posted_inline):
+                if p.get("comment_id") is not None:
+                    f["comment_id"] = p["comment_id"]
+
         # Cache diff + per-file findings for incremental re-reviews
         # Use fresh_findings (pre-merge) to avoid duplicating carried findings
         if is_incremental and cached_findings:
@@ -756,8 +885,21 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             findings_map.update(fresh)
         else:
             findings_map = _findings_by_file(fresh_findings, set(current_hashes.keys()))
+        verdict = "approve" if approve else "needs_work"
+        # Store the formatted review body (with severity + findings list)
+        # so the comment-driven `## Your Prior Verdict` block shows the
+        # AI substantive context — not just the one-line `summary` field.
+        # Matches the shape the comment-revision path writes
+        # (revise["body"], also a multi-paragraph body).
+        cache_summary = body
         with _previous_diffs_lock:
-            _previous_diffs[pr_key] = (time.time(), current_hashes, findings_map)
+            _previous_diffs[pr_key] = CacheEntry(
+                timestamp=time.time(),
+                hashes=current_hashes,
+                findings=findings_map,
+                verdict=verdict,
+                summary=cache_summary,
+            )
         _evict_cache()
         _save_cache()
 
@@ -775,15 +917,31 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
 
         raven_user = provider.get_authenticated_user()
         raven_user_lc = (raven_user or "").lower()
-        other_reviews = [r for r in provider.get_pr_reviews(repo_full_name, pr_number)
-                         if ((r.get("user") or {}).get("login") or "").lower() != raven_user_lc]
+        # Wrap both provider calls — 401/403/transport errors here used
+        # to propagate to the outer try/except as "internal error" and
+        # clear dedup. Fail closed instead: if we can't verify reviewer
+        # state, don't auto-merge (a human can still merge manually).
+        try:
+            other_reviews = [r for r in provider.get_pr_reviews(repo_full_name, pr_number)
+                             if ((r.get("user") or {}).get("login") or "").lower() != raven_user_lc]
+        except Exception as e:
+            logger.warning("Could not verify reviewer state on PR #%d (get_pr_reviews failed: %s) — leaving open without auto-merge",
+                           pr_number, e)
+            _notify_if_needed(repo_full_name, pr_number, pr_title, pr_url, review)
+            return
         # Filter Raven itself out of the requested-reviewers list. Raven is
         # in this list whenever it auto-added itself or a human re-requested
         # its review — neither case represents another reviewer waiting to
         # weigh in. Without this filter, every PR Raven self-requests would
         # be falsely classified as "has other reviewers" and never auto-merge.
-        requested = [u for u in provider.get_pr_requested_reviewers(repo_full_name, pr_number)
-                     if (u or "").lower() != raven_user_lc]
+        try:
+            requested = [u for u in provider.get_pr_requested_reviewers(repo_full_name, pr_number)
+                         if (u or "").lower() != raven_user_lc]
+        except Exception as e:
+            logger.warning("Could not verify requested-reviewers on PR #%d (get_pr_requested_reviewers failed: %s) — leaving open without auto-merge",
+                           pr_number, e)
+            _notify_if_needed(repo_full_name, pr_number, pr_title, pr_url, review)
+            return
         if other_reviews or requested:
             logger.info("PR #%d has other reviewers — leaving open for human review", pr_number)
             _notify_if_needed(repo_full_name, pr_number, pr_title, pr_url, review)
@@ -831,8 +989,10 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
 
     The webhook handler dispatches any comment that *could* be for Raven —
     either an @mention or a reply inside a thread. This worker confirms the
-    thread case with a provider API call (kept off the webhook hot path) and
-    quietly exits if Raven isn't involved.
+    thread case with a provider API call (kept off the webhook hot path),
+    fetches active-thread + prior-verdict context for the AI, posts the
+    reply, and optionally retracts invalidated findings and revises the
+    overall verdict (which may dispatch auto-merge).
     """
     repo_full_name = payload["repo"]
     pr_number = payload.get("pr_number")
@@ -844,10 +1004,37 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         parent_comment_id = payload.get("parent_comment_id")
         is_mention = bool(payload.get("_is_mention"))
 
+        # Active thread fetched ONCE up-front, reused for:
+        #   - Mention/author gating (non-mention path needs to verify Raven
+        #     is in the thread before responding).
+        #   - AI prompt context (`## Active Thread` block).
+        #   - Retraction ID validation (we only retract IDs that appear in
+        #     the fetched thread).
+        # Seed selection: parent_comment_id when set (BB DC reply); else
+        # the trigger comment's own id when the trigger is an inline-diff
+        # comment (Gitea's group-by-(path,position) returns the same thread
+        # from any member, so we use the trigger id as the seed). General
+        # @mentions on flat issue comments have no thread → []. Failure is
+        # best-effort: thread stays empty and the reply still goes out.
+        thread: list[dict] = []
+        seed_id = parent_comment_id or (comment_id if file_path else None)
+        if seed_id:
+            try:
+                thread = provider.get_comment_thread(
+                    repo_full_name, pr_number, seed_id,
+                )
+            except Exception as e:
+                # Warning, not debug: an exception here means a real API
+                # failure (auth, transport, server error). An empty
+                # thread for a brand-new comment is a different code
+                # path (no exception, just []) — that one stays silent.
+                logger.warning("Thread fetch failed for PR #%s seed=%s: %s",
+                               pr_number, seed_id, e)
+
         # Thread verification. @mentions dispatched by the handler are
         # authoritative and skip this step. Reply-with-no-mention events
-        # land here with is_mention=False; look up the thread authors to
-        # decide if Raven should engage.
+        # land here with is_mention=False; use the thread we already
+        # fetched to decide whether Raven should engage at all.
         if not is_mention:
             try:
                 raven_user = provider.get_authenticated_user()
@@ -857,14 +1044,7 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 logger.debug("Comment on PR #%s not directed at Raven — skipping",
                              pr_number)
                 return
-            try:
-                thread_authors = provider.get_comment_thread_authors(
-                    repo_full_name, pr_number, parent_comment_id,
-                )
-            except Exception as e:
-                logger.warning("Thread lookup failed for PR #%s comment %s: %s",
-                               pr_number, parent_comment_id, e)
-                return
+            thread_authors = [c.get("user", {}).get("login", "") for c in thread]
             raven_lower = raven_user.lower()
             if not any(a and a.lower() == raven_lower for a in thread_authors):
                 logger.debug("Raven not in thread rooted at %s — skipping",
@@ -886,24 +1066,59 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         raw_diff = provider.fetch_pr_diff(repo_full_name, pr_number)
         diff = _strip_lockfiles_and_binaries(raw_diff)
         diff = _truncate_diff_for_comment(diff, file_path, line)
+        # Fetch CLAUDE.md from the PR's head SHA (matches _process_pr's
+        # behavior). Reading from "HEAD" before could surface a different
+        # version of CLAUDE.md than the one Raven reviewed against — most
+        # notably on a re-review where the default branch has moved.
         claude_md = ""
         try:
-            claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref="HEAD")
-        except Exception:
-            pass
+            cmd_head_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
+        except Exception as e:
+            logger.debug("get_pr_head_sha for PR #%s CLAUDE.md fetch failed (falling back to HEAD): %s",
+                         pr_number, e)
+            cmd_head_sha = "HEAD"
+        try:
+            claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref=cmd_head_sha)
+        except Exception as e:
+            # 404 (file missing) returns "" without raising; reaching this
+            # except means an auth/transport failure worth flagging.
+            logger.warning("CLAUDE.md fetch for PR #%s reply failed (reply proceeds without repo context): %s",
+                           pr_number, e)
 
-        # Fetch conversation (keep last N to avoid prompt bloat)
-        conversation = provider.get_pr_comments(repo_full_name, pr_number)[-COMMENT_HISTORY:]
+        # Fetch conversation (keep last N to avoid prompt bloat). Dedupe
+        # against thread IDs so the same comment doesn't appear twice.
+        # Note: in both Gitea and BB DC, comment IDs are unique within a
+        # repo namespace (single comment table with shared auto-increment
+        # PK), so dedup by bare id is safe.
+        thread_ids = {c.get("id") for c in thread}
+        conversation = [
+            c for c in provider.get_pr_comments(repo_full_name, pr_number)[-COMMENT_HISTORY:]
+            if c.get("id") not in thread_ids
+        ]
+
+        # Fetch prior verdict from cache (best-effort; None disables
+        # comment-driven verdict revision below).
+        pr_key = f"{provider.name}:{repo_full_name}#{pr_number}"
+        prior_verdict: str | None = None
+        prior_body: str | None = None
+        with _previous_diffs_lock:
+            cache_entry = _previous_diffs.get(pr_key)
+        if cache_entry is not None:
+            prior_verdict = cache_entry.verdict
+            prior_body = cache_entry.summary
 
         # For inline diff comments, pull a line-numbered window of the file
         # around the commented line and inject it into the prompt so Claude
-        # doesn't have to find the code by parsing hunk headers. Needs the
-        # PR's head SHA — best-effort; fall back to no snippet on failure.
+        # doesn't have to find the code by parsing hunk headers. Reuse the
+        # head SHA fetched above for CLAUDE.md; if that fell back to "HEAD",
+        # try once more here in case the earlier call failed transiently.
         code_snippet = ""
         if file_path and line > 0:
             try:
-                head_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
-                file_content = provider.fetch_file(repo_full_name, file_path, ref=head_sha)
+                snippet_ref = cmd_head_sha
+                if snippet_ref == "HEAD":
+                    snippet_ref = provider.get_pr_head_sha(repo_full_name, pr_number)
+                file_content = provider.fetch_file(repo_full_name, file_path, ref=snippet_ref)
                 code_snippet = _extract_code_snippet(file_content, line)
             except Exception as e:
                 logger.debug("Could not fetch code snippet for %s:%s — %s",
@@ -921,13 +1136,37 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             logger.debug("Could not resolve base ref / respond override for PR #%d: %s",
                          pr_number, e)
 
-        # Generate response
-        response = respond_to_comment(
-            comment_body, conversation, diff, repo_full_name,
-            claude_md=claude_md, file_path=file_path, line=line,
-            code_snippet=code_snippet,
-            prompt_override=respond_prompt_override,
-        )
+        # Generate response. respond_to_comment returns
+        # {response, revise, retract_findings} since the comment-thread-context
+        # feature; mocks may still return a plain string in older tests
+        # (treated as response-only for back-compat).
+        try:
+            result = respond_to_comment(
+                comment_body, conversation, diff, repo_full_name,
+                claude_md=claude_md, file_path=file_path, line=line,
+                code_snippet=code_snippet,
+                prompt_override=respond_prompt_override,
+                thread=thread,
+                prior_verdict=prior_verdict,
+                prior_body=prior_body,
+            )
+        except RespondParseError as e:
+            logger.warning("Respond JSON parse error for PR #%d: %s", pr_number, e)
+            inc("raven_response_parse_errors_total", {"repo": repo_full_name})
+            provider.post_pr_comment(
+                repo_full_name, pr_number,
+                "\U0001f985 ⚠️ Couldn't generate a response — please try rephrasing.",
+                parent_comment_id=comment_id,
+            )
+            return
+        if isinstance(result, dict):
+            response = result.get("response", "")
+            revise = result.get("revise")
+            retract_findings = result.get("retract_findings") or []
+        else:
+            response = result
+            revise = None
+            retract_findings = []
 
         # Post response (skip if Claude returned nothing)
         if not response:
@@ -954,6 +1193,267 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                                  parent_comment_id=comment_id)
         inc("raven_responses_total", {"repo": repo_full_name})
         logger.info("Responded to comment on PR #%d in %s", pr_number, repo_full_name)
+
+        # ── Retraction + verdict revision + auto-merge dispatch ────── #
+        # Skip if nothing to do.
+        if revise is None and not retract_findings:
+            return
+
+        # Atomic race guard: mirrors _process_pr's pattern at
+        # server.py:522-529 — check-and-add under the lock. If a push-
+        # driven re-review is in flight for this PR, skip mutations (the
+        # in-flight review will write its own verdict and would race with
+        # us on submit_review + the cache).
+        #
+        # Asymmetric semantics:
+        #   - Check _in_progress_prs (push reviews) → push wins; bail.
+        #   - Check _comment_mutating_prs → another comment-flow is
+        #     already mutating this PR; bail to avoid both submitting
+        #     opposing reviews + dismissing each other's. (TOCTOU re-
+        #     check alone doesn't cover the window between cache read
+        #     and cache write, where both flows can be in flight.)
+        #   - Add ourselves to _comment_mutating_prs ONLY — pushing
+        #     never waits on a comment-flow.
+        with _in_progress_lock:
+            if pr_key in _in_progress_prs:
+                logger.debug("Skipping comment-driven mutations — push re-review in flight for %s", pr_key)
+                return
+            if pr_key in _comment_mutating_prs:
+                logger.debug("Skipping comment-driven mutations — another comment-flow in flight for %s", pr_key)
+                return
+            _comment_mutating_prs.add(pr_key)
+
+        mutated_cache = False
+        try:
+            # TOCTOU re-check: re-read prior_verdict from the cache under
+            # the guard. If it moved (because a concurrent _process_pr
+            # landed a fresh review while the AI was thinking), the AI's
+            # decision is on stale context — skip mutations.
+            with _previous_diffs_lock:
+                current_entry = _previous_diffs.get(pr_key)
+            current_verdict = current_entry.verdict if current_entry else None
+            if current_verdict != prior_verdict:
+                logger.debug(
+                    "Cache verdict changed under us (%s -> %s) — skipping comment-driven mutations for %s",
+                    prior_verdict, current_verdict, pr_key,
+                )
+                return
+
+            # Server-side defense in depth: the prompt instructs the AI
+            # not to revise without a prior verdict, but enforce here too.
+            if prior_verdict is None:
+                revise = None
+
+            # PR state gate — fail closed.
+            try:
+                pr_state = provider.get_pr_state(repo_full_name, pr_number)
+            except Exception as e:
+                logger.warning("get_pr_state failed for %s: %s — skipping mutations (fail-closed)",
+                               pr_key, e)
+                return
+            if pr_state != "open":
+                logger.debug("PR %s state=%s — skipping revision/retraction", pr_key, pr_state)
+                return
+
+            # Filter retraction IDs against fetched thread (defensive
+            # against AI hallucination).
+            valid_thread_ids = {c.get("id") for c in thread}
+            to_retract = [cid for cid in retract_findings if cid in valid_thread_ids]
+            dropped = set(retract_findings) - set(to_retract)
+            if dropped:
+                logger.debug("Dropped %d hallucinated retract IDs not in thread: %s",
+                             len(dropped), dropped)
+
+            any_retraction_succeeded = False
+            for cid in to_retract:
+                try:
+                    ok = provider.retract_finding(repo_full_name, pr_number, cid)
+                except Exception as e:
+                    logger.warning("retract_finding failed for comment %s on PR #%d: %s",
+                                   cid, pr_number, e)
+                    inc("raven_retractions_total", {"repo": repo_full_name, "result": "fail"})
+                    continue
+                inc("raven_retractions_total",
+                    {"repo": repo_full_name, "result": "ok" if ok else "fail"})
+                if not ok:
+                    continue
+                any_retraction_succeeded = True
+                # Drop matching cached finding so the next push-driven
+                # incremental review doesn't carry it forward and re-post
+                # it as a new inline comment, effectively undoing the
+                # retraction. Findings carry `comment_id` only when
+                # provider.submit_review's extended return shape is wired
+                # (deferred to a follow-up); legacy findings without
+                # comment_id fall through this loop without a match.
+                with _previous_diffs_lock:
+                    entry = _previous_diffs.get(pr_key)
+                    if entry is None:
+                        continue
+                    for fname, file_findings in list(entry.findings.items()):
+                        kept = [f for f in file_findings if f.get("comment_id") != cid]
+                        if len(kept) != len(file_findings):
+                            entry.findings[fname] = kept
+                            entry.timestamp = time.time()  # mark recently active so LRU doesn't evict
+                            mutated_cache = True
+                            logger.debug("Dropped retracted finding (comment_id=%s) from cache file %s",
+                                         cid, fname)
+                            break
+
+            # Verdict revision (only when verdict actually changes).
+            do_revision = revise is not None and revise.get("verdict") != prior_verdict
+
+            if not do_revision:
+                new_verdict = prior_verdict
+                new_body = prior_body or ""
+                rev_head_sha = None
+            else:
+                new_verdict = revise["verdict"]
+                new_body = revise["body"]
+
+            if do_revision:
+                # Pin the revised review to the current head_sha for
+                # force-push protection, same as _process_pr does at
+                # server.py:739. Fail closed if we can't fetch it —
+                # submitting with commit_id='' silently bypasses Gitea's
+                # force-push guard so a push between the AI call and now
+                # would land the revised verdict on un-inspected commits.
+                # Next push will re-trigger _process_pr and the verdict
+                # can be revised again from there.
+                try:
+                    rev_head_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
+                except Exception as e:
+                    logger.warning(
+                        "Could not fetch head_sha for revision on PR #%d: %s — "
+                        "skipping revision (fail-closed force-push protection)",
+                        pr_number, e,
+                    )
+                    return
+                if not rev_head_sha:
+                    logger.warning(
+                        "Empty head_sha for revision on PR #%d — skipping (fail-closed)",
+                        pr_number,
+                    )
+                    return
+                try:
+                    new_review_dict = provider.submit_review(
+                        repo_full_name, pr_number,
+                        body=new_body,
+                        approve=(new_verdict == "approve"),
+                        inline_comments=None,
+                        commit_id=rev_head_sha,
+                    )
+                except Exception as e:
+                    logger.warning("Verdict revision submit_review failed for PR #%d: %s",
+                                   pr_number, e)
+                    inc("raven_revision_submit_errors_total", {"repo": repo_full_name})
+                    return
+
+                # Dismiss the prior Raven review so the PR shows the
+                # current verdict cleanly. Without this, two reviews of
+                # opposite verdicts (the original needs_work + the new
+                # approve) coexist on the PR — confusing for humans.
+                # Best-effort; failure doesn't block.
+                new_review_id = new_review_dict.get("id") if isinstance(new_review_dict, dict) else None
+                if new_review_id is not None:
+                    try:
+                        bot_user = provider.get_authenticated_user()
+                        provider.dismiss_previous_reviews(
+                            repo_full_name, pr_number, bot_user,
+                            exclude_id=new_review_id,
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to dismiss prior reviews on PR #%d after revision: %s",
+                                       pr_number, e)
+
+                # Update cache verdict + summary. Defensive .get() in case
+                # the entry was evicted between the prior read and now.
+                with _previous_diffs_lock:
+                    existing = _previous_diffs.get(pr_key)
+                    if existing is not None:
+                        existing.verdict = new_verdict
+                        existing.summary = new_body
+                        existing.timestamp = time.time()  # mark recently active for LRU
+                        mutated_cache = True
+                    else:
+                        logger.debug("Cache entry for %s evicted between read and write", pr_key)
+                inc("raven_verdict_revisions_total",
+                    {"repo": repo_full_name,
+                     "from": prior_verdict or "none", "to": new_verdict})
+
+            # Auto-merge dispatch:
+            #   (a) verdict flipped needs_work → approve, OR
+            #   (b) verdict was already approve AND a retraction succeeded
+            #       (BB DC all-comments-resolved unblock).
+            should_dispatch_merge = (
+                (prior_verdict == "needs_work" and new_verdict == "approve")
+                or (prior_verdict == "approve" and new_verdict == "approve" and any_retraction_succeeded)
+            )
+            if should_dispatch_merge:
+                # Fail-closed on metadata fetch failure: dispatching with
+                # head_sha='' would defeat _do_merge's force-push
+                # protection.
+                try:
+                    head_sha = rev_head_sha if rev_head_sha else provider.get_pr_head_sha(
+                        repo_full_name, pr_number,
+                    )
+                except Exception as e:
+                    logger.warning("Could not fetch head_sha for auto-merge of PR #%d: %s — skipping dispatch",
+                                   pr_number, e)
+                    return
+                if not head_sha:
+                    return
+                try:
+                    meta = provider.get_pr_metadata(repo_full_name, pr_number)
+                except Exception as e:
+                    logger.debug("get_pr_metadata for PR #%d failed: %s", pr_number, e)
+                    meta = {}
+                pr_title = meta.get("title") or f"PR #{pr_number}"
+                pr_url = meta.get("html_url") or ""
+                merge_strategy = os.environ.get("MERGE_STRATEGY", "squash")
+                # Synthesize a review dict reflecting residual cache state.
+                with _previous_diffs_lock:
+                    entry = _previous_diffs.get(pr_key)
+                remaining_findings = []
+                if entry is not None:
+                    for fl in entry.findings.values():
+                        remaining_findings.extend(fl)
+                if remaining_findings:
+                    max_sev = max(SEVERITY_ORDER.get(f.get("severity", "low"), 0)
+                                  for f in remaining_findings)
+                    severity = next(name for name, ord_ in SEVERITY_ORDER.items()
+                                    if ord_ == max_sev)
+                else:
+                    severity = "low"
+                synthetic_review = {
+                    "approve": True,
+                    "severity": severity,
+                    "summary": new_body,
+                    "findings": remaining_findings,
+                }
+                fut = ci_wait_executor.submit(
+                    _safe_do_merge, provider, repo_full_name, pr_number,
+                    pr_title, pr_url, synthetic_review,
+                    head_sha, merge_strategy,
+                )
+                fut.add_done_callback(
+                    functools.partial(_log_future_exception, repo=repo_full_name),
+                )
+        finally:
+            # Order matters: _save_cache() can raise (disk full,
+            # permission error). The lock release MUST always happen
+            # or the PR is wedged out of comment-driven mutations
+            # until process restart.
+            if mutated_cache:
+                try:
+                    _save_cache()
+                except Exception as e:
+                    logger.warning("_save_cache() failed in _process_comment finally: %s", e)
+            # Release the comment-mutation slot so a follow-up comment
+            # on the same PR can proceed. The push-review set
+            # (_in_progress_prs) is owned by _process_pr; we don't
+            # touch it.
+            with _in_progress_lock:
+                _comment_mutating_prs.discard(pr_key)
 
     except Exception as e:
         logger.error("Failed to respond to comment: %s", e, exc_info=True)
@@ -1102,6 +1602,12 @@ def _wait_for_ci(provider: GitProvider, repo_full_name: str, sha: str, timeout: 
     initial = provider.get_commit_status(repo_full_name, sha)
     if initial in ("success", "failure", "error", "none"):
         return initial
+
+    # CI_WAIT_TIMEOUT=0 (or negative) means "don't wait" — config.example.env
+    # documents this as the skip-CI-check switch. Without this short-circuit
+    # we'd still hit the time.sleep(initial_delay) below before exiting.
+    if timeout <= 0:
+        return initial  # whatever it is (likely "pending"); caller decides
 
     initial_delay = 10
     interval = 15
@@ -1418,7 +1924,11 @@ def _fetch_rules(provider: GitProvider, repo_full_name: str, ref: str) -> dict[s
     try:
         entries = provider.list_directory(repo_full_name, RULES_DIR, ref=ref)
     except Exception as e:
-        logger.debug("Could not list %s at %s: %s", RULES_DIR, ref[:8], e)
+        # 404 (directory absent) returns [] from both providers without
+        # raising; reaching this except means a real listing failure
+        # (auth, transport) the operator should see.
+        logger.warning("Could not list %s at %s (review proceeds without rule context): %s",
+                       RULES_DIR, ref[:8], e)
         return {}
     if not entries:
         return {}
@@ -1433,7 +1943,10 @@ def _fetch_rules(provider: GitProvider, repo_full_name: str, ref: str) -> dict[s
             if content:
                 rules[path] = content
         except Exception as e:
-            logger.debug("Could not fetch rule file %s: %s", path, e)
+            # fetch_file returns "" on 404; raising here means real
+            # operational failure on a single rule file. Other rules
+            # still get processed; warn so operator sees the gap.
+            logger.warning("Could not fetch rule file %s: %s", path, e)
     if rules:
         logger.info("Loaded %d rule file(s) from %s for %s", len(rules), RULES_DIR, repo_full_name)
     return rules
@@ -1457,8 +1970,11 @@ def _fetch_prompt_override(provider: GitProvider, repo_full_name: str,
     try:
         content = provider.fetch_file(repo_full_name, path, ref=ref)
     except Exception as e:
-        logger.debug("Prompt override fetch for %s@%s/%s: %s",
-                     repo_full_name, ref[:8] if ref else "", path, e)
+        # fetch_file returns "" on 404 (override absent — the common
+        # case); reaching this except means an auth/transport failure
+        # that prevents Raven from honoring a configured override.
+        logger.warning("Prompt override fetch for %s@%s/%s failed (using built-in default): %s",
+                       repo_full_name, ref[:8] if ref else "", path, e)
         return None
     if not content or not content.strip():
         return None

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 
 import raven.server as _server_mod
-from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _fetch_rules, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _wait_for_ci, _should_skip_duplicate, _do_merge, _safe_do_merge, _truncate_diff_for_comment, _extract_code_snippet, _shutdown_executor, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW
+from raven.server import create_app, _is_bot_author, _is_skipped_repo, _format_comment, _fetch_changed_files, _fetch_rules, _findings_by_file, _load_cache, _save_cache, _evict_cache, _process_pr, _process_comment, _wait_for_ci, _should_skip_duplicate, _do_merge, _safe_do_merge, _truncate_diff_for_comment, _extract_code_snippet, _shutdown_executor, _recent_prs, _previous_diffs, _MAX_CACHED_PRS, DEDUP_WINDOW, CacheEntry
 from raven.providers import GitProvider, _providers
 
 
@@ -105,6 +105,52 @@ class TestStartupAssertion:
         with patch.dict(os.environ, {"GITEA_WEBHOOK_SECRET": "", "RAVEN_WEBHOOK_SECRET": "", "GITEA_URL": "", "GITEA_TOKEN": ""}):
             with pytest.raises(RuntimeError, match="No git providers configured"):
                 create_app()
+
+
+class TestMetricsAuth:
+    def _build_client(self, monkeypatch, token: str | None):
+        _providers.clear()
+        if token is None:
+            monkeypatch.delenv("RAVEN_METRICS_TOKEN", raising=False)
+        else:
+            monkeypatch.setenv("RAVEN_METRICS_TOKEN", token)
+        app = create_app()
+        app.config["TESTING"] = True
+        return app.test_client()
+
+    def teardown_method(self):
+        _providers.clear()
+
+    def test_unset_token_returns_404(self, monkeypatch):
+        client = self._build_client(monkeypatch, token=None)
+        resp = client.get("/metrics")
+        assert resp.status_code == 404
+
+    def test_unset_token_ignores_authorization_header(self, monkeypatch):
+        client = self._build_client(monkeypatch, token=None)
+        resp = client.get("/metrics", headers={"Authorization": "Bearer anything"})
+        assert resp.status_code == 404
+
+    def test_missing_header_returns_404(self, monkeypatch):
+        client = self._build_client(monkeypatch, token="s3cret")
+        resp = client.get("/metrics")
+        assert resp.status_code == 404
+
+    def test_wrong_token_returns_404(self, monkeypatch):
+        client = self._build_client(monkeypatch, token="s3cret")
+        resp = client.get("/metrics", headers={"Authorization": "Bearer wrong"})
+        assert resp.status_code == 404
+
+    def test_malformed_header_returns_404(self, monkeypatch):
+        client = self._build_client(monkeypatch, token="s3cret")
+        resp = client.get("/metrics", headers={"Authorization": "s3cret"})
+        assert resp.status_code == 404
+
+    def test_correct_token_returns_200(self, monkeypatch):
+        client = self._build_client(monkeypatch, token="s3cret")
+        resp = client.get("/metrics", headers={"Authorization": "Bearer s3cret"})
+        assert resp.status_code == 200
+        assert resp.headers["Content-Type"].startswith("text/plain")
 
 
 class TestSignatureValidation:
@@ -1732,7 +1778,7 @@ class TestIncrementalReview:
         # Seed the cache with the hash of the same diff chunk
         import hashlib, time as _time
         chunk_hash = hashlib.sha256("diff --git a/f.py b/f.py\n+line\n".encode()).hexdigest()
-        _previous_diffs["gitea:owner/repo#42"] = (_time.time(), {"f.py": chunk_hash}, {"f.py": []})
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(timestamp=_time.time(), hashes={"f.py": chunk_hash}, findings={"f.py": []})
         mc = self._make_provider()
         with (
             patch("raven.server.review_diff") as mock_review,
@@ -1747,7 +1793,7 @@ class TestIncrementalReview:
         # First review cached a different diff for f.py
         import hashlib, time as _time
         old_hash = hashlib.sha256("diff --git a/f.py b/f.py\n+old\n".encode()).hexdigest()
-        _previous_diffs["gitea:owner/repo#42"] = (_time.time(), {"f.py": old_hash}, {"f.py": []})
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(timestamp=_time.time(), hashes={"f.py": old_hash}, findings={"f.py": []})
         new_diff = "diff --git a/f.py b/f.py\n+new\ndiff --git a/g.py b/g.py\n+added\n"
         mc = self._make_provider()
         with (
@@ -1797,11 +1843,7 @@ class TestIncrementalReview:
         old_hash_a = hashlib.sha256("diff --git a/a.py b/a.py\n+old\n".encode()).hexdigest()
         old_hash_b = hashlib.sha256("diff --git a/b.py b/b.py\n+stable\n".encode()).hexdigest()
         carried_finding = {"severity": "high", "file": "b.py", "line": 10, "message": "bug in b"}
-        _previous_diffs["gitea:owner/repo#42"] = (
-            _time.time(),
-            {"a.py": old_hash_a, "b.py": old_hash_b},
-            {"a.py": [], "b.py": [carried_finding]},
-        )
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(timestamp=_time.time(), hashes={"a.py": old_hash_a, "b.py": old_hash_b}, findings={"a.py": [], "b.py": [carried_finding]})
         # Only a.py changed, b.py is unchanged
         new_diff = "diff --git a/a.py b/a.py\n+new\ndiff --git a/b.py b/b.py\n+stable\n"
         mc = self._make_provider()
@@ -1831,11 +1873,7 @@ class TestIncrementalReview:
         import hashlib, time as _time
         hash_a = hashlib.sha256("diff --git a/a.py b/a.py\n+old\n".encode()).hexdigest()
         hash_b = hashlib.sha256("diff --git a/b.py b/b.py\n+stable\n".encode()).hexdigest()
-        _previous_diffs["gitea:owner/repo#42"] = (
-            _time.time(),
-            {"a.py": hash_a, "b.py": hash_b},
-            {"a.py": [], "b.py": [{"severity": "medium", "file": "b.py", "message": "issue"}]},
-        )
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(timestamp=_time.time(), hashes={"a.py": hash_a, "b.py": hash_b}, findings={"a.py": [], "b.py": [{"severity": "medium", "file": "b.py", "message": "issue"}]})
         new_diff = "diff --git a/a.py b/a.py\n+new\ndiff --git a/b.py b/b.py\n+stable\n"
         mc = self._make_provider()
         with (
@@ -1860,11 +1898,7 @@ class TestIncrementalReview:
         """When a file is re-reviewed, its old findings are replaced."""
         import hashlib, time as _time
         old_hash = hashlib.sha256("diff --git a/a.py b/a.py\n+old\n".encode()).hexdigest()
-        _previous_diffs["gitea:owner/repo#42"] = (
-            _time.time(),
-            {"a.py": old_hash},
-            {"a.py": [{"severity": "high", "file": "a.py", "message": "old bug"}]},
-        )
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(timestamp=_time.time(), hashes={"a.py": old_hash}, findings={"a.py": [{"severity": "high", "file": "a.py", "message": "old bug"}]})
         new_diff = "diff --git a/a.py b/a.py\n+fixed\n"
         mc = self._make_provider()
         with (
@@ -1892,11 +1926,7 @@ class TestIncrementalReview:
         """Old Raven reviews are dismissed even on incremental reviews."""
         import hashlib, time as _time
         old_hash = hashlib.sha256("diff --git a/a.py b/a.py\n+old\n".encode()).hexdigest()
-        _previous_diffs["gitea:owner/repo#42"] = (
-            _time.time(),
-            {"a.py": old_hash},
-            {"a.py": []},
-        )
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(timestamp=_time.time(), hashes={"a.py": old_hash}, findings={"a.py": []})
         new_diff = "diff --git a/a.py b/a.py\n+new\n"
         mc = self._make_provider()
         with (
@@ -1920,11 +1950,7 @@ class TestIncrementalReview:
         """Auto-merge proceeds on incremental review when all findings resolved."""
         import hashlib, time as _time
         old_hash = hashlib.sha256("diff --git a/a.py b/a.py\n+old\n".encode()).hexdigest()
-        _previous_diffs["gitea:owner/repo#42"] = (
-            _time.time(),
-            {"a.py": old_hash},
-            {"a.py": []},
-        )
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(timestamp=_time.time(), hashes={"a.py": old_hash}, findings={"a.py": []})
         new_diff = "diff --git a/a.py b/a.py\n+new\n"
         mc = self._make_provider()
         with (
@@ -1954,11 +1980,7 @@ class TestIncrementalReview:
         import hashlib, time as _time
         old_hash_a = hashlib.sha256("diff --git a/a.py b/a.py\n+old\n".encode()).hexdigest()
         old_hash_b = hashlib.sha256("diff --git a/b.py b/b.py\n+stable\n".encode()).hexdigest()
-        _previous_diffs["gitea:owner/repo#42"] = (
-            _time.time(),
-            {"a.py": old_hash_a, "b.py": old_hash_b},
-            {"a.py": [], "b.py": [{"severity": "high", "file": "b.py", "message": "critical"}]},
-        )
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(timestamp=_time.time(), hashes={"a.py": old_hash_a, "b.py": old_hash_b}, findings={"a.py": [], "b.py": [{"severity": "high", "file": "b.py", "message": "critical"}]})
         new_diff = "diff --git a/a.py b/a.py\n+new\ndiff --git a/b.py b/b.py\n+stable\n"
         mc = self._make_provider()
         with (
@@ -1975,31 +1997,11 @@ class TestIncrementalReview:
             _process_pr(mc, self._normalized_payload())
         mc.merge_pr.assert_not_called()
 
-    def test_backward_compat_old_cache_format(self):
-        """Old 2-tuple cache format degrades to no cached findings."""
-        import hashlib, time as _time
-        old_hash = hashlib.sha256("diff --git a/a.py b/a.py\n+old\n".encode()).hexdigest()
-        # Old format: no findings element
-        _previous_diffs["gitea:owner/repo#42"] = (_time.time(), {"a.py": old_hash})
-        new_diff = "diff --git a/a.py b/a.py\n+new\n"
-        mc = self._make_provider()
-        with (
-            patch("raven.server.review_diff") as mock_review,
-            patch("raven.server.notify"),
-        ):
-            mc.fetch_pr_diff.return_value = new_diff
-            mc.fetch_file.return_value = ""
-            mc.submit_review.return_value = {"id": 1}
-            mc.add_label_to_pr.return_value = None
-            mc.get_authenticated_user.return_value = "Raven"
-            mc.get_pr_reviews.side_effect = [
-                [],                                                        # auto-add check
-                [{"user": {"login": "Raven"}, "state": "APPROVED"}],      # gate check
-            ]
-            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
-            _process_pr(mc, self._normalized_payload())
-        # Should still work — no crash, review submitted
-        mc.submit_review.assert_called_once()
+    # NOTE: a "2-tuple legacy format" test previously lived here. It was
+    # testing in-memory 2-tuple insertion as a stand-in for legacy on-disk
+    # entries. With CacheEntry, in-memory 2-tuples can't exist; the legacy
+    # 3-tuple path is exercised in TestCachePersistence via the actual
+    # JSON load route — see test_load_legacy_3tuple_entries_yields_none_verdict.
 
 
 class TestReviewEvent:
@@ -2286,7 +2288,7 @@ class TestIssueComment:
         mc.get_pr_comments.return_value = [{"user": {"login": "alice"}, "body": "@Raven explain"}]
         mc.post_pr_comment.return_value = {"id": 1}
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "The issue is that..."
+            mock_respond.return_value = {"response": "The issue is that...", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_comment_payload())
         mc.post_pr_comment.assert_called_once()
         posted_body = mc.post_pr_comment.call_args[0][2]
@@ -2303,7 +2305,7 @@ class TestIssueComment:
         mc.get_pr_comments.return_value = [{"user": {"login": "alice"}, "body": "@Raven explain"}]
         mc.post_pr_comment.return_value = {"id": 1}
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "reply text"
+            mock_respond.return_value = {"response": "reply text", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_comment_payload())
         assert mc.post_pr_comment.call_args[1]["parent_comment_id"] == 999
 
@@ -2330,7 +2332,7 @@ class TestIssueComment:
         mc.fetch_file.return_value = ""
         mc.get_pr_comments.return_value = []
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = ""
+            mock_respond.return_value = {"response": "", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_comment_payload())
         mc.post_pr_comment.assert_called_once()
         posted_body = mc.post_pr_comment.call_args[0][2]
@@ -2345,7 +2347,7 @@ class TestIssueComment:
         mc.fetch_file.return_value = ""
         mc.get_pr_comments.return_value = []
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "ok"
+            mock_respond.return_value = {"response": "ok", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_comment_payload())
         mc.react_to_comment.assert_called_once_with("owner/repo", 42, 999)
 
@@ -2358,28 +2360,34 @@ class TestIssueComment:
         mc.fetch_file.return_value = ""
         mc.get_pr_comments.return_value = []
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "the answer"
+            mock_respond.return_value = {"response": "the answer", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_comment_payload())
         mc.post_pr_comment.assert_called_once()
         assert "the answer" in mc.post_pr_comment.call_args[0][2]
 
     def test_process_comment_reply_path_verifies_thread_in_background(self):
         """Reply-in-thread payloads reach _process_comment with
-        _is_mention=False — the worker must call get_comment_thread_authors
-        to decide whether Raven should engage."""
+        _is_mention=False — the worker must call get_comment_thread
+        to decide whether Raven should engage (authors derived from the
+        thread dicts)."""
         mc = MagicMock(spec=GitProvider)
         mc.name = "bitbucket-dc"
         mc.get_authenticated_user.return_value = "Raven"
-        mc.get_comment_thread_authors.return_value = ["alice", "Raven"]
+        mc.get_comment_thread.return_value = [
+            {"id": 700, "parent_id": None, "user": {"login": "alice"},
+             "body": "...", "file_path": None, "line": None, "resolved": False},
+            {"id": 701, "parent_id": 700, "user": {"login": "Raven"},
+             "body": "...", "file_path": None, "line": None, "resolved": False},
+        ]
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.return_value = ""
         mc.get_pr_comments.return_value = []
         payload = self._normalized_comment_payload(is_mention=False)
         payload["parent_comment_id"] = 700
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "ok"
+            mock_respond.return_value = {"response": "ok", "revise": None, "retract_findings": []}
             _process_comment(mc, payload)
-        mc.get_comment_thread_authors.assert_called_once_with("owner/repo", 42, 700)
+        mc.get_comment_thread.assert_called_once_with("owner/repo", 42, 700)
         mc.post_pr_comment.assert_called_once()
 
     def test_process_comment_reply_path_skips_when_raven_not_in_thread(self):
@@ -2388,7 +2396,12 @@ class TestIssueComment:
         mc = MagicMock(spec=GitProvider)
         mc.name = "bitbucket-dc"
         mc.get_authenticated_user.return_value = "Raven"
-        mc.get_comment_thread_authors.return_value = ["alice", "bob"]
+        mc.get_comment_thread.return_value = [
+            {"id": 700, "parent_id": None, "user": {"login": "alice"},
+             "body": "...", "file_path": None, "line": None, "resolved": False},
+            {"id": 701, "parent_id": 700, "user": {"login": "bob"},
+             "body": "...", "file_path": None, "line": None, "resolved": False},
+        ]
         payload = self._normalized_comment_payload(is_mention=False)
         payload["parent_comment_id"] = 700
         _process_comment(mc, payload)
@@ -2400,7 +2413,7 @@ class TestIssueComment:
         mc = MagicMock(spec=GitProvider)
         mc.name = "bitbucket-dc"
         mc.get_authenticated_user.return_value = "Raven"
-        mc.get_comment_thread_authors.side_effect = RuntimeError("503")
+        mc.get_comment_thread.side_effect = RuntimeError("503")
         payload = self._normalized_comment_payload(is_mention=False)
         payload["parent_comment_id"] = 700
         _process_comment(mc, payload)
@@ -2415,9 +2428,9 @@ class TestIssueComment:
         mc.fetch_file.return_value = ""
         mc.get_pr_comments.return_value = []
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "the answer"
+            mock_respond.return_value = {"response": "the answer", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_comment_payload(is_mention=True))
-        mc.get_comment_thread_authors.assert_not_called()
+        mc.get_comment_thread.assert_not_called()
         mc.post_pr_comment.assert_called_once()
 
     def test_respond_threads_prompt_override_from_base_branch(self):
@@ -2440,7 +2453,7 @@ class TestIssueComment:
         mc.fetch_file.side_effect = fetch_file
 
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "reply body"
+            mock_respond.return_value = {"response": "reply body", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_comment_payload())
 
         kwargs = mock_respond.call_args.kwargs
@@ -2457,7 +2470,7 @@ class TestIssueComment:
         mc.get_pr_base_ref.return_value = "main"
 
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "reply body"
+            mock_respond.return_value = {"response": "reply body", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_comment_payload())
 
         kwargs = mock_respond.call_args.kwargs
@@ -2474,7 +2487,7 @@ class TestIssueComment:
         mc.get_pr_base_ref.side_effect = RuntimeError("boom")
 
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "reply body"
+            mock_respond.return_value = {"response": "reply body", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_comment_payload())
 
         assert mock_respond.called
@@ -2544,7 +2557,7 @@ class TestPullRequestComment:
         mc.get_pr_comments.return_value = []
         mc.post_pr_comment.return_value = {"id": 1}
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "The issue is..."
+            mock_respond.return_value = {"response": "The issue is...", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_diff_comment())
         # Verify file_path and line were passed to respond_to_comment
         call_kwargs = mock_respond.call_args[1]
@@ -2561,7 +2574,7 @@ class TestPullRequestComment:
         mc.get_pr_comments.return_value = []
         mc.post_pr_comment.return_value = {"id": 1}
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "Because of X."
+            mock_respond.return_value = {"response": "Because of X.", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_diff_comment(body="@Raven why?"))
         posted_body = mc.post_pr_comment.call_args[0][2]
         assert "server.py" in posted_body
@@ -2581,7 +2594,7 @@ class TestPullRequestComment:
         mc.fetch_file.side_effect = ["", "\n".join(f"row-{i}" for i in range(1, 101))]
         mc.get_pr_comments.return_value = []
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "ok"
+            mock_respond.return_value = {"response": "ok", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_diff_comment(line=42))
         call_kwargs = mock_respond.call_args[1]
         snippet = call_kwargs.get("code_snippet", "")
@@ -2602,7 +2615,7 @@ class TestPullRequestComment:
         mc.fetch_file.return_value = ""
         mc.get_pr_comments.return_value = []
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "ok"
+            mock_respond.return_value = {"response": "ok", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_diff_comment(line=42))
         call_kwargs = mock_respond.call_args[1]
         assert call_kwargs.get("code_snippet", "") == ""
@@ -2618,7 +2631,7 @@ class TestPullRequestComment:
         mc.get_pr_comments.return_value = []
         mc.post_pr_comment.return_value = {"id": 1}
         with patch("raven.server.respond_to_comment") as mock_respond:
-            mock_respond.return_value = "Because of X."
+            mock_respond.return_value = {"response": "Because of X.", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_diff_comment(body="@Raven why?"))
         posted_body = mc.post_pr_comment.call_args[0][2]
         assert "**Re:" not in posted_body
@@ -2754,11 +2767,12 @@ class TestCachePersistence:
         _previous_diffs.clear()
 
     def test_save_and_load_round_trip(self, tmp_path):
+        from raven.server import CacheEntry
         cache_file = tmp_path / "raven" / "findings_cache.json"
-        _previous_diffs["owner/repo#1"] = (
-            100.0,
-            {"a.py": "hash1"},
-            {"a.py": [{"severity": "high", "message": "bug"}]},
+        _previous_diffs["owner/repo#1"] = CacheEntry(
+            timestamp=100.0,
+            hashes={"a.py": "hash1"},
+            findings={"a.py": [{"severity": "high", "message": "bug"}]},
         )
         with patch("raven.server._CACHE_FILE", cache_file), \
              patch("raven.server._CACHE_DIR", tmp_path / "raven"):
@@ -2767,9 +2781,9 @@ class TestCachePersistence:
             _load_cache()
         assert "owner/repo#1" in _previous_diffs
         entry = _previous_diffs["owner/repo#1"]
-        assert entry[0] == 100.0
-        assert entry[1] == {"a.py": "hash1"}
-        assert entry[2]["a.py"][0]["message"] == "bug"
+        assert entry.timestamp == 100.0
+        assert entry.hashes == {"a.py": "hash1"}
+        assert entry.findings["a.py"][0]["message"] == "bug"
 
     def test_load_missing_file(self, tmp_path):
         cache_file = tmp_path / "nonexistent" / "cache.json"
@@ -2785,22 +2799,91 @@ class TestCachePersistence:
         assert len(_previous_diffs) == 0
 
     def test_lru_eviction(self):
-        # Fill cache beyond max
+        from raven.server import CacheEntry
         for i in range(_MAX_CACHED_PRS + 10):
-            _previous_diffs[f"repo#{i}"] = (float(i), {}, {})
+            _previous_diffs[f"repo#{i}"] = CacheEntry(
+                timestamp=float(i), hashes={}, findings={},
+            )
         with patch("raven.server._save_cache"):
             _evict_cache()
         assert len(_previous_diffs) == _MAX_CACHED_PRS
-        # Oldest entries (0-9) should be evicted
+        # Oldest entries (lowest timestamps) evicted first.
         for i in range(10):
             assert f"repo#{i}" not in _previous_diffs
-        # Newest should remain
+        # Newest retained.
         assert f"repo#{_MAX_CACHED_PRS + 9}" in _previous_diffs
+
+    # ── Migration & new-field tests (Task 1 of the comment-thread plan) ──
+
+    def test_load_legacy_3tuple_entries_yields_none_verdict(self, tmp_path):
+        """Legacy 3-tuple cache entries load with verdict=None, summary=None."""
+        from raven.reviewer import review_config_hash
+        cache_dir = tmp_path / "raven"
+        cache_dir.mkdir()
+        cache_file = cache_dir / "findings_cache.json"
+        cache_file.write_text(json.dumps({
+            "_config_hash": review_config_hash(),
+            "entries": {
+                "u/r#1": [1234567890.0, {"a.py": "h1"},
+                          {"a.py": [{"severity": "low"}]}],
+            },
+        }))
+        with patch("raven.server._CACHE_DIR", cache_dir), \
+             patch("raven.server._CACHE_FILE", cache_file):
+            _load_cache()
+        entry = _previous_diffs["u/r#1"]
+        assert entry.timestamp == 1234567890.0
+        assert entry.hashes == {"a.py": "h1"}
+        assert entry.findings == {"a.py": [{"severity": "low"}]}
+        assert entry.verdict is None
+        assert entry.summary is None
+
+    def test_load_new_dict_entries_round_trip(self, tmp_path):
+        """New dict-shape entries round-trip with verdict + summary."""
+        from raven.reviewer import review_config_hash
+        cache_dir = tmp_path / "raven"
+        cache_dir.mkdir()
+        cache_file = cache_dir / "findings_cache.json"
+        cache_file.write_text(json.dumps({
+            "_config_hash": review_config_hash(),
+            "entries": {"u/r#2": {
+                "timestamp": 1700.0,
+                "hashes": {"a.py": "h"},
+                "findings": {"a.py": []},
+                "verdict": "approve",
+                "summary": "LGTM",
+            }},
+        }))
+        with patch("raven.server._CACHE_DIR", cache_dir), \
+             patch("raven.server._CACHE_FILE", cache_file):
+            _load_cache()
+        entry = _previous_diffs["u/r#2"]
+        assert entry.verdict == "approve"
+        assert entry.summary == "LGTM"
+
+    def test_save_emits_new_dict_shape(self, tmp_path):
+        """_save_cache serializes the new dict shape, not the legacy 3-tuple."""
+        from raven.server import CacheEntry
+        cache_dir = tmp_path / "raven"
+        cache_dir.mkdir()
+        cache_file = cache_dir / "findings_cache.json"
+        _previous_diffs["u/r#3"] = CacheEntry(
+            timestamp=1.0, hashes={}, findings={},
+            verdict="needs_work", summary="see findings",
+        )
+        with patch("raven.server._CACHE_DIR", cache_dir), \
+             patch("raven.server._CACHE_FILE", cache_file):
+            _save_cache()
+        data = json.loads(cache_file.read_text())
+        entry = data["entries"]["u/r#3"]
+        assert isinstance(entry, dict)
+        assert entry["verdict"] == "needs_work"
+        assert entry["summary"] == "see findings"
 
     def test_config_hash_match_loads_cache(self, tmp_path):
         """Cache loads when config hash matches."""
         cache_file = tmp_path / "cache.json"
-        _previous_diffs["owner/repo#1"] = (100.0, {"a.py": "h"}, {"a.py": []})
+        _previous_diffs["owner/repo#1"] = CacheEntry(timestamp=100.0, hashes={"a.py": "h"}, findings={"a.py": []})
         with patch("raven.server._CACHE_FILE", cache_file), \
              patch("raven.server._CACHE_DIR", tmp_path):
             _save_cache()
@@ -2811,7 +2894,7 @@ class TestCachePersistence:
     def test_config_hash_mismatch_wipes_cache(self, tmp_path):
         """Cache discarded when config hash differs (model/prompt change)."""
         cache_file = tmp_path / "cache.json"
-        _previous_diffs["owner/repo#1"] = (100.0, {"a.py": "h"}, {"a.py": []})
+        _previous_diffs["owner/repo#1"] = CacheEntry(timestamp=100.0, hashes={"a.py": "h"}, findings={"a.py": []})
         with patch("raven.server._CACHE_FILE", cache_file), \
              patch("raven.server._CACHE_DIR", tmp_path):
             _save_cache()
@@ -3027,7 +3110,7 @@ class TestBitbucketDCWebhook:
             },
         }
         with patch.object(self._provider, "get_authenticated_user", return_value=self.BB_USERNAME), \
-             patch.object(self._provider, "get_comment_thread_authors",
+             patch.object(self._provider, "get_comment_thread",
                           return_value=["alice", self.BB_USERNAME]), \
              patch("raven.server.executor") as mock_executor:
             resp = self._post_bb_dc(payload, "pr:comment:added")
@@ -3058,7 +3141,7 @@ class TestBitbucketDCWebhook:
         }
         # Thread authors: alice (root) + raven-bot (reply) + alice (reply)
         with patch.object(self._provider, "get_authenticated_user", return_value=self.BB_USERNAME), \
-             patch.object(self._provider, "get_comment_thread_authors",
+             patch.object(self._provider, "get_comment_thread",
                           return_value=["alice", self.BB_USERNAME]), \
              patch("raven.server.executor") as mock_executor:
             resp = self._post_bb_dc(payload, "pr:comment:added")
@@ -3111,7 +3194,7 @@ class TestBitbucketDCWebhook:
             },
         }
         with patch.object(self._provider, "get_authenticated_user", return_value=self.BB_USERNAME), \
-             patch.object(self._provider, "get_comment_thread_authors") as mock_lookup, \
+             patch.object(self._provider, "get_comment_thread") as mock_lookup, \
              patch("raven.server.executor"):
             resp = self._post_bb_dc(payload, "pr:comment:added")
         assert resp.status_code == 200
@@ -3504,3 +3587,469 @@ class TestFetchPromptOverride:
         provider = self._make_provider(fetch_file)
         _fetch_prompt_override(provider, "owner/repo", "main", "review")
         assert captured["path"] == ".custom/dir/raven/prompts/review.md"
+
+
+# ------------------------------------------------------------------ #
+#  Comment-thread-context feature: retract + revise + auto-merge      #
+# ------------------------------------------------------------------ #
+
+@pytest.fixture
+def mock_provider_for_comment_flow():
+    """Module-level fixture shared across the comment-flow tests below
+    (TestProcessCommentRetraction, TestProcessCommentRevision,
+    TestProcessCommentRaceGuard). Sibling test classes can't share
+    class-scoped fixtures."""
+    mp = MagicMock(spec=GitProvider)
+    mp.name = "gitea"
+    mp.fetch_pr_diff.return_value = "diff..."
+    mp.get_pr_comments.return_value = [
+        {"id": 50, "user": {"login": "carol"}, "body": "global note"},
+    ]
+    mp.get_comment_thread.return_value = [
+        {"id": 10, "parent_id": None, "user": {"login": "raven"},
+         "body": "Original finding", "file_path": "a.py", "line": 5,
+         "resolved": False},
+        {"id": 11, "parent_id": 10, "user": {"login": "alice"},
+         "body": "Why is this bad?", "file_path": "a.py", "line": 5,
+         "resolved": False},
+    ]
+    mp.get_pr_state.return_value = "open"
+    mp.get_pr_head_sha.return_value = "abc123"
+    mp.get_pr_metadata.return_value = {"title": "Test PR", "html_url": "https://x/u/r/pulls/1"}
+    mp.fetch_file.side_effect = lambda r, p, ref="HEAD": "" if p == "CLAUDE.md" else "code"
+    mp.get_pr_base_ref.return_value = "main"
+    mp.get_authenticated_user.return_value = "raven"
+    mp.supports_comment_threads = True
+    return mp
+
+
+@pytest.fixture
+def cached_needs_work(mock_provider_for_comment_flow):
+    """Seed cache with a prior 'needs_work' entry under the prefixed key
+    format _process_pr uses: f'{provider.name}:{repo}#{pr}'."""
+    from raven.server import CacheEntry, _previous_diffs
+    pr_key = "gitea:u/r#1"
+    _previous_diffs[pr_key] = CacheEntry(
+        timestamp=0.0, hashes={}, findings={},
+        verdict="needs_work", summary="see findings",
+    )
+    yield
+    _previous_diffs.pop(pr_key, None)
+
+
+class TestProcessCommentRetraction:
+    def _payload(self, comment_id=12, parent=10):
+        return {
+            "repo": "u/r", "pr_number": 1,
+            "comment_body": "?", "comment_id": comment_id,
+            "parent_comment_id": parent, "_is_mention": True,
+            "file_path": "a.py", "line": 5,
+        }
+
+    def test_retracts_filtered_to_thread_ids(self, mock_provider_for_comment_flow):
+        """IDs not in the fetched thread are dropped."""
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {
+                "response": "ok", "revise": None,
+                "retract_findings": [10, 11, 9999],
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        called_ids = sorted(
+            call.args[2] for call in mock_provider_for_comment_flow.retract_finding.call_args_list
+        )
+        assert called_ids == [10, 11]
+
+    def test_retracts_skipped_when_pr_not_open(self, mock_provider_for_comment_flow):
+        mock_provider_for_comment_flow.get_pr_state.return_value = "merged"
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {
+                "response": "ok", "revise": None,
+                "retract_findings": [10],
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        mock_provider_for_comment_flow.retract_finding.assert_not_called()
+
+    def test_retract_failure_does_not_block_subsequent(self, mock_provider_for_comment_flow):
+        mock_provider_for_comment_flow.retract_finding.side_effect = [False, True]
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {
+                "response": "ok", "revise": None,
+                "retract_findings": [10, 11],
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        assert mock_provider_for_comment_flow.retract_finding.call_count == 2
+
+    def test_no_retract_when_list_empty(self, mock_provider_for_comment_flow):
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {
+                "response": "ok", "revise": None, "retract_findings": [],
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        mock_provider_for_comment_flow.retract_finding.assert_not_called()
+
+    def test_successful_retract_drops_matching_finding_from_cache(self, mock_provider_for_comment_flow):
+        """End-to-end: when a cached finding carries comment_id=42 and
+        retract_finding(42) succeeds, the cache cleanup drops that
+        finding so the next push-driven incremental review doesn't
+        carry it forward and re-post."""
+        from raven.server import CacheEntry, _previous_diffs
+        pr_key = "gitea:u/r#1"
+        _previous_diffs[pr_key] = CacheEntry(
+            timestamp=0.0, hashes={"a.py": "h"},
+            findings={"a.py": [
+                {"file": "a.py", "line": 5, "severity": "medium",
+                 "message": "the flagged thing", "comment_id": 42},
+                {"file": "a.py", "line": 10, "severity": "low",
+                 "message": "another finding", "comment_id": 43},
+            ]},
+            verdict="needs_work", summary="see findings",
+        )
+        try:
+            mock_provider_for_comment_flow.retract_finding.return_value = True
+            mock_provider_for_comment_flow.get_comment_thread.return_value = [
+                {"id": 42, "parent_id": None, "user": {"login": "raven"},
+                 "body": "the flagged thing", "file_path": "a.py", "line": 5,
+                 "resolved": False},
+            ]
+            with patch("raven.server.respond_to_comment") as mock_respond:
+                mock_respond.return_value = {
+                    "response": "retracting",
+                    "revise": None,
+                    "retract_findings": [42],
+                }
+                _process_comment(mock_provider_for_comment_flow, {
+                    "repo": "u/r", "pr_number": 1,
+                    "comment_body": "?", "comment_id": 99,
+                    "parent_comment_id": 42, "_is_mention": True,
+                    "file_path": "a.py", "line": 5,
+                })
+            remaining = _previous_diffs[pr_key].findings["a.py"]
+            assert all(f.get("comment_id") != 42 for f in remaining)
+            assert any(f.get("comment_id") == 43 for f in remaining)
+        finally:
+            _previous_diffs.pop(pr_key, None)
+
+
+class TestProcessCommentRevision:
+    def _payload(self):
+        return {
+            "repo": "u/r", "pr_number": 1,
+            "comment_body": "?", "comment_id": 12,
+            "parent_comment_id": None, "_is_mention": True,
+        }
+
+    def test_revise_needs_work_to_approve_submits_review(
+        self, mock_provider_for_comment_flow, cached_needs_work,
+    ):
+        # Patch _safe_do_merge so the inline-executor autouse fixture
+        # doesn't run real CI-wait polling (CI_WAIT_TIMEOUT defaults
+        # to 300s and time.sleep is real inside _wait_for_ci).
+        with patch("raven.server.respond_to_comment") as mock_respond, \
+             patch("raven.server._safe_do_merge"):
+            mock_respond.return_value = {
+                "response": "you're right",
+                "revise": {"verdict": "approve", "body": "Revised: LGTM"},
+                "retract_findings": [],
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        kwargs = mock_provider_for_comment_flow.submit_review.call_args.kwargs
+        assert kwargs["approve"] is True
+        assert kwargs["body"] == "Revised: LGTM"
+
+    def test_revise_unchanged_verdict_skips_submit(
+        self, mock_provider_for_comment_flow, cached_needs_work,
+    ):
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {
+                "response": "x",
+                "revise": {"verdict": "needs_work", "body": "still needs work"},
+                "retract_findings": [],
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        mock_provider_for_comment_flow.submit_review.assert_not_called()
+
+    def test_cache_updated_after_successful_submit(
+        self, mock_provider_for_comment_flow, cached_needs_work,
+    ):
+        from raven.server import _previous_diffs
+        with patch("raven.server.respond_to_comment") as mock_respond, \
+             patch("raven.server._safe_do_merge"):
+            mock_respond.return_value = {
+                "response": "yes",
+                "revise": {"verdict": "approve", "body": "Revised"},
+                "retract_findings": [],
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        entry = _previous_diffs["gitea:u/r#1"]
+        assert entry.verdict == "approve"
+        assert entry.summary == "Revised"
+
+    def test_submit_failure_leaves_cache_unchanged(
+        self, mock_provider_for_comment_flow, cached_needs_work,
+    ):
+        from raven.server import _previous_diffs
+        mock_provider_for_comment_flow.submit_review.side_effect = RuntimeError("api down")
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {
+                "response": "x",
+                "revise": {"verdict": "approve", "body": "Revised"},
+                "retract_findings": [],
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        entry = _previous_diffs["gitea:u/r#1"]
+        assert entry.verdict == "needs_work"
+
+    def test_auto_merge_dispatched_on_flip_to_approve(
+        self, mock_provider_for_comment_flow, cached_needs_work, monkeypatch,
+    ):
+        from concurrent.futures import Future
+        submitted = []
+
+        class _Capture:
+            def submit(self, fn, *args, **kwargs):
+                submitted.append((fn, args, kwargs))
+                fut = Future(); fut.set_result(None); return fut
+            def shutdown(self, **kwargs): pass
+
+        monkeypatch.setattr("raven.server.ci_wait_executor", _Capture())
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {
+                "response": "ok",
+                "revise": {"verdict": "approve", "body": "Revised"},
+                "retract_findings": [],
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        assert submitted, "Expected ci_wait_executor.submit on flip-to-approve"
+
+    def test_no_auto_merge_on_flip_to_needs_work(self, mock_provider_for_comment_flow, monkeypatch):
+        from raven.server import CacheEntry, _previous_diffs
+        pr_key = "gitea:u/r#1"
+        _previous_diffs[pr_key] = CacheEntry(
+            timestamp=0.0, hashes={}, findings={},
+            verdict="approve", summary="LGTM",
+        )
+        try:
+            submitted = []
+            from concurrent.futures import Future
+
+            class _Capture:
+                def submit(self, fn, *args, **kwargs):
+                    submitted.append((fn, args, kwargs))
+                    fut = Future(); fut.set_result(None); return fut
+                def shutdown(self, **kwargs): pass
+
+            monkeypatch.setattr("raven.server.ci_wait_executor", _Capture())
+            with patch("raven.server.respond_to_comment") as mock_respond:
+                mock_respond.return_value = {
+                    "response": "wait",
+                    "revise": {"verdict": "needs_work", "body": "Found another issue"},
+                    "retract_findings": [],
+                }
+                _process_comment(mock_provider_for_comment_flow, self._payload())
+            assert not submitted
+        finally:
+            _previous_diffs.pop(pr_key, None)
+
+    def test_auto_merge_dispatched_on_retract_only_when_prior_approve(
+        self, mock_provider_for_comment_flow, monkeypatch,
+    ):
+        """Goal 3 regression guard: BB DC scenario where prior verdict
+        was 'approve' but auto-merge was blocked by unresolved comments.
+        Retraction succeeds → auto-merge MUST retry."""
+        from raven.server import CacheEntry, _previous_diffs
+        from concurrent.futures import Future
+        pr_key = "gitea:u/r#1"
+        _previous_diffs[pr_key] = CacheEntry(
+            timestamp=0.0, hashes={}, findings={},
+            verdict="approve", summary="LGTM",
+        )
+        submitted = []
+
+        class _Capture:
+            def submit(self, fn, *args, **kwargs):
+                submitted.append((fn, args, kwargs))
+                fut = Future(); fut.set_result(None); return fut
+            def shutdown(self, **kwargs): pass
+
+        monkeypatch.setattr("raven.server.ci_wait_executor", _Capture())
+        try:
+            mock_provider_for_comment_flow.retract_finding.return_value = True
+            with patch("raven.server.respond_to_comment") as mock_respond:
+                mock_respond.return_value = {
+                    "response": "you're right",
+                    "revise": None,
+                    "retract_findings": [10],
+                }
+                _process_comment(mock_provider_for_comment_flow, {
+                    "repo": "u/r", "pr_number": 1,
+                    "comment_body": "?", "comment_id": 99,
+                    "parent_comment_id": 10, "_is_mention": True,
+                    "file_path": "a.py", "line": 5,
+                })
+            mock_provider_for_comment_flow.retract_finding.assert_called_once()
+            mock_provider_for_comment_flow.submit_review.assert_not_called()
+            assert submitted, "Expected auto-merge dispatch on retraction-only with prior=approve"
+        finally:
+            _previous_diffs.pop(pr_key, None)
+
+
+class TestProcessCommentRaceGuard:
+    def test_comment_flow_does_not_add_itself_to_in_progress(
+        self, mock_provider_for_comment_flow, cached_needs_work, monkeypatch,
+    ):
+        """Asymmetric semantics: comment-flow gives push priority by
+        checking _in_progress_prs, but must NOT add itself — otherwise
+        a fresh push webhook arriving during the comment-flow's
+        ~30-60s synchronous sequence would be dropped at server.py:553
+        and the new commits never get reviewed.
+
+        It DOES add itself to _comment_mutating_prs so a concurrent
+        second comment-flow on the same PR serializes.
+        """
+        from raven.server import (
+            _in_progress_prs, _comment_mutating_prs, _in_progress_lock,
+        )
+        pr_key = "gitea:u/r#1"
+
+        # Capture set membership at submit_review call time.
+        captured = {}
+        def _capture_then_return(*args, **kwargs):
+            with _in_progress_lock:
+                captured["in_progress_prs"] = pr_key in _in_progress_prs
+                captured["comment_mutating"] = pr_key in _comment_mutating_prs
+            return {"id": 1, "inline_comments": []}
+        mock_provider_for_comment_flow.submit_review.side_effect = _capture_then_return
+        # Also patch _safe_do_merge so the inline-executor autouse fixture
+        # doesn't run real CI polling.
+        with patch("raven.server.respond_to_comment") as mock_respond, \
+             patch("raven.server._safe_do_merge"):
+            mock_respond.return_value = {
+                "response": "ok",
+                "revise": {"verdict": "approve", "body": "Revised"},
+                "retract_findings": [],
+            }
+            _process_comment(mock_provider_for_comment_flow, {
+                "repo": "u/r", "pr_number": 1,
+                "comment_body": "?", "comment_id": 12,
+                "parent_comment_id": None, "_is_mention": True,
+            })
+        # Mid-flight: pr_key was NOT in _in_progress_prs (push set),
+        # but IS in _comment_mutating_prs (concurrent-comment exclusion).
+        assert captured["in_progress_prs"] is False
+        assert captured["comment_mutating"] is True
+        # And after: comment-mutation slot released.
+        with _in_progress_lock:
+            assert pr_key not in _comment_mutating_prs
+            assert pr_key not in _in_progress_prs
+
+    def test_in_progress_skips_revision_and_retraction(
+        self, mock_provider_for_comment_flow, cached_needs_work,
+    ):
+        """If the PR is already in _in_progress_prs (push re-review),
+        skip mutations but still post the reply."""
+        from raven.server import _in_progress_prs, _in_progress_lock
+        pr_key = "gitea:u/r#1"
+        with _in_progress_lock:
+            _in_progress_prs.add(pr_key)
+        try:
+            with patch("raven.server.respond_to_comment") as mock_respond:
+                mock_respond.return_value = {
+                    "response": "ok",
+                    "revise": {"verdict": "approve", "body": "Revised"},
+                    "retract_findings": [10],
+                }
+                _process_comment(mock_provider_for_comment_flow, {
+                    "repo": "u/r", "pr_number": 1,
+                    "comment_body": "?", "comment_id": 12,
+                    "parent_comment_id": 10, "_is_mention": True,
+                    "file_path": "a.py", "line": 5,
+                })
+            mock_provider_for_comment_flow.submit_review.assert_not_called()
+            mock_provider_for_comment_flow.retract_finding.assert_not_called()
+            mock_provider_for_comment_flow.post_pr_comment.assert_called()  # reply still went out
+        finally:
+            with _in_progress_lock:
+                _in_progress_prs.discard(pr_key)
+
+    def test_concurrent_comment_flow_skips_mutations(
+        self, mock_provider_for_comment_flow, cached_needs_work,
+    ):
+        """When another comment-flow is mid-mutation for the same PR
+        (entry in _comment_mutating_prs), the second one bails before
+        submit_review — protects against both flows submitting opposing
+        reviews + dismissing each other's. Reply still posts."""
+        from raven.server import _comment_mutating_prs, _in_progress_lock
+        pr_key = "gitea:u/r#1"
+        with _in_progress_lock:
+            _comment_mutating_prs.add(pr_key)
+        try:
+            with patch("raven.server.respond_to_comment") as mock_respond:
+                mock_respond.return_value = {
+                    "response": "ok",
+                    "revise": {"verdict": "approve", "body": "Revised"},
+                    "retract_findings": [10],
+                }
+                _process_comment(mock_provider_for_comment_flow, {
+                    "repo": "u/r", "pr_number": 1,
+                    "comment_body": "?", "comment_id": 12,
+                    "parent_comment_id": 10, "_is_mention": True,
+                    "file_path": "a.py", "line": 5,
+                })
+            mock_provider_for_comment_flow.submit_review.assert_not_called()
+            mock_provider_for_comment_flow.retract_finding.assert_not_called()
+            mock_provider_for_comment_flow.post_pr_comment.assert_called()  # reply still went out
+        finally:
+            with _in_progress_lock:
+                _comment_mutating_prs.discard(pr_key)
+
+    def test_verdict_none_skips_revise_server_side(self, mock_provider_for_comment_flow):
+        """Server enforces 'no revise without prior verdict' regardless
+        of AI behaviour (defense in depth)."""
+        # No cache entry → prior_verdict is None
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {
+                "response": "...",
+                "revise": {"verdict": "approve", "body": "AI ignored the rule"},
+                "retract_findings": [],
+            }
+            _process_comment(mock_provider_for_comment_flow, {
+                "repo": "u/r", "pr_number": 1,
+                "comment_body": "?", "comment_id": 12,
+                "parent_comment_id": None, "_is_mention": True,
+            })
+        mock_provider_for_comment_flow.submit_review.assert_not_called()
+        mock_provider_for_comment_flow.post_pr_comment.assert_called()
+
+    def test_prior_verdict_changed_under_guard_skips_mutations(
+        self, mock_provider_for_comment_flow,
+    ):
+        """If a concurrent _process_pr changed the cache verdict between
+        the AI call and the under-guard re-check, mutations are skipped."""
+        from raven.server import CacheEntry, _previous_diffs
+        pr_key = "gitea:u/r#1"
+        _previous_diffs[pr_key] = CacheEntry(
+            timestamp=0.0, hashes={}, findings={},
+            verdict="approve", summary="LGTM",
+        )
+
+        def _flip_cache_during_ai(*args, **kwargs):
+            _previous_diffs[pr_key].verdict = "needs_work"
+            _previous_diffs[pr_key].summary = "Push found issues"
+            return {
+                "response": "ok",
+                "revise": {"verdict": "needs_work", "body": "Reconsidered"},
+                "retract_findings": [],
+            }
+
+        try:
+            with patch("raven.server.respond_to_comment",
+                       side_effect=_flip_cache_during_ai):
+                _process_comment(mock_provider_for_comment_flow, {
+                    "repo": "u/r", "pr_number": 1,
+                    "comment_body": "?", "comment_id": 12,
+                    "parent_comment_id": None, "_is_mention": True,
+                })
+            mock_provider_for_comment_flow.post_pr_comment.assert_called()  # reply still out
+            mock_provider_for_comment_flow.submit_review.assert_not_called()
+        finally:
+            _previous_diffs.pop(pr_key, None)
