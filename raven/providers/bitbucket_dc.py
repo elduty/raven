@@ -367,7 +367,14 @@ class BitbucketDCProvider(GitProvider):
                         comment_id: int) -> bool:
         """Resolve a previously-posted inline review comment.
         Uses BB DC's PUT /comments/{id} with state=RESOLVED + version.
-        Returns False on 403/404/409 without raising."""
+        Returns False on 403/404/409 without raising.
+
+        On any non-2xx, logs the response body (truncated to 500 chars)
+        so operators can read BB DC's validation context — the v8.9+
+        resolve API contract isn't well-documented in the wild and 400
+        responses contain a `context` field pointing at the failing
+        request field, which is exactly what we need to debug.
+        """
         project, repo = _split_repo(repo_full_name)
         base = (
             f"{self.api_url}/projects/{project}/repos/{repo}"
@@ -384,13 +391,16 @@ class BitbucketDCProvider(GitProvider):
                 base, json={"state": "RESOLVED", "version": version}, timeout=10,
             )
             if put_resp.status_code in (403, 404, 409):
-                logger.warning("BB DC retract comment %s failed: HTTP %s",
-                               comment_id, put_resp.status_code)
+                logger.warning("BB DC retract comment %s failed: HTTP %s — body: %s",
+                               comment_id, put_resp.status_code,
+                               (put_resp.text or "")[:500])
                 return False
             put_resp.raise_for_status()
             return True
         except requests.HTTPError as e:
-            logger.warning("BB DC retract comment %s failed: %s", comment_id, e)
+            body = getattr(e.response, "text", "") or ""
+            logger.warning("BB DC retract comment %s failed: %s — body: %s",
+                           comment_id, e, body[:500])
             return False
 
     def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
