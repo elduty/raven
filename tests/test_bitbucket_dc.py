@@ -1251,3 +1251,91 @@ class TestSubmitReviewInlineIds:
         ic = result["inline_comments"]
         assert ic[0]["comment_id"] == 500
         assert ic[1]["comment_id"] is None
+
+
+# ------------------------------------------------------------------ #
+#  User-resolved-findings filter: get_resolved_comment_ids            #
+# ------------------------------------------------------------------ #
+
+class TestGetResolvedCommentIds:
+    """``get_resolved_comment_ids`` returns the set of top-level thread
+    root IDs the developer has marked resolved on the PR. Both
+    ``threadResolved=true`` (UI's "Resolve thread" button per the
+    RestComment OpenAPI spec) and the legacy ``state="RESOLVED"`` task
+    enum count. Used by ``_process_pr``'s carry-forward filter to drop
+    user-resolved findings from the consolidated verdict."""
+
+    def _activities_response(self, threads, is_last=True, next_start=None):
+        return {
+            "values": [{"action": "COMMENTED", "comment": t} for t in threads],
+            "isLastPage": is_last,
+            "nextPageStart": next_start or 0,
+        }
+
+    def test_collects_threadresolved_and_state_resolved(self, client):
+        """Both signals are collected. threadResolved is the modern
+        path the UI uses; state=RESOLVED is the legacy task-resolved
+        path. A non-resolved thread is NOT in the set."""
+        threads = [
+            # Thread-resolved via UI (modern path)
+            {"id": 100, "threadResolved": True, "state": "OPEN", "comments": []},
+            # Resolved task (legacy path)
+            {"id": 200, "threadResolved": False, "state": "RESOLVED", "comments": []},
+            # Open thread — excluded
+            {"id": 300, "threadResolved": False, "state": "OPEN", "comments": []},
+        ]
+        with _mock_get(client, status=200,
+                       json_data=self._activities_response(threads)):
+            resolved = client.get_resolved_comment_ids("proj/repo", 1)
+        assert resolved == {100, 200}
+
+    def test_returns_empty_when_no_activities(self, client):
+        with _mock_get(client, status=200,
+                       json_data=self._activities_response([])):
+            assert client.get_resolved_comment_ids("proj/repo", 1) == set()
+
+    def test_returns_empty_on_http_error(self, client):
+        """Transient API failure → empty set, no raise. The review
+        proceeds without filtering rather than blocking."""
+        from requests import HTTPError
+        mock_resp = MagicMock(status_code=500)
+        mock_resp.raise_for_status.side_effect = HTTPError("500")
+        with patch.object(client.session, "get", return_value=mock_resp):
+            assert client.get_resolved_comment_ids("proj/repo", 1) == set()
+
+    def test_only_collects_top_level_thread_roots(self, client):
+        """Raven posts inline review comments as top-level threads, so
+        their ``comment_id`` is always the thread root. We only collect
+        from top-level — nested replies are ignored even if marked
+        resolved on their own (which BB DC doesn't allow anyway)."""
+        threads = [
+            {"id": 100, "threadResolved": True, "state": "OPEN",
+             "comments": [
+                # A nested resolved-state comment — must NOT leak into the set
+                {"id": 101, "threadResolved": True, "state": "RESOLVED", "comments": []},
+             ]},
+        ]
+        with _mock_get(client, status=200,
+                       json_data=self._activities_response(threads)):
+            resolved = client.get_resolved_comment_ids("proj/repo", 1)
+        assert resolved == {100}
+
+    def test_paginates_activities(self, client):
+        page1 = self._activities_response(
+            [{"id": 10, "threadResolved": True, "state": "OPEN", "comments": []}],
+            is_last=False, next_start=50,
+        )
+        page2 = self._activities_response(
+            [{"id": 20, "threadResolved": True, "state": "OPEN", "comments": []}],
+            is_last=True,
+        )
+        pages = [page1, page2]
+        def fake_get(url, params=None, timeout=None):
+            start = (params or {}).get("start", 0)
+            mr = MagicMock(status_code=200)
+            mr.raise_for_status = MagicMock()
+            mr.json.return_value = pages[0] if start == 0 else pages[1]
+            return mr
+        with patch.object(client.session, "get", side_effect=fake_get):
+            resolved = client.get_resolved_comment_ids("proj/repo", 1)
+        assert resolved == {10, 20}

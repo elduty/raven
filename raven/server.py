@@ -786,6 +786,47 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             )
         # Save original findings before merging carried ones (used for cache write)
         fresh_findings = list(review.get("findings", []))
+
+        # Drop cached findings whose backing inline comment the developer
+        # marked resolved via the platform UI (Gitea ≥1.24 /resolve;
+        # BB DC "Resolve thread" → threadResolved=true). Symmetric to the
+        # AI-driven retraction in _process_comment: that flow is Raven
+        # resolving on the AI's behalf; this one is Raven respecting the
+        # user's direct dismissal. Without this filter, an incremental
+        # re-review carries the resolved finding forward and re-includes
+        # it in the consolidated verdict — the user sees the same
+        # complaint after explicitly resolving it.
+        #
+        # cached_findings is a reference into _previous_diffs[pr_key].findings,
+        # so mutating in place propagates to both (a) the carry-forward
+        # block below and (b) the cache write at line ~908 — net effect
+        # is "drop from cache" without needing a second pass. The atomic
+        # guards (_in_progress_prs, _comment_mutating_prs) ensure no
+        # other flow is reading concurrently.
+        if is_incremental and cached_findings:
+            try:
+                resolved_ids = provider.get_resolved_comment_ids(repo_full_name, pr_number)
+            except Exception as e:
+                logger.warning(
+                    "get_resolved_comment_ids for PR #%d failed: %s — proceeding without filter",
+                    pr_number, e,
+                )
+                resolved_ids = set()
+            if resolved_ids:
+                dropped_total = 0
+                for fname, file_findings in list(cached_findings.items()):
+                    kept = [f for f in file_findings if f.get("comment_id") not in resolved_ids]
+                    if len(kept) != len(file_findings):
+                        dropped_total += len(file_findings) - len(kept)
+                        cached_findings[fname] = kept
+                if dropped_total:
+                    logger.info(
+                        "PR #%d: dropped %d user-resolved finding(s) from carry-forward",
+                        pr_number, dropped_total,
+                    )
+                    for _ in range(dropped_total):
+                        inc("raven_user_resolved_findings_dropped_total", {"repo": repo_full_name})
+
         # Merge carried findings from unchanged files into the review
         if is_incremental and cached_findings:
             carried = []

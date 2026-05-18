@@ -915,3 +915,71 @@ class TestSubmitReviewInlineIds:
                 "u/r", 1, "body", approve=True, inline_comments=inline,
             )
         assert result["inline_comments"][0]["comment_id"] is None
+
+
+# ------------------------------------------------------------------ #
+#  User-resolved-findings filter: get_resolved_comment_ids            #
+# ------------------------------------------------------------------ #
+
+class TestGetResolvedCommentIds:
+    """``get_resolved_comment_ids`` returns IDs of review comments
+    where the ``resolver`` field is populated. Used by ``_process_pr``'s
+    carry-forward filter to drop user-resolved findings from the
+    consolidated verdict so the user doesn't see the same complaint
+    after explicitly resolving it."""
+
+    def _reviews_and_comments(self, comments):
+        """Return a mock get(...) side-effect that serves the reviews
+        list, then the per-review comments list. Single review with all
+        comments for simplicity."""
+        reviews_resp = MagicMock(status_code=200)
+        reviews_resp.raise_for_status = MagicMock()
+        reviews_resp.json.return_value = [{"id": 1, "comments_count": len(comments)}]
+        comments_resp = MagicMock(status_code=200)
+        comments_resp.raise_for_status = MagicMock()
+        comments_resp.json.return_value = comments
+        # First call → reviews; subsequent → comments page 1, then empty.
+        empty_resp = MagicMock(status_code=200)
+        empty_resp.raise_for_status = MagicMock()
+        empty_resp.json.return_value = []
+        responses = [reviews_resp, comments_resp, empty_resp, empty_resp]
+        idx = [0]
+        def fake_get(url, params=None, timeout=None):
+            r = responses[min(idx[0], len(responses) - 1)]
+            idx[0] += 1
+            return r
+        return fake_get
+
+    def test_collects_resolved_comments(self, client):
+        """``resolver`` populated → in the set. Unresolved → excluded."""
+        comments = [
+            {"id": 100, "resolver": {"login": "alice"}, "path": "a.py", "position": 5},
+            {"id": 200, "resolver": None, "path": "a.py", "position": 10},
+            {"id": 300, "resolver": {"login": "bob"}, "path": "b.py", "position": 1},
+        ]
+        with patch.object(client.session, "get",
+                          side_effect=self._reviews_and_comments(comments)):
+            resolved = client.get_resolved_comment_ids("u/r", 1)
+        assert resolved == {100, 300}
+
+    def test_returns_empty_when_resolver_field_absent(self, client):
+        """Pre-1.24 Gitea doesn't expose the ``resolver`` field — every
+        comment looks unresolved, so the set is empty. Carry-forward
+        degrades to current behavior on older Gitea."""
+        comments = [
+            {"id": 100, "path": "a.py", "position": 5},  # no resolver key
+            {"id": 200, "path": "b.py", "position": 1},
+        ]
+        with patch.object(client.session, "get",
+                          side_effect=self._reviews_and_comments(comments)):
+            resolved = client.get_resolved_comment_ids("u/r", 1)
+        assert resolved == set()
+
+    def test_returns_empty_on_reviews_http_error(self, client):
+        """API failure on the reviews list → empty set, no raise.
+        Filtering is best-effort; review must proceed."""
+        import requests
+        get_resp = MagicMock(status_code=500)
+        get_resp.raise_for_status.side_effect = requests.HTTPError("boom")
+        with patch.object(client.session, "get", return_value=get_resp):
+            assert client.get_resolved_comment_ids("u/r", 1) == set()

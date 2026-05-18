@@ -2110,6 +2110,101 @@ class TestIncrementalReview:
     # 3-tuple path is exercised in TestCachePersistence via the actual
     # JSON load route — see test_load_legacy_3tuple_entries_yields_none_verdict.
 
+    def test_user_resolved_findings_dropped_from_carry_forward(self):
+        """When the developer marks an inline finding resolved via the
+        platform UI (Gitea /resolve, BB DC "Resolve thread"), the next
+        incremental review must drop it from carry-forward — otherwise
+        the consolidated verdict re-litigates a dismissed complaint.
+        Cache mutation propagates so the resolved finding is also
+        removed from the cache write later in _process_pr."""
+        import hashlib, time as _time
+        hash_a = hashlib.sha256("diff --git a/a.py b/a.py\n+old\n".encode()).hexdigest()
+        hash_b = hashlib.sha256("diff --git a/b.py b/b.py\n+stable\n".encode()).hexdigest()
+        # Two findings on unchanged b.py: one user-resolved (comment_id=42),
+        # one still open (comment_id=43). After filtering, only 43 carries.
+        cached_findings = {
+            "a.py": [],
+            "b.py": [
+                {"severity": "high", "file": "b.py", "line": 10,
+                 "message": "developer dismissed this", "comment_id": 42},
+                {"severity": "medium", "file": "b.py", "line": 20,
+                 "message": "still valid", "comment_id": 43},
+            ],
+        }
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(
+            timestamp=_time.time(),
+            hashes={"a.py": hash_a, "b.py": hash_b},
+            findings=cached_findings,
+        )
+        new_diff = "diff --git a/a.py b/a.py\n+new\ndiff --git a/b.py b/b.py\n+stable\n"
+        mc = self._make_provider()
+        # Developer resolved comment 42 in the UI; provider reports it.
+        mc.get_resolved_comment_ids.return_value = {42}
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+        ):
+            mc.fetch_pr_diff.return_value = new_diff
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.get_authenticated_user.return_value = "Raven"
+            mc.get_pr_reviews.side_effect = [
+                [],
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],
+            ]
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+        # The submitted review body must NOT include the dismissed
+        # finding's message, but MUST include the still-valid one.
+        submitted_body = mc.submit_review.call_args[0][2]
+        assert "developer dismissed this" not in submitted_body
+        assert "still valid" in submitted_body
+        # The cache must be filtered too — the dismissed entry is gone
+        # so the next push doesn't re-check it.
+        cached_after = _previous_diffs["gitea:owner/repo#42"].findings.get("b.py", [])
+        kept_ids = {f.get("comment_id") for f in cached_after}
+        assert 42 not in kept_ids
+        assert 43 in kept_ids
+
+    def test_get_resolved_comment_ids_failure_proceeds_without_filter(self):
+        """Provider API failure must not block the review — fall back
+        to current behavior (no filtering) so the user can still get
+        an incremental review even if the resolved-state lookup is
+        temporarily unavailable."""
+        import hashlib, time as _time
+        hash_a = hashlib.sha256("diff --git a/a.py b/a.py\n+old\n".encode()).hexdigest()
+        hash_b = hashlib.sha256("diff --git a/b.py b/b.py\n+stable\n".encode()).hexdigest()
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(
+            timestamp=_time.time(),
+            hashes={"a.py": hash_a, "b.py": hash_b},
+            findings={"a.py": [], "b.py": [
+                {"severity": "high", "file": "b.py", "line": 10,
+                 "message": "carry me", "comment_id": 42},
+            ]},
+        )
+        new_diff = "diff --git a/a.py b/a.py\n+new\ndiff --git a/b.py b/b.py\n+stable\n"
+        mc = self._make_provider()
+        mc.get_resolved_comment_ids.side_effect = RuntimeError("transient outage")
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+        ):
+            mc.fetch_pr_diff.return_value = new_diff
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.get_authenticated_user.return_value = "Raven"
+            mc.get_pr_reviews.side_effect = [
+                [],
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],
+            ]
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+        # Finding still carries — no filter applied.
+        submitted_body = mc.submit_review.call_args[0][2]
+        assert "carry me" in submitted_body
+
 
 class TestReviewEvent:
     """Verify that review severity maps to the correct approve flag."""

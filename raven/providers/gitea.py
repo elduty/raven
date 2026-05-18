@@ -273,6 +273,22 @@ class GiteaProvider(GitProvider):
             logger.warning("Gitea retract comment %s failed: %s", comment_id, e)
             return False
 
+    def get_resolved_comment_ids(self, repo_full_name: str, pr_number: int) -> set[int]:
+        """Return IDs of review comments the developer has marked resolved.
+
+        Reuses ``_fetch_review_comments`` (paginated across all reviews)
+        and emits IDs where ``resolver`` is populated. The ``resolver``
+        field is added in Gitea 1.24 alongside the ``/resolve`` endpoint
+        — on older Gitea the field is simply absent and this returns an
+        empty set (no filtering applied to carry-forward, which matches
+        existing behavior on pre-1.24 instances).
+        """
+        all_comments = self._fetch_review_comments(repo_full_name, pr_number)
+        return {
+            c["id"] for c in all_comments
+            if c.get("resolver") is not None and isinstance(c.get("id"), int)
+        }
+
     def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
         """Return all comments on a PR (paginated)."""
         owner, repo = _split_repo(repo_full_name)

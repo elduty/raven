@@ -459,6 +459,54 @@ class BitbucketDCProvider(GitProvider):
                            comment_id, e, body[:500])
             return False
 
+    def get_resolved_comment_ids(self, repo_full_name: str, pr_number: int) -> set[int]:
+        """Return IDs of comments the developer has marked resolved.
+
+        Scans the activities endpoint (the same source ``get_comment_thread``
+        uses) and emits IDs of top-level thread roots where either
+        ``threadResolved is True`` (the boolean BB DC's "Resolve thread"
+        UI button sets per the RestComment schema) or
+        ``state == "RESOLVED"`` (legacy resolved-task path for
+        severity=BLOCKER comments). Both signals are checked because the
+        read-side audit cleanup found that thread-resolved comments leave
+        ``state`` at OPEN — relying on ``state`` alone misses every
+        UI-resolved thread.
+
+        Raven posts inline review comments at the top level, so checking
+        thread roots is sufficient for the carry-forward filter: a Raven
+        finding's ``comment_id`` is always the root of its thread. On
+        any HTTP error returns ``set()`` — the review proceeds without
+        filtering rather than blocking on a transient outage.
+        """
+        project, repo = _split_repo(repo_full_name)
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/activities"
+        resolved: set[int] = set()
+        start = 0
+        max_pages = 10
+        for _ in range(max_pages):
+            try:
+                resp = self.session.get(url, params={"start": start, "limit": 50}, timeout=10)
+                resp.raise_for_status()
+            except requests.HTTPError as e:
+                logger.warning("BB DC get_resolved_comment_ids for PR #%d failed: %s", pr_number, e)
+                return set()
+            data = resp.json()
+            for activity in data.get("values", []):
+                if activity.get("action") != "COMMENTED":
+                    continue
+                top = activity.get("comment")
+                if not top:
+                    continue
+                if (top.get("threadResolved") is True
+                        or top.get("state") == "RESOLVED"):
+                    cid = top.get("id")
+                    if isinstance(cid, int):
+                        resolved.add(cid)
+            if data.get("isLastPage", True):
+                break
+            start = data.get("nextPageStart", start + 50)
+        return resolved
+
     def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
         """Return all comments on a PR via the activities endpoint."""
         project, repo = _split_repo(repo_full_name)

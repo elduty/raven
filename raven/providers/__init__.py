@@ -212,6 +212,40 @@ class GitProvider(ABC):
         """
         return {}
 
+    def get_resolved_comment_ids(self, repo: str, pr_number: int) -> set[int]:
+        """Return the set of comment IDs the developer has marked
+        resolved on this PR (via the platform UI's "Resolve thread" /
+        "Resolve conversation" button).
+
+        Used by ``_process_pr``'s carry-forward block to filter out
+        cached findings whose backing inline comment was user-resolved
+        between pushes, so the consolidated verdict on the next push
+        doesn't re-litigate dismissed feedback. Symmetric to the
+        AI-driven retraction in ``_process_comment``: that path is
+        Raven resolving on the AI's behalf; this one is Raven respecting
+        the user's direct resolution.
+
+        Provider notes:
+          - BB DC: scans the activities endpoint and returns top-level
+            thread roots where ``threadResolved is True`` (the boolean
+            the "Resolve thread" UI button sets per the RestComment
+            schema) OR ``state == "RESOLVED"`` (legacy resolved-task
+            path for severity=BLOCKER comments). Raven posts inline
+            review comments at the top level, so checking roots is
+            sufficient.
+          - Gitea (>=1.24): scans review comments and returns IDs where
+            ``resolver is not None``. Older Gitea returns an empty set
+            (no resolved-state field exposed) — degrades to current
+            behavior (no filtering).
+
+        Default returns ``set()`` — out-of-tree providers degrade
+        gracefully (no filtering). Implementations must be best-effort:
+        return an empty set on API failure rather than raise, since the
+        review proceeds regardless and a temporary outage shouldn't
+        block it.
+        """
+        return set()
+
 
 # Provider registry — populated at app startup
 _providers: dict[str, GitProvider] = {}
