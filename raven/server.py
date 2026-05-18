@@ -1318,8 +1318,8 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 and ((c.get("user") or {}).get("login") or "").lower() == raven_user_lc
                 and raven_user_lc
             }
-            to_retract = [cid for cid in retract_findings if cid in raven_owned_ids]
-            dropped = set(retract_findings) - set(to_retract)
+            to_retract_seeds = [cid for cid in retract_findings if cid in raven_owned_ids]
+            dropped = set(retract_findings) - set(to_retract_seeds)
             if dropped:
                 # WARNING (not DEBUG): when the AI tries to retract IDs
                 # we can't honor (not in thread, or not authored by us),
@@ -1328,6 +1328,48 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 # outside and is hard to diagnose.
                 logger.warning("Dropped %d retract IDs not authored by Raven or absent from thread: %s",
                                len(dropped), dropped)
+
+            # The AI may pick a reply id from the thread, but BB DC
+            # (v8.9+) only resolves the THREAD ROOT — calling
+            # state=RESOLVED on a comment with a parent returns 400
+            # "Cannot resolve a comment with a parent comment." BB DC's
+            # GET /comments/{id} response shape has no parent field so
+            # the provider can't walk up via API. The thread tree we
+            # already fetched does carry parent_id linkage (filled in
+            # from the nested-children response during get_comment_thread),
+            # so we walk to root here in memory.
+            parent_map: dict[int, int | None] = {
+                c.get("id"): c.get("parent_id")
+                for c in thread if c.get("id") is not None
+            }
+
+            def _walk_to_root(start_id: int) -> int:
+                """Walk parent_id chain in the in-memory thread; cycle-safe."""
+                seen: set[int] = set()
+                cur = start_id
+                while (cur in parent_map
+                        and parent_map[cur] is not None
+                        and cur not in seen):
+                    seen.add(cur)
+                    cur = parent_map[cur]
+                return cur
+
+            # Resolve each retract candidate to its thread root. The
+            # root may NOT be Raven-authored (e.g., the AI is replying
+            # inside a developer-rooted thread); only resolve when the
+            # root is also Raven-authored — we only resolve threads
+            # Raven itself originated.
+            to_retract: list[int] = []
+            for cid in to_retract_seeds:
+                root_cid = _walk_to_root(cid)
+                if root_cid not in raven_owned_ids:
+                    logger.warning(
+                        "Dropped retract %s — thread root %s not authored by Raven",
+                        cid, root_cid,
+                    )
+                    continue
+                if root_cid not in to_retract:  # dedupe: multiple seeds may share a root
+                    to_retract.append(root_cid)
 
             any_retraction_succeeded = False
             for cid in to_retract:

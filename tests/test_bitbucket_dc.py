@@ -1113,69 +1113,6 @@ class TestRetractFinding:
              patch.object(client.session, "put", return_value=put_resp):
             assert client.retract_finding("proj/repo", 1, 42) is False
 
-    def test_walks_up_to_thread_root_before_resolving(self, client):
-        """BB DC rejects state=RESOLVED on comments that have a parent
-        ("Cannot resolve a comment with a parent comment."). When the
-        AI picks a reply ID instead of the original finding's ID,
-        retract_finding must walk UP to the root and resolve THAT.
-
-        Reproduces the production failure: AI passed id=263325 (a reply),
-        BB DC returned 400. Expected behavior: walk up to root, PUT on
-        root's id."""
-        # Fake comment graph:
-        #   id=10 (root, no parent)
-        #     id=20 (parent=10)
-        #       id=30 (parent=20) <-- AI picks this one
-        nodes = {
-            10: {"id": 10, "version": 7, "parent": None},
-            20: {"id": 20, "version": 4, "parent": {"id": 10}},
-            30: {"id": 30, "version": 2, "parent": {"id": 20}},
-        }
-        get_calls = []
-        def fake_get(url, timeout=None):
-            cid = int(url.rstrip("/").split("/")[-1])
-            get_calls.append(cid)
-            mr = MagicMock(status_code=200)
-            mr.raise_for_status = MagicMock()
-            mr.json.return_value = nodes[cid]
-            return mr
-        put_resp = MagicMock(status_code=200)
-        put_resp.raise_for_status = MagicMock()
-        with patch.object(client.session, "get", side_effect=fake_get), \
-             patch.object(client.session, "put", return_value=put_resp) as mock_put:
-            assert client.retract_finding("proj/repo", 1, 30) is True
-        # Walked up: fetched 30 → 20 → 10.
-        assert get_calls == [30, 20, 10]
-        # Resolved root (id=10) with root's version (7), not the seed's.
-        url, kwargs = mock_put.call_args[0][0], mock_put.call_args[1]
-        assert url.endswith("/comments/10")
-        assert kwargs["json"] == {"state": "RESOLVED", "version": 7}
-
-    def test_walks_up_terminates_on_missing_parent(self, client):
-        """Walk-up stops when parent fetch 404s; resolves whatever ancestor
-        we found (defensive against deleted/missing parents in BB DC)."""
-        nodes = {
-            20: {"id": 20, "version": 4, "parent": {"id": 999}},  # parent missing
-        }
-        def fake_get(url, timeout=None):
-            cid = int(url.rstrip("/").split("/")[-1])
-            if cid not in nodes:
-                return MagicMock(status_code=404)
-            mr = MagicMock(status_code=200)
-            mr.raise_for_status = MagicMock()
-            mr.json.return_value = nodes[cid]
-            return mr
-        put_resp = MagicMock(status_code=200)
-        put_resp.raise_for_status = MagicMock()
-        with patch.object(client.session, "get", side_effect=fake_get), \
-             patch.object(client.session, "put", return_value=put_resp) as mock_put:
-            # Seed 20 has a parent=999 that doesn't exist; walk-up stops
-            # at 20 itself and we resolve 20 (best-effort).
-            assert client.retract_finding("proj/repo", 1, 20) is True
-        url = mock_put.call_args[0][0]
-        assert url.endswith("/comments/20")
-
-
 # ------------------------------------------------------------------ #
 #  Comment-thread-context: submit_review returns per-inline IDs       #
 # ------------------------------------------------------------------ #

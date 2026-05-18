@@ -3773,7 +3773,7 @@ class TestProcessCommentRetraction:
             comment).
         Mock thread has id=10 (raven) and id=11 (alice). AI returns
         [10, 11, 9999]. After filtering, only Raven's own comment 10
-        survives."""
+        survives. 10 has no parent so root == 10."""
         with patch("raven.server.respond_to_comment") as mock_respond:
             mock_respond.return_value = {
                 "response": "ok", "revise": None,
@@ -3784,6 +3784,82 @@ class TestProcessCommentRetraction:
             call.args[2] for call in mock_provider_for_comment_flow.retract_finding.call_args_list
         )
         assert called_ids == [10]
+
+    def test_retract_walks_to_thread_root_from_reply(self, mock_provider_for_comment_flow):
+        """When the AI picks a Raven-authored REPLY id (not the original
+        finding's id), the server walks up the in-memory thread to the
+        root and resolves that. BB DC rejects state=RESOLVED on comments
+        with a parent — the GET response has no parent field so the
+        provider can't walk up via API; the caller does it using the
+        thread tree we already fetched.
+
+        Mock thread:
+          id=10 (raven, root, no parent)  <-- THE finding
+            id=20 (alice, reply)
+              id=30 (raven, reply)         <-- AI picks this
+        Expected: retract_finding called with id=10, not 30.
+        """
+        mock_provider_for_comment_flow.get_comment_thread.return_value = [
+            {"id": 10, "parent_id": None, "user": {"login": "raven"},
+             "body": "Original finding", "resolved": False},
+            {"id": 20, "parent_id": 10, "user": {"login": "alice"},
+             "body": "Not a bug", "resolved": False},
+            {"id": 30, "parent_id": 20, "user": {"login": "raven"},
+             "body": "Acknowledged — finding doesn't apply", "resolved": False},
+        ]
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {
+                "response": "ok", "revise": None,
+                "retract_findings": [30],  # AI picks its own reply, not the root
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        called_ids = [
+            call.args[2] for call in mock_provider_for_comment_flow.retract_finding.call_args_list
+        ]
+        # Walked up: 30 → 20 → 10. Resolve root.
+        assert called_ids == [10]
+
+    def test_retract_dedupes_when_multiple_replies_share_root(self, mock_provider_for_comment_flow):
+        """If the AI lists multiple Raven-authored replies in the same
+        thread, all walk to the same root — call retract_finding once,
+        not N times."""
+        mock_provider_for_comment_flow.get_comment_thread.return_value = [
+            {"id": 10, "parent_id": None, "user": {"login": "raven"}, "body": "X", "resolved": False},
+            {"id": 11, "parent_id": 10, "user": {"login": "raven"}, "body": "Y", "resolved": False},
+            {"id": 12, "parent_id": 11, "user": {"login": "raven"}, "body": "Z", "resolved": False},
+        ]
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {
+                "response": "ok", "revise": None,
+                "retract_findings": [10, 11, 12],  # all three
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        called_ids = [
+            call.args[2] for call in mock_provider_for_comment_flow.retract_finding.call_args_list
+        ]
+        # Three seeds collapse to a single root.
+        assert called_ids == [10]
+
+    def test_retract_drops_when_root_not_raven_authored(self, mock_provider_for_comment_flow):
+        """Defense: Raven joined a developer-rooted thread (e.g. answered
+        a @mention on a top-level discussion comment). The AI sees its
+        own reply marked [YOU], lists it for retract — but the thread
+        root is the developer's comment. We never resolve threads we
+        didn't originate; drop with a warning."""
+        mock_provider_for_comment_flow.get_comment_thread.return_value = [
+            {"id": 10, "parent_id": None, "user": {"login": "alice"},
+             "body": "Discussion starter", "resolved": False},
+            {"id": 20, "parent_id": 10, "user": {"login": "raven"},
+             "body": "@mention reply", "resolved": False},
+        ]
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {
+                "response": "ok", "revise": None,
+                "retract_findings": [20],  # Raven's own reply
+            }
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+        # 20 walks to root=10 (alice). Root not Raven-authored → drop.
+        mock_provider_for_comment_flow.retract_finding.assert_not_called()
 
     def test_retracts_skipped_when_pr_not_open(self, mock_provider_for_comment_flow):
         mock_provider_for_comment_flow.get_pr_state.return_value = "merged"
@@ -3796,22 +3872,22 @@ class TestProcessCommentRetraction:
         mock_provider_for_comment_flow.retract_finding.assert_not_called()
 
     def test_retract_failure_does_not_block_subsequent(self, mock_provider_for_comment_flow):
-        # Both ids must belong to Raven for the new authorship filter to
-        # keep them in `to_retract`. Override the default thread (which
-        # has id=10 raven + id=11 alice) with two raven-authored entries.
+        # Two independent Raven-rooted threads so they don't dedupe to
+        # a single root via the in-memory walk-up. (Within one thread,
+        # multiple [YOU]-marked entries collapse to the same root.)
         mock_provider_for_comment_flow.get_comment_thread.return_value = [
             {"id": 10, "parent_id": None, "user": {"login": "raven"},
-             "body": "Finding 1", "file_path": "a.py", "line": 5,
+             "body": "Finding A", "file_path": "a.py", "line": 5,
              "resolved": False},
-            {"id": 11, "parent_id": 10, "user": {"login": "raven"},
-             "body": "Finding 2", "file_path": "a.py", "line": 5,
+            {"id": 20, "parent_id": None, "user": {"login": "raven"},
+             "body": "Finding B", "file_path": "b.py", "line": 5,
              "resolved": False},
         ]
         mock_provider_for_comment_flow.retract_finding.side_effect = [False, True]
         with patch("raven.server.respond_to_comment") as mock_respond:
             mock_respond.return_value = {
                 "response": "ok", "revise": None,
-                "retract_findings": [10, 11],
+                "retract_findings": [10, 20],
             }
             _process_comment(mock_provider_for_comment_flow, self._payload())
         assert mock_provider_for_comment_flow.retract_finding.call_count == 2

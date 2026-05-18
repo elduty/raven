@@ -377,42 +377,43 @@ class BitbucketDCProvider(GitProvider):
 
     def retract_finding(self, repo_full_name: str, pr_number: int,
                         comment_id: int) -> bool:
-        """Resolve the thread containing the given comment.
+        """Resolve a comment thread.
 
-        BB DC v8.9+ supports comment-thread resolution via
+        BB DC v8.9+ resolves threads via
         ``PUT /comments/{id} {state: RESOLVED, version: N}`` — but ONLY
         on the thread root. Calling it on a comment that has a parent
         returns ``400 "Cannot resolve a comment with a parent comment."``
 
-        ``comment_id`` may be any node in the thread (the AI sometimes
-        picks a reply ID instead of the original finding); we walk UP
-        to the root and resolve that. End result is the same: the whole
-        thread shows as resolved in the BB DC UI.
+        **The caller is responsible for passing the thread root id.**
+        Walking up via ``GET /comments/{id}`` doesn't work here: BB DC's
+        ``ActivityComment`` response shape encodes children via nested
+        ``comments`` arrays but has no parent field, so a direct fetch
+        of a deep reply gives no way to find its root. The thread tree
+        IS available at the caller — ``get_comment_thread`` builds it
+        with ``parent_id`` filled in from the nested structure — so the
+        caller walks to root in-memory before invoking this method.
 
         Returns ``False`` on 403/404/409 without raising. On any
         non-2xx, logs the response body (truncated to 500 chars).
         """
         project, repo = _split_repo(repo_full_name)
+        base = (
+            f"{self.api_url}/projects/{project}/repos/{repo}"
+            f"/pull-requests/{pr_number}/comments/{comment_id}"
+        )
         try:
-            root = self._walk_to_thread_root(repo_full_name, pr_number, comment_id)
-            if root is None:
+            get_resp = self.session.get(base, timeout=10)
+            if get_resp.status_code == 404:
                 logger.debug("Cannot retract BB DC comment %s — 404", comment_id)
                 return False
-            root_id = root.get("id")
-            if root_id is None:
-                logger.warning("BB DC retract comment %s — thread root has no id", comment_id)
-                return False
-            base = (
-                f"{self.api_url}/projects/{project}/repos/{repo}"
-                f"/pull-requests/{pr_number}/comments/{root_id}"
-            )
-            version = root.get("version", 0)
+            get_resp.raise_for_status()
+            version = get_resp.json().get("version", 0)
             put_resp = self.session.put(
                 base, json={"state": "RESOLVED", "version": version}, timeout=10,
             )
             if put_resp.status_code in (403, 404, 409):
-                logger.warning("BB DC retract comment %s (root=%s) failed: HTTP %s — body: %s",
-                               comment_id, root_id, put_resp.status_code,
+                logger.warning("BB DC retract comment %s failed: HTTP %s — body: %s",
+                               comment_id, put_resp.status_code,
                                (put_resp.text or "")[:500])
                 return False
             put_resp.raise_for_status()
