@@ -910,7 +910,8 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
                         prompt_override: str | None = None,
                         thread: list[dict] | None = None,
                         prior_verdict: str | None = None,
-                        prior_body: str | None = None) -> dict:
+                        prior_body: str | None = None,
+                        raven_user: str = "") -> dict:
     """Generate a conversational response to a developer's comment.
 
     Returns a dict ``{response: str, revise: dict|None, retract_findings: list[int]}``.
@@ -921,6 +922,13 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
     When non-empty, the prompt includes ``## Active Thread`` and
     ``## Your Prior Verdict on This PR`` blocks; when empty, those sections
     are omitted.
+
+    ``raven_user`` is the bot's username on the platform (e.g. ``"jenkins.builder"``
+    on the operator's BB DC). When provided, the AI's own thread entries are
+    marked ``[YOU]`` in the rendered thread so the model doesn't have to
+    guess which entries are its own — that ambiguity was blocking retraction
+    in production (AI would acknowledge in text but leave ``retract_findings``
+    empty because the rule "only retract findings YOU posted" was unverifiable).
     """
     # User-controlled content (claude_md, diff, conversation, triggering
     # comment, code snippet, thread bodies, prior verdict body) is wrapped
@@ -964,13 +972,18 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
     thread_section = ""
     thread_for_prompt = _truncate_thread(thread or [])
     if thread_for_prompt:
+        raven_lc = (raven_user or "").lower()
         thread_lines = []
         for c in thread_for_prompt:
             user = c.get('user', {}).get('login', 'unknown')
             cid = c.get('id')
+            is_you = bool(raven_lc) and (user or "").lower() == raven_lc
+            you_marker = " [YOU]" if is_you else ""
             id_marker = f" [id={cid}]" if cid is not None else ""
             resolved = " [resolved]" if c.get("resolved") else ""
-            thread_lines.append(f"**{user}{id_marker}{resolved}:** {c.get('body', '')}")
+            thread_lines.append(
+                f"**{user}{you_marker}{id_marker}{resolved}:** {c.get('body', '')}"
+            )
         thread_text = "\n\n".join(thread_lines)
         thread_section = (
             "\n\n## Active Thread (you are replying inside this)\n"

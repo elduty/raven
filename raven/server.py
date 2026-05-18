@@ -1068,15 +1068,28 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 logger.warning("Thread fetch failed for PR #%s seed=%s: %s",
                                pr_number, seed_id, e)
 
+        # Fetch Raven's account name once up-front. Used by:
+        #   - Non-mention thread verification (below) — only respond when
+        #     Raven is already in the thread, so a reply-without-mention
+        #     can be intended for us.
+        #   - The AI prompt rendering — entries authored by ``raven_user``
+        #     get a ``[YOU]`` marker so the model can identify which
+        #     thread entries are its own findings (eligible for retract).
+        #   - The retract authorship filter — only IDs authored by
+        #     ``raven_user`` survive into ``to_retract``.
+        # Failure (auth/transport) degrades gracefully: empty string, no
+        # [YOU] markers, retract filter drops everything (safe — same as
+        # the prior behavior).
+        try:
+            raven_user = provider.get_authenticated_user() or ""
+        except Exception:
+            raven_user = ""
+
         # Thread verification. @mentions dispatched by the handler are
         # authoritative and skip this step. Reply-with-no-mention events
         # land here with is_mention=False; use the thread we already
         # fetched to decide whether Raven should engage at all.
         if not is_mention:
-            try:
-                raven_user = provider.get_authenticated_user()
-            except Exception:
-                raven_user = ""
             if not (raven_user and parent_comment_id):
                 logger.debug("Comment on PR #%s not directed at Raven — skipping",
                              pr_number)
@@ -1186,6 +1199,7 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 thread=thread,
                 prior_verdict=prior_verdict,
                 prior_body=prior_body,
+                raven_user=raven_user,
             )
         except RespondParseError as e:
             logger.warning("Respond JSON parse error for PR #%d: %s", pr_number, e)
@@ -1297,10 +1311,7 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             # a hallucinating AI (or a prompt-injection vector) from
             # resolving a developer's comment via the platform API. We
             # only ever retract our OWN findings.
-            try:
-                raven_user_lc = (provider.get_authenticated_user() or "").lower()
-            except Exception:
-                raven_user_lc = ""
+            raven_user_lc = raven_user.lower()
             raven_owned_ids = {
                 c.get("id") for c in thread
                 if c.get("id") is not None
@@ -1310,8 +1321,13 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             to_retract = [cid for cid in retract_findings if cid in raven_owned_ids]
             dropped = set(retract_findings) - set(to_retract)
             if dropped:
-                logger.debug("Dropped %d retract IDs not authored by Raven or absent from thread: %s",
-                             len(dropped), dropped)
+                # WARNING (not DEBUG): when the AI tries to retract IDs
+                # we can't honor (not in thread, or not authored by us),
+                # operators need to see it. A silent drop here on every
+                # comment looks identical to "AI didn't try" from the
+                # outside and is hard to diagnose.
+                logger.warning("Dropped %d retract IDs not authored by Raven or absent from thread: %s",
+                               len(dropped), dropped)
 
             any_retraction_succeeded = False
             for cid in to_retract:

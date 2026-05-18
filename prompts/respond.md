@@ -12,7 +12,10 @@ Read the active thread (if shown above), your prior verdict (if shown above), th
    - **DO revise when you retract findings that were the basis for `needs_work`.** If your retractions in this turn invalidate the reasons for your prior `needs_work` verdict, set `revise: {verdict: "approve", body: "..."}` — the basis for blocking is gone.
    - DON'T revise: clarifying questions you're answering, style disagreements without a clear resolution, requests for explanation.
    - If no prior verdict is shown to you, do NOT set `revise` — there is nothing to revise.
-3. **Whether to retract specific findings.** When the conversation explicitly invalidates a specific finding you posted earlier, list its inline-comment ID in `retract_findings`. **Comment IDs are shown as `[id=N]` after each commenter's name in the Active Thread above.** **Only retract findings whose IDs appear in the active thread shown to you** — never speculate or guess. **Only retract findings you yourself posted** (entries authored by you); never retract a developer's comment.
+3. **Whether to retract specific findings.** Setting `retract_findings: [N]` causes the platform to resolve the comment thread containing finding `N` — that IS the resolve action, not just an opinion about it. If the conversation has invalidated a finding you posted earlier, **you MUST add its id to `retract_findings`**. Saying "the finding doesn't apply" or "resolving the thread is appropriate" in your `response` text is NOT enough — you have to perform the action by listing the id.
+   - **Comment IDs are shown as `[id=N]` after each commenter's name** in the Active Thread above.
+   - **Find your own entries by the `[YOU]` marker** — those (and only those) are findings you may retract. Never retract a developer's comment or someone else's reply.
+   - Don't speculate: only retract IDs that actually appear in the Active Thread shown to you.
 
 ## Guidelines
 

@@ -632,6 +632,67 @@ class TestRespondPromptBuilding:
         assert "[id=7700]" in prompt
         assert "[id=7701]" in prompt
 
+    def test_thread_marks_raven_entries_with_you(self, monkeypatch):
+        """When raven_user is passed, entries authored by that user get
+        a [YOU] marker. The AI uses this to identify which findings it
+        can retract (PR #120's "Only retract findings YOU posted" rule
+        is unverifiable without an explicit marker — production AI was
+        leaving retract_findings empty even after acknowledging the
+        finding was wrong, because it didn't know which thread username
+        was its own)."""
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        thread = [
+            {"id": 10, "user": {"login": "jenkins.builder"},
+             "body": "Original finding", "resolved": False},
+            {"id": 11, "user": {"login": "alice"},
+             "body": "Not a bug because X", "resolved": False},
+        ]
+        respond_to_comment(
+            comment_body="?", conversation=[], diff="", repo_name="u/r",
+            thread=thread, prior_verdict="needs_work", prior_body="...",
+            raven_user="jenkins.builder",
+        )
+        prompt = captured["prompt"]
+        assert "**jenkins.builder [YOU] [id=10]:** Original finding" in prompt
+        assert "**alice [id=11]:**" in prompt
+        # Alice doesn't get [YOU] — she's not Raven.
+        assert "**alice [YOU]" not in prompt
+
+    def test_thread_you_marker_case_insensitive(self, monkeypatch):
+        """raven_user matching is case-insensitive — providers may return
+        usernames in different casing (BB DC slug is lowercased, Gitea
+        preserves case)."""
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        thread = [
+            {"id": 1, "user": {"login": "Jenkins.Builder"}, "body": "x", "resolved": False},
+        ]
+        respond_to_comment(
+            comment_body="?", conversation=[], diff="", repo_name="u/r",
+            thread=thread, prior_verdict=None, prior_body=None,
+            raven_user="jenkins.builder",
+        )
+        assert "[YOU]" in captured["prompt"]
+
+    def test_thread_no_you_marker_when_raven_user_empty(self, monkeypatch):
+        """raven_user defaults to '' — when empty, no [YOU] markers
+        appear on thread entries. Back-compat with callers that don't
+        pass it (existing tests rely on this). The instruction text
+        still references the marker, but no thread entry has it."""
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        thread = [
+            {"id": 1, "user": {"login": "anyone"}, "body": "x", "resolved": False},
+        ]
+        respond_to_comment(
+            comment_body="?", conversation=[], diff="", repo_name="u/r",
+            thread=thread, prior_verdict=None, prior_body=None,
+        )
+        # The rendered thread entry should NOT carry the marker on
+        # its label even though the instruction text mentions it.
+        assert "**anyone [YOU]" not in captured["prompt"]
+
     def test_thread_no_id_marker_when_id_missing(self, monkeypatch):
         """Comments without an `id` field render without the `[id=N]` marker —
         no `[id=None]` artifact. Some legacy code paths may produce
