@@ -1008,8 +1008,22 @@ class TestGetPrMetadata:
 # ------------------------------------------------------------------ #
 
 class TestGetCommentThread:
+    """``get_comment_thread`` finds the true thread root via the
+    activities endpoint, since BB DC's ``GET /comments/{id}`` response
+    shape has no parent field. Tests mock the activities endpoint."""
+
+    def _activities_response(self, threads, is_last=True, next_start=None):
+        """Build a paginated activities response wrapping the given
+        top-level threads as ``action=COMMENTED`` activities."""
+        return {
+            "values": [{"action": "COMMENTED", "comment": t} for t in threads],
+            "isLastPage": is_last,
+            "nextPageStart": next_start or 0,
+        }
+
     def test_walks_nested_with_resolved_flag(self, client):
-        response_json = {
+        """Seed is the top-level thread root; full tree is emitted."""
+        root_thread = {
             "id": 100, "author": {"slug": "raven"}, "text": "root",
             "state": "OPEN",
             "anchor": {"path": "a.py", "line": 5},
@@ -1024,7 +1038,8 @@ class TestGetCommentThread:
                  "state": "OPEN", "comments": []},
             ],
         }
-        with _mock_get(client, status=200, json_data=response_json):
+        with _mock_get(client, status=200,
+                       json_data=self._activities_response([root_thread])):
             thread = client.get_comment_thread("proj/repo", 1, 100)
         ids = [c["id"] for c in thread]
         assert ids == [100, 101, 102, 103]
@@ -1038,15 +1053,29 @@ class TestGetCommentThread:
         assert thread[0]["resolved"] is False
         assert thread[1]["resolved"] is False
 
-    def test_returns_empty_on_404(self, client):
-        with _mock_get(client, status=404):
+    def test_returns_empty_when_seed_not_in_activities(self, client):
+        """Seed id absent from all activities → empty thread."""
+        with _mock_get(client, status=200,
+                       json_data=self._activities_response([
+                           {"id": 1, "author": {"slug": "a"}, "text": "other thread",
+                            "state": "OPEN", "comments": []},
+                       ])):
             assert client.get_comment_thread("proj/repo", 1, 999) == []
 
-    def test_walks_up_to_conversation_root(self, client):
-        """Webhook gives immediate parent (id=100, intermediate); the actual
-        conversation root is id=99. get_comment_thread must walk UP first."""
-        root_resp = {
-            "id": 99, "author": {"slug": "raven"}, "text": "root",
+    def test_returns_empty_on_activities_http_error(self, client):
+        """Activities endpoint returns 500 → swallow and return []."""
+        from requests import HTTPError
+        mock_resp = MagicMock(status_code=500)
+        mock_resp.raise_for_status.side_effect = HTTPError("500")
+        with patch.object(client.session, "get", return_value=mock_resp):
+            assert client.get_comment_thread("proj/repo", 1, 999) == []
+
+    def test_finds_root_from_deep_reply_seed(self, client):
+        """The seed (101) is a reply nested under the real root (99).
+        Webhook-provided parent_comment_id may be any node in the tree;
+        we must still emit the thread starting from the TRUE root."""
+        root_thread = {
+            "id": 99, "author": {"slug": "raven"}, "text": "the finding",
             "state": "OPEN", "anchor": {"path": "a.py", "line": 5},
             "comments": [
                 {"id": 100, "author": {"slug": "alice"}, "text": "mid",
@@ -1056,30 +1085,49 @@ class TestGetCommentThread:
                  ]},
             ],
         }
-        intermediate_resp = {
-            "id": 100, "parent": {"id": 99},
-            "author": {"slug": "alice"}, "text": "mid",
-            "state": "OPEN", "anchor": {"path": "a.py", "line": 5},
-            "comments": [],
+        # Seed is 101 (deep reply); other top-level threads in the PR
+        # are unrelated but must be scanned past.
+        unrelated = {
+            "id": 50, "author": {"slug": "x"}, "text": "unrelated",
+            "state": "OPEN", "comments": [],
         }
-
-        def fake_get(url, **kwargs):
-            mr = MagicMock()
-            mr.raise_for_status = MagicMock()
-            if "/comments/100" in url:
-                mr.status_code = 200
-                mr.json.return_value = intermediate_resp
-            elif "/comments/99" in url:
-                mr.status_code = 200
-                mr.json.return_value = root_resp
-            else:
-                mr.status_code = 404
-            return mr
-
-        with patch.object(client.session, "get", side_effect=fake_get):
-            thread = client.get_comment_thread("proj/repo", 1, 100)
+        with _mock_get(client, status=200,
+                       json_data=self._activities_response([unrelated, root_thread])):
+            thread = client.get_comment_thread("proj/repo", 1, 101)
         ids = [c["id"] for c in thread]
+        # Starts at the TRUE root (99), not the webhook seed (101).
         assert ids == [99, 100, 101]
+        # parent_id chain links back to root.
+        assert thread[0]["parent_id"] is None
+        assert thread[1]["parent_id"] == 99
+        assert thread[2]["parent_id"] == 100
+
+    def test_paginates_activities_until_found(self, client):
+        """Activities is paginated; scan past empty / unrelated pages."""
+        page1 = self._activities_response(
+            [{"id": 1, "author": {"slug": "a"}, "text": "p1", "comments": []}],
+            is_last=False, next_start=50,
+        )
+        page2 = self._activities_response(
+            [{"id": 100, "author": {"slug": "raven"}, "text": "root",
+              "state": "OPEN", "anchor": {"path": "a.py", "line": 5},
+              "comments": [
+                {"id": 101, "author": {"slug": "x"}, "text": "reply",
+                 "state": "OPEN", "comments": []},
+              ]}],
+            is_last=True,
+        )
+        pages = [page1, page2]
+        def fake_get(url, params=None, timeout=None):
+            start = (params or {}).get("start", 0)
+            mr = MagicMock(status_code=200)
+            mr.raise_for_status = MagicMock()
+            mr.json.return_value = pages[0] if start == 0 else pages[1]
+            return mr
+        with patch.object(client.session, "get", side_effect=fake_get):
+            thread = client.get_comment_thread("proj/repo", 1, 101)
+        ids = [c["id"] for c in thread]
+        assert ids == [100, 101]
 
 
 # ------------------------------------------------------------------ #

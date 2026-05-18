@@ -291,38 +291,72 @@ class BitbucketDCProvider(GitProvider):
         resp.raise_for_status()
         return resp.json()
 
-    def _walk_to_thread_root(self, repo_full_name: str, pr_number: int,
-                              comment_id: int) -> dict | None:
-        """Walk UP via ``parent.id`` to find the thread root (the comment
-        with no parent). Returns the root node dict, or ``None`` if the
-        seed comment doesn't exist (404). Bounded depth (20) and cycle-safe.
+    def _find_thread_root_via_activities(self, repo_full_name: str, pr_number: int,
+                                          comment_id: int) -> dict | None:
+        """Find a comment's thread root by searching the PR's activities.
 
-        Used by ``get_comment_thread`` (for full-thread context) and
-        ``retract_finding`` (BB DC rejects ``state=RESOLVED`` on comments
-        that have a parent — only the root is the resolvable target)."""
-        seed = self._fetch_bbdc_comment(repo_full_name, pr_number, comment_id)
-        if seed is None:
-            return None
-        visited: set[int] = {seed.get("id")} if seed.get("id") is not None else set()
-        current = seed
-        for _ in range(20):
-            parent_ref = (current.get("parent") or {}).get("id")
-            if not parent_ref or parent_ref in visited:
+        BB DC's ``GET /comments/{id}`` response shape (``ActivityComment``)
+        encodes thread relationships only via nested ``comments`` (children)
+        arrays — there is NO ``parent`` field. So we can walk DOWN from a
+        root, but never UP from a deep reply.
+
+        The activities endpoint
+        (``GET /pull-requests/{id}/activities``) exposes the full top-down
+        tree: each ``COMMENTED`` activity carries a top-level comment with
+        nested children. To find the root of any comment, scan activities
+        and recursively descend each top-level comment until we find the
+        one containing the target id. Returns that top-level comment dict,
+        or ``None`` if not found / on error.
+        """
+        project, repo = _split_repo(repo_full_name)
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/activities"
+        start = 0
+        max_pages = 10
+        for _ in range(max_pages):
+            try:
+                resp = self.session.get(url, params={"start": start, "limit": 50}, timeout=10)
+                resp.raise_for_status()
+            except requests.HTTPError as e:
+                logger.warning("BB DC activities fetch failed for PR #%d: %s", pr_number, e)
+                return None
+            data = resp.json()
+            for activity in data.get("values", []):
+                if activity.get("action") != "COMMENTED":
+                    continue
+                top_comment = activity.get("comment")
+                if not top_comment:
+                    continue
+                if self._comment_contains_id(top_comment, comment_id):
+                    return top_comment
+            if data.get("isLastPage", True):
                 break
-            parent = self._fetch_bbdc_comment(repo_full_name, pr_number, parent_ref)
-            if parent is None:
-                break
-            visited.add(parent_ref)
-            current = parent
-        return current
+            start = data.get("nextPageStart", start + 50)
+        return None
+
+    def _comment_contains_id(self, node: dict, target_id: int) -> bool:
+        """Recursive DFS: does this comment tree contain ``target_id``?"""
+        if node.get("id") == target_id:
+            return True
+        for child in node.get("comments") or []:
+            if isinstance(child, dict) and self._comment_contains_id(child, target_id):
+                return True
+        return False
 
     def get_comment_thread(self, repo_full_name: str, pr_number: int,
                            root_comment_id: int) -> list[dict]:
-        """Return the full thread rooted at the CONVERSATION ROOT, parent-
-        first DFS. The webhook gives us the immediate parent of the trigger
-        which on threads deeper than 2 levels is NOT the conversation root,
-        so we walk UP via comment.parent.id first."""
-        root_node = self._walk_to_thread_root(repo_full_name, pr_number, root_comment_id)
+        """Return the full thread rooted at the CONVERSATION ROOT,
+        parent-first DFS.
+
+        The webhook gives us the immediate parent of the trigger comment,
+        which on threads deeper than 2 levels is NOT the conversation
+        root. BB DC's ``GET /comments/{id}`` response has no ``parent``
+        field, so we can't walk UP from a deep node. Instead we search
+        the activities endpoint top-down for the tree containing the
+        seed id and start emitting from THAT root.
+        """
+        root_node = self._find_thread_root_via_activities(
+            repo_full_name, pr_number, root_comment_id,
+        )
         if root_node is None:
             return []
 
