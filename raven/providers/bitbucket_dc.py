@@ -277,20 +277,6 @@ class BitbucketDCProvider(GitProvider):
 
     # ── New methods for the comment-thread-context feature ───────────── #
 
-    def _fetch_bbdc_comment(self, repo_full_name: str, pr_number: int,
-                            comment_id: int) -> dict | None:
-        """Fetch a single BB DC comment. Returns None on 404."""
-        project, repo = _split_repo(repo_full_name)
-        url = (
-            f"{self.api_url}/projects/{project}/repos/{repo}"
-            f"/pull-requests/{pr_number}/comments/{comment_id}"
-        )
-        resp = self.session.get(url, timeout=10)
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        return resp.json()
-
     def _find_thread_root_via_activities(self, repo_full_name: str, pr_number: int,
                                           comment_id: int) -> dict | None:
         """Find a comment's thread root by searching the PR's activities.
@@ -371,7 +357,16 @@ class BitbucketDCProvider(GitProvider):
                 "body": node.get("text", ""),
                 "file_path": anchor.get("path"),
                 "line": anchor.get("line"),
-                "resolved": node.get("state") == "RESOLVED",
+                # Thread resolution (UI "Resolve thread" button) sets
+                # ``threadResolved`` per BB DC's RestComment schema. The
+                # ``state`` enum (OPEN/PENDING/RESOLVED) is task-specific
+                # (severity=BLOCKER) and stays OPEN on regular thread-
+                # resolved comments. Treat either as resolved so the AI
+                # sees both signals.
+                "resolved": (
+                    node.get("threadResolved") is True
+                    or node.get("state") == "RESOLVED"
+                ),
             })
             for child in node.get("comments") or []:
                 if isinstance(child, dict):
@@ -411,21 +406,27 @@ class BitbucketDCProvider(GitProvider):
 
     def retract_finding(self, repo_full_name: str, pr_number: int,
                         comment_id: int) -> bool:
-        """Resolve a comment thread.
+        """Resolve a comment thread on BB DC.
 
-        BB DC v8.9+ resolves threads via
-        ``PUT /comments/{id} {state: RESOLVED, version: N}`` — but ONLY
-        on the thread root. Calling it on a comment that has a parent
-        returns ``400 "Cannot resolve a comment with a parent comment."``
+        BB DC's ``RestComment`` schema has **two distinct writable
+        fields** that look similar but aren't:
 
-        **The caller is responsible for passing the thread root id.**
-        Walking up via ``GET /comments/{id}`` doesn't work here: BB DC's
-        ``ActivityComment`` response shape encodes children via nested
-        ``comments`` arrays but has no parent field, so a direct fetch
-        of a deep reply gives no way to find its root. The thread tree
-        IS available at the caller — ``get_comment_thread`` builds it
-        with ``parent_id`` filled in from the nested structure — so the
-        caller walks to root in-memory before invoking this method.
+        * ``state`` (enum ``OPEN`` / ``PENDING`` / ``RESOLVED``) — for
+          **tasks** (severity=BLOCKER). Setting it on a regular comment
+          or on a comment with a parent returns 400 "Cannot resolve a
+          comment with a parent comment."
+        * ``threadResolved`` (boolean) — for **thread resolution**.
+          This is what the "Resolve thread" UI button maps to.
+          ``threadResolvedDate`` and ``threadResolver`` are the readOnly
+          counterparts BB DC populates.
+
+        Source: Atlassian's static OpenAPI spec at
+        ``dac-static.atlassian.com/server/bitbucket/9.6.swagger.v3.json``.
+
+        We set ``threadResolved: true``. Callers should pass the thread
+        root id (``get_comment_thread`` makes the tree available so the
+        caller can walk to root in memory — the GET response shape has
+        no parent linkage, so the provider can't do it).
 
         Returns ``False`` on 403/404/409 without raising. On any
         non-2xx, logs the response body (truncated to 500 chars).
@@ -443,7 +444,7 @@ class BitbucketDCProvider(GitProvider):
             get_resp.raise_for_status()
             version = get_resp.json().get("version", 0)
             put_resp = self.session.put(
-                base, json={"state": "RESOLVED", "version": version}, timeout=10,
+                base, json={"threadResolved": True, "version": version}, timeout=10,
             )
             if put_resp.status_code in (403, 404, 409):
                 logger.warning("BB DC retract comment %s failed: HTTP %s — body: %s",

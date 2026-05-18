@@ -3788,9 +3788,9 @@ class TestProcessCommentRetraction:
     def test_retract_walks_to_thread_root_from_reply(self, mock_provider_for_comment_flow):
         """When the AI picks a Raven-authored REPLY id (not the original
         finding's id), the server walks up the in-memory thread to the
-        root and resolves that. BB DC rejects state=RESOLVED on comments
-        with a parent — the GET response has no parent field so the
-        provider can't walk up via API; the caller does it using the
+        root and resolves that. Thread resolution is a thread-root
+        operation; the BB DC GET response has no parent field so the
+        provider can't walk up via API — the caller does it using the
         thread tree we already fetched.
 
         Mock thread:

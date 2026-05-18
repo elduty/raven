@@ -1329,15 +1329,16 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 logger.warning("Dropped %d retract IDs not authored by Raven or absent from thread: %s",
                                len(dropped), dropped)
 
-            # The AI may pick a reply id from the thread, but BB DC
-            # (v8.9+) only resolves the THREAD ROOT — calling
-            # state=RESOLVED on a comment with a parent returns 400
-            # "Cannot resolve a comment with a parent comment." BB DC's
-            # GET /comments/{id} response shape has no parent field so
-            # the provider can't walk up via API. The thread tree we
-            # already fetched does carry parent_id linkage (filled in
-            # from the nested-children response during get_comment_thread),
-            # so we walk to root here in memory.
+            # The AI may pick a reply id from the thread, but thread
+            # resolution is semantically a thread-root operation —
+            # ``threadResolved`` (the BB DC field the UI's "Resolve
+            # thread" button maps to) belongs on the root comment, and
+            # Gitea's ``/resolve`` endpoint treats every comment in a
+            # ``(path, position)`` group the same anyway. Walk to root
+            # in memory using the parent_id linkage filled in by
+            # ``get_comment_thread`` (BB DC's GET shape has no parent
+            # field, so the provider can't walk up via the single-
+            # comment API).
             parent_map: dict[int, int | None] = {
                 c.get("id"): c.get("parent_id")
                 for c in thread if c.get("id") is not None

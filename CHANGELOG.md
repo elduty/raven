@@ -36,7 +36,7 @@ First public snapshot. Raven now reviews PRs on both Gitea and Bitbucket Data Ce
 ### New features
 
 **Multi-provider support**
-- Bitbucket Data Center provider with full parity: webhook parsing, diff fetch, inline comments, formal reviews (approve / needs-work), participant-aware reviewer detection, native comment resolve (`state=RESOLVED`).
+- Bitbucket Data Center provider with full parity: webhook parsing, diff fetch, inline comments, formal reviews (approve / needs-work), participant-aware reviewer detection, native thread resolve (`threadResolved=true`).
 - `GitProvider` ABC + provider registry — adding a new platform means implementing the abstract methods. Out-of-tree providers degrade gracefully on the conversational-context methods (concrete defaults on the base class).
 - Single Raven instance handles webhooks from multiple platforms simultaneously via `/hook/<provider>` routing.
 
@@ -51,7 +51,7 @@ First public snapshot. Raven now reviews PRs on both Gitea and Bitbucket Data Ce
 - When a developer replies to a Raven finding, Raven sees the **whole conversation it's replying inside** (root + replies), not just the last 20 PR-wide comments. Thread root is always preserved through truncation.
 - AI returns structured JSON: response text + optional verdict revision + optional finding retraction list.
 - When the discussion provides substantive new information ("this isn't a bug because the path is unreachable"), Raven can submit a **new formal review revising its prior verdict**. Auto-merge gates fire on `needs_work → approve` flips and also on retraction-only paths when the prior verdict was already approve.
-- When discussion invalidates a specific inline finding, Raven retracts it via the platform's **native resolve action**: Bitbucket DC marks the comment `state=RESOLVED`; Gitea ≥1.24 uses `POST /pulls/comments/{id}/resolve`.
+- When discussion invalidates a specific inline finding, Raven retracts it via the platform's **native resolve action**: Bitbucket DC marks the thread root `threadResolved=true` (the same flag the UI's "Resolve thread" button sets); Gitea ≥1.24 uses `POST /pulls/comments/{id}/resolve`.
 - Atomic race guards prevent two concurrent comments from submitting opposing reviews.
 - Configurable budgets: `RAVEN_RESPOND_THREAD_TOTAL_CHARS`, `RAVEN_RESPOND_VERDICT_BODY_CHARS`.
 

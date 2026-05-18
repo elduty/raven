@@ -1022,20 +1022,28 @@ class TestGetCommentThread:
         }
 
     def test_walks_nested_with_resolved_flag(self, client):
-        """Seed is the top-level thread root; full tree is emitted."""
+        """Seed is the top-level thread root; full tree is emitted.
+
+        Resolved flag must catch both signals BB DC emits: the
+        ``threadResolved`` boolean the UI's "Resolve thread" button
+        sets, and the legacy ``state == "RESOLVED"`` enum for resolved
+        tasks (severity=BLOCKER). Mocks one of each so a future
+        regression on either path fails this test."""
         root_thread = {
             "id": 100, "author": {"slug": "raven"}, "text": "root",
-            "state": "OPEN",
+            "state": "OPEN", "threadResolved": False,
             "anchor": {"path": "a.py", "line": 5},
             "comments": [
                 {"id": 101, "author": {"slug": "alice"}, "text": "reply1",
-                 "state": "OPEN",
+                 "state": "OPEN", "threadResolved": False,
                  "comments": [
+                    # threadResolved=True — what "Resolve thread" sets.
                     {"id": 102, "author": {"slug": "bob"}, "text": "reply2",
-                     "state": "RESOLVED", "comments": []},
+                     "state": "OPEN", "threadResolved": True, "comments": []},
                  ]},
+                # Legacy: a resolved task (severity=BLOCKER) sets state.
                 {"id": 103, "author": {"slug": "carol"}, "text": "reply3",
-                 "state": "OPEN", "comments": []},
+                 "state": "RESOLVED", "threadResolved": False, "comments": []},
             ],
         }
         with _mock_get(client, status=200,
@@ -1048,10 +1056,10 @@ class TestGetCommentThread:
         assert thread[2]["parent_id"] == 101
         assert thread[0]["file_path"] == "a.py"
         assert thread[0]["line"] == 5
-        # Resolved flag derived from state field
-        assert thread[2]["resolved"] is True   # id=102 was RESOLVED
         assert thread[0]["resolved"] is False
         assert thread[1]["resolved"] is False
+        assert thread[2]["resolved"] is True   # threadResolved=True
+        assert thread[3]["resolved"] is True   # state=RESOLVED (legacy task)
 
     def test_returns_empty_when_seed_not_in_activities(self, client):
         """Seed id absent from all activities → empty thread."""
@@ -1136,6 +1144,10 @@ class TestGetCommentThread:
 
 class TestRetractFinding:
     def test_resolves_comment(self, client):
+        """The PUT body must use threadResolved (writable boolean on
+        RestComment per BB DC's OpenAPI spec). The state=RESOLVED field
+        is task-specific and returns 400 on regular comments; only
+        threadResolved actually marks the thread resolved in the UI."""
         get_resp = MagicMock(status_code=200)
         get_resp.json.return_value = {"id": 42, "version": 3}
         get_resp.raise_for_status = MagicMock()
@@ -1145,7 +1157,7 @@ class TestRetractFinding:
              patch.object(client.session, "put", return_value=put_resp) as mock_put:
             assert client.retract_finding("proj/repo", 1, 42) is True
         _, kwargs = mock_put.call_args
-        assert kwargs["json"] == {"state": "RESOLVED", "version": 3}
+        assert kwargs["json"] == {"threadResolved": True, "version": 3}
 
     def test_404_returns_false(self, client):
         get_resp = MagicMock(status_code=404)
