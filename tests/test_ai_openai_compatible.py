@@ -168,6 +168,47 @@ class TestOpenAICompatibleBackendEmptyResponse:
                     "p", model="m", effort="max", timeout=60, purpose="review",
                 )
 
+    def test_multimodal_list_content_concatenates_text_parts(self):
+        """Newer multimodal / reasoning-block responses can return
+        ``content`` as a list of parts (each with ``type`` + payload).
+        Concatenate the ``text``-typed parts; ignore other types."""
+        from raven.ai.openai_compatible import OpenAICompatibleBackend
+
+        backend = OpenAICompatibleBackend()
+        resp = _make_response("placeholder", finish_reason="stop")
+        # Simulate a multimodal/reasoning response: list of parts.
+        part_text_a = MagicMock(type="text", text="first ")
+        part_thinking = MagicMock(type="thinking", text="hidden")
+        part_text_b = MagicMock(type="text", text="and second")
+        resp.choices[0].message.content = [part_text_a, part_thinking, part_text_b]
+
+        with patch.object(
+            backend._client.chat.completions, "create", return_value=resp,
+        ):
+            out = backend.complete(
+                "p", model="m", effort="max", timeout=60, purpose="review",
+            )
+        # Only text-typed parts concatenated; the "thinking" part is excluded.
+        assert out == "first and second"
+
+    def test_unsupported_content_type_raises_empty_response(self):
+        """If ``content`` is an unexpected type (e.g. dict, int — a proxy
+        misbehaving), fall through to the empty-response error rather
+        than crashing with AttributeError."""
+        from raven.ai.openai_compatible import OpenAICompatibleBackend
+
+        backend = OpenAICompatibleBackend()
+        resp = _make_response("placeholder", finish_reason="stop")
+        resp.choices[0].message.content = {"unexpected": "dict"}
+
+        with patch.object(
+            backend._client.chat.completions, "create", return_value=resp,
+        ):
+            with pytest.raises(RuntimeError, match="empty response"):
+                backend.complete(
+                    "p", model="m", effort="max", timeout=60, purpose="review",
+                )
+
 
 class TestOpenAICompatibleBackendShutdown:
     def test_shutdown_closes_client(self):

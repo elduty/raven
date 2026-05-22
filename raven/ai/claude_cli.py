@@ -10,11 +10,45 @@ keep passing during the refactor.
 import contextlib
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 
 logger = logging.getLogger(__name__)
+
+
+# Token shapes we redact from CLI stdout/stderr before logging. The
+# Claude CLI shouldn't echo ``CLAUDE_CODE_OAUTH_TOKEN`` itself, but a
+# misconfigured CLI or an auth-failure message can include the token,
+# an Anthropic-style ``sk-ant-...`` key, or a ``Bearer ...`` header from
+# an HTTP error body. Each pattern matches a credential-looking prefix
+# and replaces the secret portion with ``***REDACTED***`` so operators
+# can still see the surrounding error context without leaking auth.
+_TOKEN_PATTERNS = [
+    re.compile(r"(sk-ant-[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+"),
+    re.compile(r"(sk-[A-Za-z0-9_-]{4})[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(Bearer\s+)[A-Za-z0-9._-]{16,}", re.IGNORECASE),
+]
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip credential-shaped substrings from log payloads.
+
+    Belt-and-braces: also rewrites the literal configured
+    ``CLAUDE_CODE_OAUTH_TOKEN`` value if it appears in the text, since
+    that's the most targeted possible match (no false positives) and
+    catches the case where the CLI echoes the env var verbatim. Pattern
+    matches stay in place for unknown / future token shapes.
+    """
+    if not text:
+        return text
+    configured = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or ""
+    if configured and len(configured) >= 8:
+        text = text.replace(configured, "***REDACTED***")
+    for pat in _TOKEN_PATTERNS:
+        text = pat.sub(r"\1***REDACTED***", text)
+    return text
 
 CLAUDE_BIN = "/usr/bin/claude"
 RAVEN_AI_MAX_CONCURRENT = max(int(os.environ.get("RAVEN_AI_MAX_CONCURRENT", "4")), 1)
@@ -166,9 +200,16 @@ class ClaudeCLIBackend(AIBackend):
                 raise RuntimeError(f"claude CLI not found at {CLAUDE_BIN}")
 
         if result.returncode != 0:
-            logger.error("claude CLI stderr: %s", result.stderr[:500])
-            logger.error("claude CLI stdout: %s", result.stdout[:500])
-            detail = result.stderr[:200] or result.stdout[:200]
+            # Redact token-shaped substrings before logging — the CLI
+            # shouldn't echo CLAUDE_CODE_OAUTH_TOKEN but a misconfigured
+            # auth-failure path can. ``detail`` is exception-message-bound
+            # and likely flows into operator log aggregation; redact it
+            # for the same reason.
+            stderr_safe = _redact_secrets(result.stderr[:500])
+            stdout_safe = _redact_secrets(result.stdout[:500])
+            logger.error("claude CLI stderr: %s", stderr_safe)
+            logger.error("claude CLI stdout: %s", stdout_safe)
+            detail = _redact_secrets(result.stderr[:200] or result.stdout[:200])
             raise RuntimeError(f"claude CLI exited with code {result.returncode}: {detail}")
         return result.stdout
 

@@ -12,6 +12,7 @@ from raven.reviewer import (
     respond_to_comment,
     review_diff,
     severity_gte,
+    split_diff_by_file,
 )
 
 
@@ -95,6 +96,34 @@ class TestParseResponse:
         result = _parse_response(raw)
         assert result["severity"] == "medium"
 
+    def test_findings_is_string_does_not_crash(self):
+        """AI sometimes emits {"findings": "high"} (a string) instead of a
+        list. The validator must coerce to empty list, not raise
+        AttributeError on str.get() — the latter used to surface as a
+        cryptic chunk-failure message."""
+        raw = '{"severity": "high", "summary": "x", "findings": "weird-string"}'
+        result = _parse_response(raw)
+        assert result["severity"] == "high"
+        assert result["findings"] == []
+        assert result.get("_parse_error") is not True
+
+    def test_findings_with_non_dict_entries_are_skipped(self):
+        """Mixed findings list — bare strings, ints, dicts. Only the dicts
+        survive; the rest are dropped without raising."""
+        raw = (
+            '{"severity": "medium", "summary": "x", '
+            '"findings": [42, "raw msg", {"severity": "high", "message": "real one"}]}'
+        )
+        result = _parse_response(raw)
+        assert len(result["findings"]) == 1
+        assert result["findings"][0]["message"] == "real one"
+        assert result["findings"][0]["severity"] == "high"
+
+    def test_findings_null_treated_as_empty(self):
+        raw = '{"severity": "low", "summary": "x", "findings": null}'
+        result = _parse_response(raw)
+        assert result["findings"] == []
+
 
 # ------------------------------------------------------------------ #
 #  review_diff (with mocked subprocess)                              #
@@ -150,10 +179,12 @@ class TestReviewDiff:
         prompt = fake_backend.complete.call_args.args[0]
         assert "This is a game engine." in prompt
 
-    def test_prompt_contains_trust_preamble_and_wraps_diff(self, monkeypatch):
-        """Diff and CLAUDE.md are wrapped in randomised
-        <untrusted_input_<tag_id>> tags, preceded by the trust preamble
-        using the same id."""
+    def test_prompt_contains_trust_preamble_and_wraps_both_tiers(self, monkeypatch):
+        """Two delimiter families: ``<untrusted_input_TAGID>`` for the
+        diff (data, model must not follow instructions), and
+        ``<repo_policy_TAGID>`` for CLAUDE.md (authoritative repo policy,
+        same trust as the prompt template). Same random tag id across
+        both, referenced by the preamble."""
         review_json = json.dumps({"severity": "low", "summary": "ok", "findings": []})
         fake_backend = self._make_backend(monkeypatch, review_json)
         review_diff("diff content\n", "user/repo", claude_md="repo guidance")
@@ -163,11 +194,15 @@ class TestReviewDiff:
         m = _re.search(r"<untrusted_input_([0-9a-f]{8,}) ", prompt)
         assert m, "randomised untrusted_input tag missing"
         tag_id = m.group(1)
+        # Diff is untrusted data.
         assert f'<untrusted_input_{tag_id} type="pr_diff">' in prompt
-        assert f'<untrusted_input_{tag_id} type="repo_file">' in prompt
         assert f"</untrusted_input_{tag_id}>" in prompt
-        # Preamble references the same id
+        # CLAUDE.md is trusted repo policy — NOT in the untrusted region.
+        assert f'<repo_policy_{tag_id} type="repo_overview">' in prompt
+        assert f"</repo_policy_{tag_id}>" in prompt
+        # Preamble references the same id for both families.
         assert f"<untrusted_input_{tag_id}>" in prompt
+        assert f"<repo_policy_{tag_id}>" in prompt
 
     def test_adversarial_diff_cannot_break_out_of_tag(self, monkeypatch):
         """A diff containing the literal untrusted_input closing tag
@@ -262,6 +297,49 @@ class TestStripLockfiles:
         result = _strip_lockfiles_and_binaries(diff)
         assert "logo.png" not in result
         assert "main.py" in result
+
+
+# ------------------------------------------------------------------ #
+#  split_diff_by_file                                                 #
+# ------------------------------------------------------------------ #
+
+class TestSplitDiffByFile:
+    def test_splits_two_files(self):
+        diff = (
+            "diff --git a/a.py b/a.py\n"
+            "+aaa\n"
+            "diff --git a/b.py b/b.py\n"
+            "+bbb\n"
+        )
+        chunks = split_diff_by_file(diff)
+        assert [name for name, _ in chunks] == ["a.py", "b.py"]
+        assert chunks[0][1].startswith("diff --git a/a.py")
+        assert "+aaa" in chunks[0][1]
+        assert chunks[1][1].startswith("diff --git a/b.py")
+        assert "+bbb" in chunks[1][1]
+
+    def test_leading_text_before_first_header_is_dropped(self):
+        """Stray text or git-format-patch metadata before the first
+        ``diff --git`` header gets appended to a buffer that's never
+        emitted (the final flush guards on current_file being set).
+        Regression for the dead-code cleanup in the reviewer audit."""
+        diff = (
+            "From abc Mon Sep 17 00:00:00 2001\n"
+            "Subject: [PATCH] something\n"
+            "\n"
+            "diff --git a/a.py b/a.py\n"
+            "+code\n"
+        )
+        chunks = split_diff_by_file(diff)
+        assert len(chunks) == 1
+        assert chunks[0][0] == "a.py"
+        # The "From ..." preamble must NOT appear in the emitted chunk.
+        assert "From abc" not in chunks[0][1]
+        assert "+code" in chunks[0][1]
+
+    def test_empty_diff_returns_empty_list(self):
+        assert split_diff_by_file("") == []
+        assert split_diff_by_file("just some prose\n") == []
 
     def test_keeps_regular_files(self):
         diff = (

@@ -41,6 +41,28 @@ class TestSelectBackendExplicit:
         backend = _select_backend()
         assert backend.name == "claude_cli"
 
+    def test_explicit_accepts_dashes(self, monkeypatch):
+        """Operator-friendly: ``claude-cli`` (dash) resolves to
+        ``claude_cli``. The underscore-vs-dash spelling shouldn't be a
+        configuration footgun."""
+        monkeypatch.setenv("RAVEN_AI_BACKEND", "claude-cli")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "dummy")
+        monkeypatch.delenv("RAVEN_AI_API_KEY", raising=False)
+        monkeypatch.delenv("RAVEN_AI_API_BASE", raising=False)
+
+        from raven.ai import _select_backend
+        backend = _select_backend()
+        assert backend.name == "claude_cli"
+
+    def test_explicit_accepts_dashes_for_openai(self, monkeypatch):
+        monkeypatch.setenv("RAVEN_AI_BACKEND", "OPENAI-COMPATIBLE")
+        monkeypatch.setenv("RAVEN_AI_API_BASE", "http://proxy.example:4000")
+        monkeypatch.setenv("RAVEN_AI_API_KEY", "sk-test")
+
+        from raven.ai import _select_backend
+        backend = _select_backend()
+        assert backend.name == "openai_compatible"
+
 
 class TestSelectBackendAutoDetect:
     def test_autodetect_openai_wins_when_both_creds_set(self, monkeypatch):

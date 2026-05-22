@@ -718,6 +718,14 @@ class GiteaProvider(GitProvider):
         elif event in ("pull_request", "pull_request_sync"):
             return self._parse_pull_request(payload, is_sync=(event == "pull_request_sync"))
         elif event in ("issue_comment", "pull_request_comment"):
+            # Gitea inline-comment webhook coverage has known gaps —
+            # see go-gitea/gitea#26023 (open as of 2026-05). Empirically
+            # ``pull_request_comment`` fires for the flows Raven supports
+            # (single-comment review submits, in-thread replies). On
+            # Gitea ≥1.24.3, comments on a *pending* review (#34928)
+            # no longer fire — only the finalized review does, which is
+            # the cleaner behavior anyway (we already filter
+            # action=created so drafts never triggered Raven).
             return self._parse_comment(payload, event)
         elif event in ("pull_request_review_approved", "pull_request_review_rejected"):
             return self._parse_review_event(payload, event)

@@ -104,7 +104,23 @@ class OpenAICompatibleBackend(AIBackend):
         if not response.choices:
             raise RuntimeError("AI backend returned no choices")
         choice = response.choices[0]
-        text = choice.message.content or ""
+        # The OpenAI SDK guarantees ``content: str | None`` for standard
+        # chat completions, but proxies (LiteLLM, vLLM, Ollama shim) and
+        # newer multimodal/reasoning APIs can return a list of content
+        # parts. Coerce known shapes; treat anything else as empty so
+        # the empty-response branch fires with a clean error instead of
+        # an AttributeError from ``str.upper()`` or similar downstream.
+        content = choice.message.content
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            # Multimodal/reasoning response: concatenate text-typed parts.
+            text = "".join(
+                getattr(p, "text", "") for p in content
+                if getattr(p, "type", "") == "text"
+            )
+        else:
+            text = ""
         if not text:
             raise RuntimeError(
                 f"AI backend returned empty response "

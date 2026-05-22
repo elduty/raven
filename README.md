@@ -32,8 +32,8 @@ push to branch
 
 Reviews typically complete in 10-30 seconds. Diffs up to 3000 lines are reviewed as a single full-context pass; larger diffs are split by file and reviewed chunk-by-chunk. Repos can tune reviews via a few optional inputs:
 
-- **`CLAUDE.md`** at the repo root — free-form project guidance. Injected as "Repository Context".
-- **`.claude/rules/*.md`** — one file per rule category (e.g. `security.md`, `style.md`, `testing.md`). Injected as "Repository Rules" and the model is instructed to apply them as review criteria. Flat directory, `.md` only. **Fetched from the PR's base branch** (already-merged state) so a PR can't add or modify rules to bias its own review — new rules only take effect after they've been merged through a review of their own.
+- **`CLAUDE.md`** at the repo root — free-form project guidance. Injected as "Repository Context" inside a trusted `<repo_policy>` block (the model treats it as authoritative). **Fetched from the PR's base branch** (already-merged state).
+- **`.claude/rules/*.md`** — one file per rule category (e.g. `security.md`, `style.md`, `testing.md`). Injected as "Repository Rules" inside the same trusted `<repo_policy>` block — the model applies them as authoritative review criteria that override conflicting guidance in the built-in prompt. Flat directory, `.md` only. **Fetched from the PR's base branch** (already-merged state) so neither rules nor CLAUDE.md can be added or modified to bias their own PR's review — changes only take effect after the introducing PR has merged through its own review cycle.
 
 - **`.claude/rules/raven/prompts/review.md`** and **`.claude/rules/raven/prompts/respond.md`** — optional overrides that **completely replace** Raven's built-in review / respond prompt for this repo. Fetched from the **PR base branch** (same security model as `.claude/rules/*.md`) — new prompts only take effect after being merged through a review of their own. To start, copy `prompts/review.md` or `prompts/respond.md` from this repo into `.claude/rules/raven/prompts/` and edit from there. Gated on `RAVEN_RULES_DIR`: setting it to empty string disables prompt overrides as well as rule injection.
 
@@ -92,9 +92,9 @@ docker compose up -d
    - Color: `#7B68EE` (purple)
 
 4. **Optional**: Add a `CLAUDE.md` at the repo root for project-wide guidance, and/or `.claude/rules/*.md` files for focused review criteria.
-   - `CLAUDE.md` is read from the **PR head** — documentation changes land atomically with the code they describe.
-   - `.claude/rules/*.md` are read from the **PR base branch** (already-merged state) so a PR can't add or modify its own review criteria. New or updated rules only take effect after they've been merged.
-   - `.claude/rules/raven/prompts/{review,respond}.md` are read from the **PR base branch** and completely replace Raven's built-in prompts for this repo. Same merge-first security property as rules.
+   - **Both are read from the PR base branch** (already-merged state). New or updated `CLAUDE.md` / `.claude/rules/*.md` content only takes effect after the PR introducing it has been merged — a PR can't add policy that biases its own review.
+   - Both are rendered inside a `<repo_policy>` block in the prompt and marked as **authoritative review policy** that the model must apply. Same trust tier as the built-in prompt template; distinct from the diff / PR-author content which is wrapped as `<untrusted_input>` data.
+   - `.claude/rules/raven/prompts/{review,respond}.md` are likewise read from the **PR base branch** and completely replace Raven's built-in prompts for this repo. Same merge-first trust property.
 
 ### Bitbucket Data Center setup
 
@@ -273,7 +273,7 @@ raven/
 prompts/
 ├── review.md              Review prompt template
 ├── respond.md             Conversational response prompt template
-├── audit.md               Full technical audit prompt
+├── audit.md               Standalone prompt for operator-driven manual audits (not code-loaded)
 entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start + daily
 ```
 
@@ -353,7 +353,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-622 tests across 13 test files covering webhook handling, review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), three-mode review engagement (`all` / `gap` / `advisory`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
+659 tests across 13 test files covering webhook handling (BB DC `pr:comment:added`/`:edited` version-aware dedup, `pr:reviewer:approved`/`:changes_requested` parity with Gitea, activities-endpoint pagination cap with WARNING), review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), two-tier prompt trust model (`<repo_policy>` for CLAUDE.md + rules at base ref vs `<untrusted_input>` for diff + comments), three-mode review engagement (`all` / `gap` / `advisory`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
 
 ## CI
 

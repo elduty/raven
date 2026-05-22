@@ -29,9 +29,11 @@ def _select_backend() -> AIBackend:
     3. CLAUDE_CODE_OAUTH_TOKEN set → claude_cli.
     4. Otherwise: RuntimeError.
 
-    Case- and whitespace-insensitive for the override.
+    The override is case-, whitespace-, and dash/underscore-insensitive:
+    ``claude_cli``, ``claude-cli``, ``Claude_CLI``, and ``CLAUDE-CLI``
+    all resolve to ``claude_cli``. Same for ``openai_compatible``.
     """
-    override = (os.environ.get("RAVEN_AI_BACKEND") or "").strip().lower()
+    override = (os.environ.get("RAVEN_AI_BACKEND") or "").strip().lower().replace("-", "_")
     if override:
         if override not in _KNOWN_BACKENDS:
             raise RuntimeError(f"Unknown RAVEN_AI_BACKEND={override!r}")

@@ -249,7 +249,20 @@ def _load_cache() -> None:
 
 
 def _save_cache() -> None:
-    """Persist findings cache to disk (atomic write)."""
+    """Persist findings cache to disk (atomic write).
+
+    The cache dict is snapshotted under ``_previous_diffs_lock`` via
+    ``asdict()`` (which deep-copies the dataclass + nested findings
+    lists), then the lock is released BEFORE the disk write. Holding
+    the lock across I/O would block concurrent reviewers for the
+    duration of the write; the snapshot is independent of further
+    mutations so this is safe.
+
+    All exceptions are caught and surfaced via
+    ``raven_cache_save_failures_total`` so persistent disk/permission
+    problems are alertable in monitoring. The function never propagates
+    — callers can invoke it bare without try/except.
+    """
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         with _previous_diffs_lock:
@@ -272,6 +285,7 @@ def _save_cache() -> None:
             raise
     except Exception as e:
         logger.warning("Could not save findings cache to %s: %s", _CACHE_FILE, e)
+        inc("raven_cache_save_failures_total", {"reason": type(e).__name__})
 
 
 def _evict_cache() -> None:
@@ -285,8 +299,14 @@ def _evict_cache() -> None:
             del _previous_diffs[key]
 
 
-def _should_skip_duplicate(repo: str, pr_number: int, head_sha: str | None = None) -> bool:
-    """Return True if this PR was already dispatched within DEDUP_WINDOW.
+def _should_skip_duplicate(repo: str, pr_number: int | str, head_sha: str | None = None) -> bool:
+    """Return True if this dispatch target was already seen within DEDUP_WINDOW.
+
+    ``pr_number`` is the natural use case but the parameter accepts any
+    stringifiable dedup identifier — the comment-flow at the webhook
+    route passes ``f"comment-{id}-v{version}"`` so each comment edit
+    gets its own slot. The key is just ``f"{repo}#{pr_number}"`` (plus
+    an optional SHA suffix) — anything stringifiable works.
 
     When ``head_sha`` is provided, it's appended to the dedup key so that
     a push carrying a new SHA is treated as a fresh event (not a webhook
@@ -487,7 +507,19 @@ def create_app() -> Flask:
                 return jsonify({"status": "ignored", "reason": "not directed at Raven"})
             if not pr_number:
                 return jsonify({"status": "skipped", "reason": "missing PR number"})
-            if comment_id and _should_skip_duplicate(f"{provider.name}:{repo}", f"comment-{comment_id}"):
+            # Include ``comment_version`` in the dedup key when the provider
+            # supplies it (BB DC bumps it on every edit). Lets a user edit a
+            # comment to add ``@raven`` and have the edit trigger a reply,
+            # while the original add's webhook (different version) doesn't
+            # double-process. Gitea doesn't surface a version so dedup falls
+            # back to the bare comment_id, preserving existing behavior.
+            comment_version = payload.get("comment_version")
+            dedup_suffix = (
+                f"comment-{comment_id}-v{comment_version}"
+                if comment_version is not None
+                else f"comment-{comment_id}"
+            )
+            if comment_id and _should_skip_duplicate(f"{provider.name}:{repo}", dedup_suffix):
                 return jsonify({"status": "skipped", "reason": "duplicate"})
             # The thread-author lookup (HTTP GET) runs inside _process_comment
             # so the webhook always returns 200 promptly — slow provider APIs
@@ -665,30 +697,30 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # Fetch diff
         diff = provider.fetch_pr_diff(repo_full_name, pr_number)
 
-        # Fetch repo context — both the legacy CLAUDE.md and the
-        # .claude/rules/ directory (if either exist). Each is optional;
-        # any fetch failure degrades to empty content rather than
-        # blocking the review.
+        # Fetch repo context — both CLAUDE.md and the .claude/rules/
+        # directory (if either exist). Each is optional; any fetch
+        # failure degrades to empty content rather than blocking the
+        # review.
         #
-        # CLAUDE.md is read from the PR head so documentation changes
-        # land atomically with the code they describe. Rules files are
-        # read from the PR *base* — fetching them from head would let a
-        # PR author add ``.claude/rules/policy.md`` saying "approve SQL
-        # concatenation" alongside hostile code, biasing Raven's review
-        # of that same PR. Reading from base means rule changes take
-        # effect only after they've been merged through a review of
-        # their own.
+        # BOTH are read from the PR *base* ref so the content carries
+        # the same trust as the review prompt itself — a change had to
+        # land via a PR Raven reviewed without the new content applied.
+        # Fetching either from PR head would let an author add
+        # ``CLAUDE.md`` / ``.claude/rules/policy.md`` saying "approve
+        # SQL concatenation" alongside hostile code, biasing Raven's
+        # review of that same PR. The reviewer renders both inside
+        # ``<repo_policy_TAGID>`` blocks (the trusted tier from the
+        # prompt preamble); see ``reviewer._build_trust_preamble``.
+        base_ref = payload.get("base_ref") or "HEAD"
         claude_md = ""
         try:
-            claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref=head_sha)
+            claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref=base_ref)
         except Exception as e:
             # 404 (missing file) returns "" without raising; reaching this
             # except means an auth/transport/server-side failure that the
             # operator probably wants to see. Warn instead of debug.
             logger.warning("CLAUDE.md fetch for %s@%s failed (review proceeds without repo context): %s",
-                           repo_full_name, head_sha[:8], e)
-
-        base_ref = payload.get("base_ref") or "HEAD"
+                           repo_full_name, base_ref, e)
         # NOTE: rule + prompt-override fetches deferred to after the
         # no-changes-skip path below so a re-review on an unchanged diff
         # doesn't incur those network calls only to return early.
@@ -1053,6 +1085,15 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
     finally:
         # Release the in-progress lock for this PR. The sentinel (pr_key
         # set back to None) means we never acquired it — skip the clear.
+        #
+        # Note: this discard happens BEFORE the auto-merge dispatched at
+        # line ~1045 to ``ci_wait_executor`` completes. A new push during
+        # CI wait can therefore trigger a fresh ``_process_pr`` while the
+        # old merge is still polling — that's intentional. The new run
+        # posts its own review + dismisses the old one + dispatches its
+        # own merge; the OLD merge's ``head_sha`` recheck in
+        # ``_do_merge`` (line ~1771) catches the SHA drift and skips
+        # cleanly. The window is safe by design.
         if pr_key is not None:
             with _in_progress_lock:
                 _in_progress_prs.discard(pr_key)
@@ -1157,19 +1198,29 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         raw_diff = provider.fetch_pr_diff(repo_full_name, pr_number)
         diff = _strip_lockfiles_and_binaries(raw_diff)
         diff = _truncate_diff_for_comment(diff, file_path, line)
-        # Fetch CLAUDE.md from the PR's head SHA (matches _process_pr's
-        # behavior). Reading from "HEAD" before could surface a different
-        # version of CLAUDE.md than the one Raven reviewed against — most
-        # notably on a re-review where the default branch has moved.
-        claude_md = ""
+        # Fetch CLAUDE.md from the PR's BASE ref (matches _process_pr's
+        # post-trust-tier behavior). CLAUDE.md is repo-policy content and
+        # the reviewer renders it in the trusted ``<repo_policy_TAGID>``
+        # block; using base ref means a PR can't sneak in policy-shaped
+        # text that would bias its own re-review through the comment-reply
+        # path. Code snippets later in this function still use head_sha
+        # since they're showing the actual code under review.
+        try:
+            comment_base_ref = provider.get_pr_base_ref(repo_full_name, pr_number)
+        except Exception as e:
+            logger.debug("get_pr_base_ref for PR #%s CLAUDE.md fetch failed (falling back to HEAD): %s",
+                         pr_number, e)
+            comment_base_ref = "HEAD"
+        # Fetch the PR head SHA up-front for the code-snippet block below.
         try:
             cmd_head_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
         except Exception as e:
-            logger.debug("get_pr_head_sha for PR #%s CLAUDE.md fetch failed (falling back to HEAD): %s",
+            logger.debug("get_pr_head_sha for PR #%s snippet fetch failed (falling back to HEAD): %s",
                          pr_number, e)
             cmd_head_sha = "HEAD"
+        claude_md = ""
         try:
-            claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref=cmd_head_sha)
+            claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref=comment_base_ref)
         except Exception as e:
             # 404 (file missing) returns "" without raising; reaching this
             # except means an auth/transport failure worth flagging.
@@ -1200,9 +1251,9 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
 
         # For inline diff comments, pull a line-numbered window of the file
         # around the commented line and inject it into the prompt so Claude
-        # doesn't have to find the code by parsing hunk headers. Reuse the
-        # head SHA fetched above for CLAUDE.md; if that fell back to "HEAD",
-        # try once more here in case the earlier call failed transiently.
+        # doesn't have to find the code by parsing hunk headers. Uses the
+        # PR head SHA fetched above; if that fell back to "HEAD", try once
+        # more here in case the earlier call failed transiently.
         code_snippet = ""
         if file_path and line > 0:
             try:
@@ -1216,10 +1267,15 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                              file_path, line, e)
 
         # Fetch per-repo respond-prompt override from the PR base branch.
-        # Best-effort: fall back to the built-in default on any failure.
+        # Reuse the base ref already fetched above for CLAUDE.md when
+        # available; only re-call if that initial fetch failed.
         respond_prompt_override = None
         try:
-            base_ref = provider.get_pr_base_ref(repo_full_name, pr_number)
+            base_ref = (
+                comment_base_ref
+                if comment_base_ref != "HEAD"
+                else provider.get_pr_base_ref(repo_full_name, pr_number)
+            )
             respond_prompt_override = _fetch_prompt_override(
                 provider, repo_full_name, base_ref, "respond",
             )
@@ -1644,15 +1700,14 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                     functools.partial(_log_future_exception, repo=repo_full_name),
                 )
         finally:
-            # Order matters: _save_cache() can raise (disk full,
-            # permission error). The lock release MUST always happen
-            # or the PR is wedged out of comment-driven mutations
-            # until process restart.
+            # ``_save_cache()`` catches all exceptions internally (disk
+            # full / permission denied are WARNING-logged + counted via
+            # ``raven_cache_save_failures_total``) and never propagates,
+            # so this call is non-raising. The lock release below would
+            # still happen even if it did, but keeping the call bare
+            # avoids dead defensive code.
             if mutated_cache:
-                try:
-                    _save_cache()
-                except Exception as e:
-                    logger.warning("_save_cache() failed in _process_comment finally: %s", e)
+                _save_cache()
             # Release the comment-mutation slot so a follow-up comment
             # on the same PR can proceed. The push-review set
             # (_in_progress_prs) is owned by _process_pr; we don't

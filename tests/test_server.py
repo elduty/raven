@@ -355,6 +355,54 @@ class TestProcessPr:
         assert kwargs["pr_title"] == "PR #42"
         assert kwargs["bot_user"] == "raven-bot"
 
+    def test_claude_md_fetched_from_base_ref_not_head(self):
+        """Same trust model as repo rules: CLAUDE.md must come from the
+        PR's base ref (already-merged state). If it came from head, a
+        hostile PR could add or edit CLAUDE.md to bias its own review
+        — and CLAUDE.md is now rendered in the trusted ``<repo_policy>``
+        block, so the impact would be high. Regression guard for the
+        2026-05-22 trust-tier fix."""
+        mc = self._make_provider()
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.list_directory.return_value = []
+        # Different content per ref so we can prove which one was fetched
+        def fake_fetch(repo, path, ref="HEAD"):
+            if path == "CLAUDE.md":
+                return "BASE_GUIDANCE" if ref == "main" else "HEAD_GUIDANCE"
+            return ""
+        mc.fetch_file.side_effect = fake_fetch
+
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+            mc.submit_review.return_value = {"id": 1}
+            mc.add_label_to_pr.return_value = None
+            mc.merge_pr.return_value = True
+            mc.get_commit_status.return_value = "success"
+            self._setup_raven_only(mc)
+            mc.get_authenticated_user.return_value = "raven-bot"
+            mc.get_pr_reviews.return_value = [{"user": {"login": "raven-bot"}, "state": "APPROVED"}]
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+
+        # CLAUDE.md fetch must have used base_ref ("main"), NOT head_sha ("abc123")
+        claude_calls = [
+            c for c in mc.fetch_file.call_args_list
+            if len(c.args) >= 2 and c.args[1] == "CLAUDE.md"
+        ]
+        assert len(claude_calls) == 1
+        cc = claude_calls[0]
+        ref_used = cc.kwargs.get("ref") or (
+            cc.args[2] if len(cc.args) >= 3 else None
+        )
+        assert ref_used == "main", f"CLAUDE.md fetched with ref={ref_used!r}, expected 'main'"
+        # And the content forwarded to review_diff is the base version
+        assert mock_review.call_args.kwargs.get("claude_md") == "BASE_GUIDANCE"
+
     def test_rules_fetched_from_base_ref_not_head(self):
         """Security regression: rules must come from the PR's base ref
         (already-merged state), not the head SHA. If they came from head,
@@ -3115,6 +3163,25 @@ class TestCachePersistence:
             _load_cache()
         assert len(_previous_diffs) == 0
 
+    def test_save_failure_increments_metric(self, tmp_path):
+        """Disk write failures must surface as a metric — silent WARNING
+        logging alone leaves operators unable to alert on persistent
+        cache-persistence breakage."""
+        _previous_diffs["owner/repo#1"] = CacheEntry(
+            timestamp=100.0, hashes={"a.py": "h"}, findings={"a.py": []},
+        )
+        with patch("raven.server._CACHE_DIR", tmp_path), \
+             patch("raven.server._CACHE_FILE", tmp_path / "cache.json"), \
+             patch("raven.server.os.replace", side_effect=PermissionError("denied")), \
+             patch("raven.server.inc") as mock_inc:
+            _save_cache()
+        # Verify the metric fired with the exception type as the reason.
+        assert any(
+            call.args[0] == "raven_cache_save_failures_total"
+            and call.args[1].get("reason") == "PermissionError"
+            for call in mock_inc.call_args_list
+        ), f"Expected raven_cache_save_failures_total inc; got: {mock_inc.call_args_list}"
+
 
 class TestBitbucketDCWebhook:
     """Integration tests for Bitbucket Data Center webhook endpoint."""
@@ -3401,6 +3468,115 @@ class TestBitbucketDCWebhook:
         assert resp.status_code == 200
         assert resp.get_json()["status"] == "accepted"
         mock_lookup.assert_not_called()
+
+    # -- Edited comment with bumped version triggers reprocessing ---------- #
+
+    def test_edited_comment_dispatches_when_version_bumped(self):
+        """pr:comment:edited carries comment.version (incremented per edit).
+        The server's dedup key includes the version so a re-edit of the
+        same comment id gets a distinct slot — letting a user add @raven
+        to an existing comment and have the edit trigger a reply."""
+        base_payload = {
+            "actor": {"slug": "alice"},
+            "pullRequest": {
+                "id": 10,
+                "toRef": {
+                    "repository": {"slug": "my-repo", "project": {"key": "PROJ"}},
+                },
+            },
+            "comment": {
+                "id": 901, "version": 1,
+                "text": "looking good @raven-bot",
+                "author": {"slug": "alice"},
+            },
+        }
+        with patch.object(self._provider, "get_authenticated_user", return_value=self.BB_USERNAME), \
+             patch("raven.server.executor") as mock_executor:
+            resp_add = self._post_bb_dc(base_payload, "pr:comment:added")
+            # Second delivery for the SAME comment_id but bumped version:
+            edited = dict(base_payload)
+            edited["comment"] = {
+                "id": 901, "version": 2,
+                "text": "looking good — @raven-bot please re-check",
+                "author": {"slug": "alice"},
+            }
+            edited["previousComment"] = "looking good @raven-bot"
+            resp_edit = self._post_bb_dc(edited, "pr:comment:edited")
+        assert resp_add.status_code == 200
+        assert resp_add.get_json()["status"] == "accepted"
+        assert resp_edit.status_code == 200
+        # Both deliveries dispatched — version-aware dedup keeps the edit
+        # from collapsing onto the original add's slot.
+        assert resp_edit.get_json()["status"] == "accepted"
+        assert mock_executor.submit.call_count == 2
+
+    def test_repeat_added_with_same_version_dedups(self):
+        """Sanity: webhook retry with the SAME (id, version) hits the
+        existing dedup slot. The version-aware key still collapses
+        identical deliveries."""
+        payload = {
+            "actor": {"slug": "alice"},
+            "pullRequest": {
+                "id": 10,
+                "toRef": {
+                    "repository": {"slug": "my-repo", "project": {"key": "PROJ"}},
+                },
+            },
+            "comment": {
+                "id": 902, "version": 1,
+                "text": "@raven-bot have a look",
+                "author": {"slug": "alice"},
+            },
+        }
+        with patch.object(self._provider, "get_authenticated_user", return_value=self.BB_USERNAME), \
+             patch("raven.server.executor") as mock_executor:
+            first = self._post_bb_dc(payload, "pr:comment:added")
+            second = self._post_bb_dc(payload, "pr:comment:added")
+        assert first.get_json()["status"] == "accepted"
+        assert second.get_json()["status"] == "skipped"
+        assert second.get_json()["reason"] == "duplicate"
+        assert mock_executor.submit.call_count == 1
+
+    # -- Review-state events route to existing no-op consumers ------------- #
+
+    def test_reviewer_approved_routes_to_no_action(self):
+        """Parity with Gitea's pull_request_review_approved. Consumer is
+        a no-op (route preserved so deliveries return a clean ignored
+        response), but the response must NOT be "unhandled"."""
+        payload = {
+            "actor": {"slug": "alice"},
+            "pullRequest": {
+                "id": 10, "title": "x",
+                "fromRef": {"displayId": "f", "latestCommit": "a",
+                            "repository": {"slug": "my-repo", "project": {"key": "PROJ"}}},
+                "toRef": {"displayId": "main",
+                          "repository": {"slug": "my-repo", "project": {"key": "PROJ"}}},
+                "links": {"self": [{"href": "https://bb/pr/10"}]},
+            },
+        }
+        with patch("raven.server.executor"):
+            resp = self._post_bb_dc(payload, "pr:reviewer:approved")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["status"] == "ignored"
+        assert "no action" in data["reason"]
+
+    def test_reviewer_changes_requested_routes_to_no_action(self):
+        payload = {
+            "actor": {"slug": "alice"},
+            "pullRequest": {
+                "id": 10, "title": "x",
+                "fromRef": {"displayId": "f", "latestCommit": "a",
+                            "repository": {"slug": "my-repo", "project": {"key": "PROJ"}}},
+                "toRef": {"displayId": "main",
+                          "repository": {"slug": "my-repo", "project": {"key": "PROJ"}}},
+                "links": {"self": [{"href": "https://bb/pr/10"}]},
+            },
+        }
+        with patch("raven.server.executor"):
+            resp = self._post_bb_dc(payload, "pr:reviewer:changes_requested")
+        assert resp.status_code == 200
+        assert resp.get_json()["status"] == "ignored"
 
     # -- Reviewer updated triggers review ---------------------------------- #
 

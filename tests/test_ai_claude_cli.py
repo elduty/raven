@@ -11,6 +11,7 @@ from raven.ai.base import AIBackend
 from raven.ai.claude_cli import (
     _active_procs,
     _active_procs_lock,
+    _redact_secrets,
     _run_claude_cli,
     terminate_active_processes,
     ClaudeCLIBackend,
@@ -311,3 +312,76 @@ class TestClaudeCLIBackend:
         assert "--allowed-tools" in cli_args
         tools_idx = cli_args.index("--allowed-tools")
         assert cli_args[tools_idx + 1] == ""
+
+
+# ------------------------------------------------------------------ #
+#  Token redaction in error-path logs                                  #
+# ------------------------------------------------------------------ #
+
+class TestRedactSecrets:
+    """Guards against credential leakage in CLI stderr/stdout logs.
+    The CLI shouldn't echo CLAUDE_CODE_OAUTH_TOKEN, but a misconfigured
+    auth or transport-error message can; redaction is belt-and-braces."""
+
+    def test_redacts_configured_oauth_token_literally(self, monkeypatch):
+        """The most targeted match: if the env-var value appears verbatim,
+        replace it. Zero false positives."""
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-abc123superSecret-xyz")
+        msg = "auth failed: token sk-ant-oat-abc123superSecret-xyz invalid"
+        assert "abc123superSecret" not in _redact_secrets(msg)
+        assert "***REDACTED***" in _redact_secrets(msg)
+
+    def test_redacts_anthropic_sk_ant_pattern(self):
+        """Unknown sk-ant-... key (not the configured env var) still gets
+        redacted via pattern, keeping a 4-char prefix as a hint."""
+        msg = "request failed with key sk-ant-1234567890abcdefghij"
+        out = _redact_secrets(msg)
+        assert "sk-ant-1234" in out  # prefix retained
+        assert "567890abcdefghij" not in out
+        assert "***REDACTED***" in out
+
+    def test_redacts_generic_sk_pattern(self):
+        msg = "Authorization: sk-proj-abcdefgh1234567890ijklmnop"
+        out = _redact_secrets(msg)
+        assert "abcdefgh1234567890ijklmnop" not in out
+
+    def test_redacts_bearer_token(self):
+        msg = "401 Unauthorized: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ"
+        out = _redact_secrets(msg)
+        assert "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" not in out
+        assert "Bearer " in out  # prefix retained
+        assert "***REDACTED***" in out
+
+    def test_short_token_env_var_not_substituted(self, monkeypatch):
+        """Don't replace tiny env-var values to avoid false-positive
+        substring matches (e.g. a 3-char token would match common words)."""
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "abc")
+        msg = "abc def ghi — error about abc"
+        # The 3-char token is under the 8-char threshold; left untouched.
+        assert _redact_secrets(msg) == msg
+
+    def test_empty_or_none_passes_through(self):
+        assert _redact_secrets("") == ""
+        assert _redact_secrets(None) is None  # type: ignore[arg-type]
+
+    def test_normal_error_messages_unchanged(self):
+        """No false positives on benign content. Real CLI error text
+        shouldn't get garbled by the redactor."""
+        msg = "claude CLI: model 'claude-opus-4-7' not found"
+        assert _redact_secrets(msg) == msg
+
+    def test_complete_redacts_stderr_in_runtime_error(self, monkeypatch):
+        """End-to-end: a non-zero CLI exit with a token in stderr
+        produces a RuntimeError whose detail is redacted, not raw."""
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-supersecret-token-xyz")
+        backend = ClaudeCLIBackend()
+        fake_result = MagicMock()
+        fake_result.returncode = 1
+        fake_result.stderr = "auth: sk-ant-oat-supersecret-token-xyz expired"
+        fake_result.stdout = ""
+
+        with patch("raven.ai.claude_cli._run_claude_cli", return_value=fake_result):
+            with pytest.raises(RuntimeError) as excinfo:
+                backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        assert "supersecret-token-xyz" not in str(excinfo.value)
+        assert "***REDACTED***" in str(excinfo.value)

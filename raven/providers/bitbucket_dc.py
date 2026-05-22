@@ -13,6 +13,13 @@ from raven.providers import GitProvider
 
 logger = logging.getLogger(__name__)
 
+# Max pages (50 activities/page) scanned by the three activities-endpoint
+# consumers: thread-root discovery, resolved-comment IDs, PR comment context.
+# 30 pages = 1500 activities, comfortably above a chatty multi-week PR while
+# staying cheap. Loops that exit without ``isLastPage=true`` emit a WARNING
+# so an operator can spot pathological PRs that may be dropping state.
+_ACTIVITIES_MAX_PAGES = 30
+
 
 class BitbucketDCProvider(GitProvider):
     """Bitbucket Data Center API client implementing the GitProvider interface."""
@@ -22,6 +29,12 @@ class BitbucketDCProvider(GitProvider):
 
     def __init__(self, base_url: str, token: str, webhook_secret: str, username: str = ""):
         self.base_url = base_url.rstrip("/")
+        # ``/rest/api/latest/`` aliases to ``/rest/api/1.0/`` — the only
+        # versioned API surface BB DC publishes. v9.0's "REST v2 migration"
+        # was an internal Jersey/Jackson rearchitecture, not a URL bump;
+        # ``latest`` is the documented stable entrypoint. We track it
+        # deliberately (rather than pinning to ``1.0``) so a future v2 URL
+        # would only surface as a deliberate Atlassian-side rollout.
         self.api_url = f"{self.base_url}/rest/api/latest"
         self.build_status_url = f"{self.base_url}/rest/build-status/latest"
         self.token = token
@@ -131,8 +144,13 @@ class BitbucketDCProvider(GitProvider):
         Some BB Server versions (observed on 9.4.x) return 500 when the
         request carries ``Accept: text/plain``. Let the server pick its
         default (JSON in recent versions) and rely on
-        ``_json_diff_to_unified`` to convert. The content-type check keeps
-        the plain-text branch available if a server does return text.
+        ``_json_diff_to_unified`` to convert.
+
+        Note: on modern BB DC the JSON branch is the **primary** code
+        path, not a fallback — the session-level Content-Type doesn't
+        send an Accept header and BB DC picks JSON by default. The
+        text-branch is the fallback (kept for older servers that ignore
+        the Content-Type and return plain text).
         """
         project, repo = _split_repo(repo_full_name)
         url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/diff"
@@ -297,8 +315,8 @@ class BitbucketDCProvider(GitProvider):
         project, repo = _split_repo(repo_full_name)
         url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/activities"
         start = 0
-        max_pages = 10
-        for _ in range(max_pages):
+        last_data: dict = {}
+        for _ in range(_ACTIVITIES_MAX_PAGES):
             try:
                 resp = self.session.get(url, params={"start": start, "limit": 50}, timeout=10)
                 resp.raise_for_status()
@@ -306,6 +324,7 @@ class BitbucketDCProvider(GitProvider):
                 logger.warning("BB DC activities fetch failed for PR #%d: %s", pr_number, e)
                 return None
             data = resp.json()
+            last_data = data
             for activity in data.get("values", []):
                 if activity.get("action") != "COMMENTED":
                     continue
@@ -317,6 +336,14 @@ class BitbucketDCProvider(GitProvider):
             if data.get("isLastPage", True):
                 break
             start = data.get("nextPageStart", start + 50)
+        else:
+            if not last_data.get("isLastPage", True):
+                logger.warning(
+                    "BB DC _find_thread_root for PR #%d: activities scan capped at %d pages; "
+                    "thread-root lookup may have missed the seed comment. Bump _ACTIVITIES_MAX_PAGES "
+                    "if this PR is legitimately this large.",
+                    pr_number, _ACTIVITIES_MAX_PAGES,
+                )
         return None
 
     def _comment_contains_id(self, node: dict, target_id: int) -> bool:
@@ -482,8 +509,8 @@ class BitbucketDCProvider(GitProvider):
         url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/activities"
         resolved: set[int] = set()
         start = 0
-        max_pages = 10
-        for _ in range(max_pages):
+        last_data: dict = {}
+        for _ in range(_ACTIVITIES_MAX_PAGES):
             try:
                 resp = self.session.get(url, params={"start": start, "limit": 50}, timeout=10)
                 resp.raise_for_status()
@@ -491,6 +518,7 @@ class BitbucketDCProvider(GitProvider):
                 logger.warning("BB DC get_resolved_comment_ids for PR #%d failed: %s", pr_number, e)
                 return set()
             data = resp.json()
+            last_data = data
             for activity in data.get("values", []):
                 if activity.get("action") != "COMMENTED":
                     continue
@@ -505,19 +533,35 @@ class BitbucketDCProvider(GitProvider):
             if data.get("isLastPage", True):
                 break
             start = data.get("nextPageStart", start + 50)
+        else:
+            if not last_data.get("isLastPage", True):
+                logger.warning(
+                    "BB DC get_resolved_comment_ids for PR #%d: activities scan capped at %d pages; "
+                    "some user-resolved findings beyond the cap may carry forward incorrectly.",
+                    pr_number, _ACTIVITIES_MAX_PAGES,
+                )
         return resolved
 
     def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
-        """Return all comments on a PR via the activities endpoint."""
+        """Return all comments on a PR via the activities endpoint.
+
+        Returns only **top-level** comments (each activity's root comment).
+        Replies nested in the ``comments`` array of each activity are not
+        extracted — they're already surfaced to the AI via the per-trigger
+        ``## Active Thread`` block in the comment-reply prompt, so
+        duplicating them here would only bloat the ``## Other PR
+        Conversation`` context.
+        """
         project, repo = _split_repo(repo_full_name)
         url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/activities"
         all_comments: list[dict] = []
         start = 0
-        max_pages = 10
-        for _ in range(max_pages):
+        last_data: dict = {}
+        for _ in range(_ACTIVITIES_MAX_PAGES):
             resp = self.session.get(url, params={"start": start, "limit": 50}, timeout=10)
             resp.raise_for_status()
             data = resp.json()
+            last_data = data
             for activity in data.get("values", []):
                 if activity.get("action") == "COMMENTED":
                     comment = activity.get("comment", {})
@@ -531,6 +575,13 @@ class BitbucketDCProvider(GitProvider):
             if data.get("isLastPage", True):
                 break
             start = data.get("nextPageStart", start + 50)
+        else:
+            if not last_data.get("isLastPage", True):
+                logger.warning(
+                    "BB DC get_pr_comments for PR #%d: activities scan capped at %d pages; "
+                    "older comments beyond the cap are missing from the prompt context.",
+                    pr_number, _ACTIVITIES_MAX_PAGES,
+                )
         return all_comments
 
     def post_pr_comment(self, repo_full_name: str, pr_number: int, body: str,
@@ -895,10 +946,40 @@ class BitbucketDCProvider(GitProvider):
             return self._parse_pr_event(payload, "pr_updated")
         elif event == "pr:reopened":
             return self._parse_pr_event(payload, "pr_reopened")
-        elif event == "pr:comment:added":
+        elif event in ("pr:comment:added", "pr:comment:edited"):
+            # Both routed through the same handler. Edits include
+            # ``comment.version`` (incremented per edit); the server's
+            # dedup key picks that up so each edit gets a distinct slot
+            # and a user adding ``@raven`` to an existing comment can
+            # still trigger a reply. ``previousComment`` (text before
+            # edit) is in the payload for diagnostics but not surfaced.
             return self._parse_comment(payload)
+        elif event == "pr:comment:deleted":
+            # Surfaced for operator visibility but no state mutation:
+            # the cached finding's ``comment_id`` is the Raven-posted
+            # inline review comment (which users normally can't delete),
+            # so a deletion is almost always a user removing their own
+            # reply. Logging is enough; the route returns None and the
+            # webhook 200s without dispatching.
+            logger.info("BB DC pr:comment:deleted received for PR #%s — no action",
+                        (payload.get("pullRequest") or {}).get("id"))
+            return None
         elif event == "pr:reviewer:updated":
             return self._parse_pr_event(payload, "review_requested")
+        elif event == "pr:reviewer:approved":
+            # Mirror of Gitea's pull_request_review_approved. Server's
+            # consumer is a no-op (the route only exists so webhook
+            # deliveries get a clean "ignored: no action taken" response
+            # instead of "unhandled"), but parity matters for operators
+            # debugging cross-provider behavior.
+            return self._parse_pr_event(payload, "review_approved")
+        elif event == "pr:reviewer:changes_requested":
+            return self._parse_pr_event(payload, "review_rejected")
+        elif event == "pr:reviewer:unapproved":
+            # No symmetric Gitea event; no behavioral need. Log + drop.
+            logger.debug("BB DC pr:reviewer:unapproved received for PR #%s — no action",
+                         (payload.get("pullRequest") or {}).get("id"))
+            return None
         else:
             return None
 
@@ -985,7 +1066,18 @@ class BitbucketDCProvider(GitProvider):
         return (event_type, normalized)
 
     def _parse_comment(self, payload: dict) -> tuple[str, dict] | None:
-        """Parse pr:comment:added event. Check anchor for diff_comment vs comment."""
+        """Parse pr:comment:added and pr:comment:edited events.
+
+        Both share the same payload shape; the edit case adds a
+        ``previousComment`` field (text before edit, not surfaced here)
+        and bumps ``comment.version``. The version is propagated as
+        ``comment_version`` so the server's dedup includes it — a fresh
+        edit (v=2, v=3, …) doesn't collide with the original add (v=1)
+        and reprocessing kicks in for things like a user adding
+        ``@raven`` to an existing comment.
+
+        Check anchor for diff_comment vs comment.
+        """
         pr = payload.get("pullRequest", {})
         comment = payload.get("comment", {})
         repo_data = pr.get("toRef", {}).get("repository", {})
@@ -1020,6 +1112,7 @@ class BitbucketDCProvider(GitProvider):
             "comment_body": comment.get("text", ""),
             "comment_user": comment.get("author", {}).get("slug", ""),
             "comment_id": comment.get("id"),
+            "comment_version": comment.get("version"),
             "parent_comment_id": parent_comment_id,
             "file_path": file_path,
             "line": line,

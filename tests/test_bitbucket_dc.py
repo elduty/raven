@@ -322,6 +322,84 @@ class TestParseWebhookComment:
         _, data = client.parse_webhook(req)
         assert data["parent_comment_id"] is None
 
+    def test_added_emits_comment_version(self, client):
+        """version=1 on a fresh comment; surfaced for the server's
+        dedup key so subsequent edits (v=2, …) don't collide."""
+        payload = _pr_payload()
+        payload["comment"] = {
+            "id": 99, "version": 1, "text": "first post",
+            "author": {"slug": "bob"},
+        }
+        req = _make_request(payload, "pr:comment:added")
+        _, data = client.parse_webhook(req)
+        assert data["comment_version"] == 1
+
+    def test_edited_event_routes_through_same_handler(self, client):
+        """pr:comment:edited shares the payload shape with pr:comment:added.
+        The version bump lets the server's dedup re-fire on the edit so a
+        user adding @raven to an existing comment triggers a reply."""
+        payload = _pr_payload()
+        payload["comment"] = {
+            "id": 99, "version": 2, "text": "second iteration with @raven",
+            "author": {"slug": "bob"},
+        }
+        payload["previousComment"] = "second iteration"
+        req = _make_request(payload, "pr:comment:edited")
+        event_type, data = client.parse_webhook(req)
+        assert event_type == "comment"
+        assert data["comment_id"] == 99
+        assert data["comment_version"] == 2
+        assert data["comment_body"] == "second iteration with @raven"
+
+    def test_edited_diff_comment_preserves_anchor(self, client):
+        payload = _pr_payload()
+        payload["comment"] = {
+            "id": 100, "version": 3, "text": "edited inline note",
+            "author": {"slug": "bob"},
+            "anchor": {"path": "src/main.py", "line": 42},
+        }
+        req = _make_request(payload, "pr:comment:edited")
+        event_type, data = client.parse_webhook(req)
+        assert event_type == "diff_comment"
+        assert data["file_path"] == "src/main.py"
+        assert data["line"] == 42
+        assert data["comment_version"] == 3
+
+    def test_deleted_event_returns_none(self, client):
+        """pr:comment:deleted is surfaced (INFO log) but not dispatched.
+        The route exists so operators see explicit handling rather than
+        an unrecognized-event silent drop."""
+        payload = _pr_payload()
+        payload["comment"] = {"id": 99, "text": "gone"}
+        req = _make_request(payload, "pr:comment:deleted")
+        assert client.parse_webhook(req) is None
+
+
+# ------------------------------------------------------------------ #
+#  parse_webhook — review-state events                                #
+# ------------------------------------------------------------------ #
+
+class TestParseWebhookReviewState:
+    """Parity with Gitea's pull_request_review_approved / _rejected.
+    The server's consumer is a no-op (route preserved so webhook
+    deliveries get an explicit ignored response), but parity matters
+    for operators debugging cross-provider behavior."""
+
+    def test_reviewer_approved_maps_to_review_approved(self, client):
+        req = _make_request(_pr_payload(), "pr:reviewer:approved")
+        event_type, _ = client.parse_webhook(req)
+        assert event_type == "review_approved"
+
+    def test_reviewer_changes_requested_maps_to_review_rejected(self, client):
+        req = _make_request(_pr_payload(), "pr:reviewer:changes_requested")
+        event_type, _ = client.parse_webhook(req)
+        assert event_type == "review_rejected"
+
+    def test_reviewer_unapproved_returns_none(self, client):
+        """No symmetric Gitea event + no behavior need → drop silently."""
+        req = _make_request(_pr_payload(), "pr:reviewer:unapproved")
+        assert client.parse_webhook(req) is None
+
 
 # ------------------------------------------------------------------ #
 #  parse_webhook — unknown event                                      #
@@ -1136,6 +1214,29 @@ class TestGetCommentThread:
             thread = client.get_comment_thread("proj/repo", 1, 101)
         ids = [c["id"] for c in thread]
         assert ids == [100, 101]
+
+    def test_pagination_cap_logs_warning_when_more_pages_pending(self, client, caplog):
+        """If the activities scan exhausts _ACTIVITIES_MAX_PAGES (30) while
+        the server still reports isLastPage=false, log a WARNING so
+        operators can spot pathological PRs that may drop state."""
+        from raven.providers.bitbucket_dc import _ACTIVITIES_MAX_PAGES
+        # Each page is "not last" with one unrelated comment.
+        def fake_get(url, params=None, timeout=None):
+            mr = MagicMock(status_code=200)
+            mr.raise_for_status = MagicMock()
+            mr.json.return_value = self._activities_response(
+                [{"id": 9999, "author": {"slug": "a"}, "text": "unrelated", "comments": []}],
+                is_last=False, next_start=(params or {}).get("start", 0) + 50,
+            )
+            return mr
+        with caplog.at_level("WARNING", logger="raven.providers.bitbucket_dc"), \
+             patch.object(client.session, "get", side_effect=fake_get):
+            result = client.get_comment_thread("proj/repo", 1, 12345)
+        assert result == []  # seed never found
+        assert any(
+            "activities scan capped" in r.message and str(_ACTIVITIES_MAX_PAGES) in r.message
+            for r in caplog.records
+        )
 
 
 # ------------------------------------------------------------------ #
