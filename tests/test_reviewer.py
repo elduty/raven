@@ -414,6 +414,156 @@ class TestChunkedReviewAllFail:
         assert result["chunks_reviewed"] == 1
 
 
+class TestChunkedReviewConsolidation:
+    """When a diff is chunked, each per-chunk AI call sees the rules
+    but can't reason about whole-PR constraints (a rule like "max 5
+    findings" collapses to "per file" when each chunk runs independently).
+    The consolidation pass takes the merged chunk findings + the rules
+    and produces the final policy-respecting review."""
+
+    def _big_diff(self):
+        return (
+            "diff --git a/a.py b/a.py\n" + "+line\n" * 200 +
+            "diff --git a/b.py b/b.py\n" + "+line\n" * 200
+        )
+
+    def test_consolidation_runs_when_chunked_with_rules(self, monkeypatch):
+        """Each chunk returns 3 findings; rules say max 2. Consolidation
+        pass collapses to 2."""
+        chunk_a = json.dumps({"severity": "high", "summary": "A bad",
+            "findings": [{"severity": "high", "message": "issue 1"},
+                         {"severity": "medium", "message": "issue 2"},
+                         {"severity": "low", "message": "issue 3"}]})
+        chunk_b = json.dumps({"severity": "medium", "summary": "B issues",
+            "findings": [{"severity": "medium", "message": "issue 4"},
+                         {"severity": "low", "message": "issue 5"}]})
+        # Consolidation pass returns a filtered + capped result.
+        consolidated = json.dumps({"severity": "high", "summary": "Consolidated",
+            "findings": [{"severity": "high", "message": "issue 1"},
+                         {"severity": "medium", "message": "issue 2"}]})
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = [chunk_a, chunk_b, consolidated]
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(
+                self._big_diff(), "user/repo",
+                rules={".claude/rules/policy.md": "max 2 findings"},
+            )
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        # 3 calls: two chunks + one consolidation
+        assert fake_backend.complete.call_count == 3
+        # Last call is the consolidation — has purpose="consolidate"
+        last_call = fake_backend.complete.call_args_list[-1]
+        assert last_call.kwargs.get("purpose") == "consolidate"
+        # Result is the consolidated output, not the raw merge
+        assert result["chunked"] is True
+        assert result.get("consolidated") is True
+        assert len(result["findings"]) == 2  # capped
+        assert result["severity"] == "high"
+
+    def test_consolidation_skipped_when_no_policy(self, monkeypatch):
+        """No rules + no CLAUDE.md → no policy to apply → skip the
+        extra AI call entirely, return the raw merge."""
+        chunk_a = json.dumps({"severity": "low", "summary": "A ok", "findings": []})
+        chunk_b = json.dumps({"severity": "low", "summary": "B ok", "findings": []})
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = [chunk_a, chunk_b]
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(self._big_diff(), "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        # Only 2 chunk calls — NO consolidation call
+        assert fake_backend.complete.call_count == 2
+        # No "consolidated" flag in the result
+        assert result.get("consolidated") is not True
+        assert result["chunked"] is True
+
+    def test_consolidation_skipped_for_single_chunk_path(self, monkeypatch):
+        """Small diff → single chunk → rules already apply naturally.
+        No consolidation overhead."""
+        single = json.dumps({"severity": "low", "summary": "ok", "findings": []})
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = [single]
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        # Diff well under MAX_DIFF_LINES, so single-chunk path is used.
+        result = review_diff(
+            "diff --git a/a.py b/a.py\n+only one line\n", "user/repo",
+            rules={".claude/rules/policy.md": "be strict"},
+        )
+        assert fake_backend.complete.call_count == 1
+        assert result["chunked"] is False
+        assert result.get("consolidated") is not True
+
+    def test_consolidation_fallback_on_ai_error(self, monkeypatch):
+        """If the consolidation call raises, fall back to the raw merge —
+        don't lose the chunk findings entirely just because policy-
+        application failed."""
+        chunk_a = json.dumps({"severity": "high", "summary": "A bad",
+            "findings": [{"severity": "high", "message": "issue 1"}]})
+        chunk_b = json.dumps({"severity": "low", "summary": "B ok",
+            "findings": [{"severity": "low", "message": "issue 2"}]})
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = [
+            chunk_a, chunk_b, RuntimeError("consolidation backend timeout"),
+        ]
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(
+                self._big_diff(), "user/repo",
+                rules={".claude/rules/policy.md": "max 1 finding"},
+            )
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        # Raw merge preserved — both findings present
+        assert result.get("consolidated") is not True
+        assert len(result["findings"]) == 2
+
+    def test_consolidation_fallback_on_parse_error(self, monkeypatch):
+        """Consolidation returning unparseable output → fall back."""
+        chunk = json.dumps({"severity": "high", "summary": "A bad",
+            "findings": [{"severity": "high", "message": "issue"}]})
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = [chunk, chunk, "not JSON at all"]
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(
+                self._big_diff(), "user/repo",
+                rules={".claude/rules/policy.md": "be strict"},
+            )
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result.get("consolidated") is not True
+        assert len(result["findings"]) == 2  # raw merge
+
+
 class TestSeverityGte:
     def test_same_level(self):
         assert severity_gte("medium", "medium") is True

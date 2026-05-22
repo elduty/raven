@@ -599,13 +599,152 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
             "_parse_error": True,
         }
 
-    result = {
+    # Consolidation pass — applies any whole-PR rules from the repo's
+    # ``.claude/rules/`` and ``CLAUDE.md`` to the aggregated chunk
+    # findings. The per-chunk reviews each saw the rules but interpret
+    # them within a single-file scope (a rule like "max 5 findings" or
+    # "no low severity" collapses to "per file" when each chunk runs
+    # independently). The consolidation pass takes the merged findings
+    # + the rule context and produces the final policy-respecting review.
+    # Skipped when neither rules nor CLAUDE.md are configured — nothing
+    # to consolidate against, so the raw merge is the final answer.
+    consolidated = _consolidate_chunked_review(
+        findings=all_findings,
+        base_severity=max_severity,
+        summary=merged_summary,
+        rules=rules,
+        claude_md=claude_md,
+        repo_name=repo_name,
+        prompt_override=prompt_override,
+    )
+    if consolidated is not None:
+        return {
+            "severity": consolidated["severity"],
+            "summary": consolidated.get("summary") or merged_summary or "Multi-file review consolidated.",
+            "findings": consolidated["findings"],
+            "chunked": True,
+            "chunks_reviewed": reviewed_count,
+            "consolidated": True,
+        }
+
+    return {
         "severity": max_severity,
         "summary": merged_summary or "Multi-file review completed.",
         "findings": all_findings,
         "chunked": True,
         "chunks_reviewed": reviewed_count,
     }
+
+
+def _consolidate_chunked_review(
+    findings: list[dict],
+    base_severity: str,
+    summary: str,
+    rules: dict[str, str] | None,
+    claude_md: str,
+    repo_name: str,
+    prompt_override: str | None = None,
+) -> dict | None:
+    """Apply repo-level review policy (rules + CLAUDE.md) to the
+    aggregated findings from a chunked review.
+
+    Each per-chunk review sees the rules but interprets them within a
+    single-file scope. Aggregate-style rules ("max N findings",
+    "prioritise the top X") collapse to "per file" when each chunk
+    runs independently — 64 chunks × 1 finding still blows past a
+    "max 5" cap. This pass takes the merged finding list + the policy
+    blocks and produces the final, policy-respecting review.
+
+    Acts on the finding list only — no per-file investigation, no
+    re-reading the diff. The pass can DROP, RANK, or DEDUPE findings
+    but must NOT add new ones (the chunks already had the code in
+    context; this pass doesn't).
+
+    Returns:
+        Consolidated review dict on success; ``None`` when there's no
+        policy to apply (no rules + no CLAUDE.md) or the AI call fails
+        / parses to ``_parse_error``. Caller falls back to the raw
+        merge on ``None``.
+    """
+    # No policy to apply → caller's raw merge is the right answer.
+    if not rules and not claude_md:
+        return None
+    if not findings:
+        return None
+
+    tag_id = _make_tag_id()
+    preamble = _build_trust_preamble(tag_id)
+
+    rules_section = _build_rules_section(rules, tag_id)
+    repo_context = ""
+    if claude_md:
+        repo_context = (
+            "\n\n## Repository Context (from CLAUDE.md at the base branch — authoritative project guidance)\n"
+            + _wrap_repo_policy("repo_overview", claude_md, tag_id)
+        )
+
+    findings_json = json.dumps(findings, indent=2)
+    findings_block = (
+        "\n\n## Findings From File-Level Reviews\n"
+        "These findings were collected from per-file reviews of this PR. "
+        "Each file was reviewed independently and could not reason about "
+        "whole-PR constraints in the repository policy above.\n\n"
+        f"```json\n{findings_json}\n```\n"
+    )
+
+    effective_template = (
+        prompt_override if (prompt_override and prompt_override.strip())
+        else _REVIEW_PROMPT_TEMPLATE
+    )
+
+    instructions = (
+        "\n\n## Your Task — Consolidation\n"
+        "Apply the repository review policy above to the file-level "
+        "findings. You may:\n"
+        "- DROP findings that conflict with policy (e.g. severity below "
+        "a stated minimum).\n"
+        "- KEEP only the most impactful findings if the policy caps the "
+        "count — rank by severity and impact.\n"
+        "- DEDUPE findings that overlap across files.\n"
+        "- REFINE the summary to describe the consolidated review.\n\n"
+        "Do NOT add findings the file-level reviews did not surface — "
+        "this pass does not see the diff. Output ONLY valid JSON "
+        "matching the review schema in the prompt template (severity, "
+        "summary, findings[]). No preamble."
+    )
+
+    prompt = (
+        f"{preamble}\n\n"
+        f"## Repository: {repo_name}{repo_context}\n\n"
+        f"{effective_template}"
+        f"{rules_section}"
+        f"{findings_block}"
+        f"{instructions}"
+    )
+
+    logger.info(
+        "Consolidating %d chunk findings for %s (model=%s effort=%s)",
+        len(findings), repo_name, RAVEN_AI_MODEL, RAVEN_AI_EFFORT,
+    )
+
+    try:
+        output = get_backend().complete(
+            prompt,
+            model=RAVEN_AI_MODEL,
+            effort=RAVEN_AI_EFFORT,
+            timeout=RAVEN_AI_TIMEOUT,
+            purpose="consolidate",
+        )
+    except Exception as e:
+        logger.warning("Consolidation pass call failed for %s: %s — falling back to raw merge",
+                       repo_name, e)
+        return None
+
+    result = _parse_response(output)
+    if result.get("_parse_error"):
+        logger.warning("Consolidation pass parse error for %s — falling back to raw merge",
+                       repo_name)
+        return None
     return result
 
 
