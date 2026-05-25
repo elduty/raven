@@ -100,5 +100,10 @@ Rules:
 - Each finding must include `file` (the path from the diff header, e.g. `src/server.py`) and `line` (the line number in the NEW version of the file, from the `+` side of the diff). Use the line numbers shown in the `@@` hunk headers.
 - If you cannot determine the exact line, omit `file` and `line` and put the location in the `message` instead.
 - Each finding message must be self-contained — include enough context that the developer knows exactly what to fix.
+
+## Output Behavior Defaults
+
+These defaults apply unless a Repository Rules section above specifies otherwise. When a rule conflicts with a default below, **the rule wins** — it represents the repo maintainers' deliberate choice for how reviews should run in their codebase.
+
 - Order findings by severity: high → medium → low.
 - Maximum 10 findings. If there are more, report the most impactful ones.
