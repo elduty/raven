@@ -692,50 +692,31 @@ def _consolidate_chunked_review(
         f"```json\n{findings_json}\n```\n"
     )
 
-    # The consolidation pass does NOT include the full review template
-    # (review.md). It's not reviewing code — it's applying policy to an
-    # already-collected finding list. Including the template would inject
-    # behavioral defaults (like "Maximum 10 findings") that conflict with
-    # repo rules (like "max 5"), forcing the model to resolve competing
-    # caps. Instead: JSON schema + consolidation-specific instructions +
-    # the "Output Behavior Defaults" section with "rules win" framing.
+    effective_template = (
+        prompt_override if (prompt_override and prompt_override.strip())
+        else _REVIEW_PROMPT_TEMPLATE
+    )
+
     instructions = (
         "\n\n## Your Task — Consolidation\n"
         "Apply the repository review policy above to the file-level "
-        "findings. You MUST apply every constraint in the policy "
-        "exactly as stated. You may:\n"
+        "findings. You may:\n"
         "- DROP findings that conflict with policy (e.g. severity below "
         "a stated minimum).\n"
         "- KEEP only the most impactful findings if the policy caps the "
-        "count — rank by severity and impact, then truncate to the cap.\n"
+        "count — rank by severity and impact.\n"
         "- DEDUPE findings that overlap across files.\n"
         "- REFINE the summary to describe the consolidated review.\n\n"
         "Do NOT add findings the file-level reviews did not surface — "
-        "this pass does not see the diff.\n\n"
-        "## Output Behavior Defaults\n\n"
-        "These defaults apply unless a Repository Rules section above "
-        "specifies otherwise. When a rule conflicts with a default below, "
-        "**the rule wins**.\n\n"
-        "- Order findings by severity: high → medium → low.\n"
-        "- Maximum 10 findings. If there are more, report the most "
-        "impactful ones.\n\n"
-        "## Output Format\n\n"
-        "Respond with ONLY valid JSON:\n\n"
-        '```\n'
-        '{\n'
-        '  "severity": "low|medium|high",\n'
-        '  "summary": "One-sentence consolidated assessment.",\n'
-        '  "findings": [\n'
-        '    {"severity": "...", "file": "...", "line": N, "message": "..."}\n'
-        '  ]\n'
-        '}\n'
-        '```\n'
-        "No preamble outside the JSON object."
+        "this pass does not see the diff. Output ONLY valid JSON "
+        "matching the review schema in the prompt template (severity, "
+        "summary, findings[]). No preamble."
     )
 
     prompt = (
         f"{preamble}\n\n"
         f"## Repository: {repo_name}{repo_context}\n\n"
+        f"{effective_template}"
         f"{rules_section}"
         f"{findings_block}"
         f"{instructions}"
