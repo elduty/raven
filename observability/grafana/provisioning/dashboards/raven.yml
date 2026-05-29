@@ -1,0 +1,17 @@
+# Auto-loads the version-controlled Raven dashboard(s) on Grafana boot.
+apiVersion: 1
+
+providers:
+  - name: Raven
+    orgId: 1
+    folder: Raven
+    type: file
+    disableDeletion: false
+    # Dashboard JSON is mounted read-only and version-controlled; edit the file,
+    # not the UI. false makes Grafana surface it as read-only (UI saves would
+    # otherwise fail silently against the :ro mount and be lost on restart).
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

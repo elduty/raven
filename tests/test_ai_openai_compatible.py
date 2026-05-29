@@ -6,9 +6,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-
-def _make_response(text: str, finish_reason: str = "stop") -> MagicMock:
-    """Build a mock openai ChatCompletion response with one choice."""
+def _make_response(text: str, finish_reason: str = "stop",
+                   prompt_tokens: int = 0, completion_tokens: int = 0) -> MagicMock:
+    """Build a mock openai ChatCompletion response with one choice + usage."""
     message = MagicMock()
     message.content = text
     choice = MagicMock()
@@ -16,7 +16,25 @@ def _make_response(text: str, finish_reason: str = "stop") -> MagicMock:
     choice.finish_reason = finish_reason
     response = MagicMock()
     response.choices = [choice]
+    response.usage = MagicMock(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
     return response
+
+
+def _raw(response, cost=None) -> MagicMock:
+    """Wrap a parsed response as a with_raw_response object: ``.parse()``
+    returns the body, ``.headers`` carries the optional LiteLLM cost."""
+    raw = MagicMock()
+    raw.parse.return_value = response
+    raw.headers = {} if cost is None else {"x-litellm-response-cost": str(cost)}
+    return raw
+
+
+def _patch_create(backend, *, return_value=None, side_effect=None):
+    """Patch the with_raw_response.create call the backend now uses."""
+    target = backend._client.chat.completions.with_raw_response
+    if side_effect is not None:
+        return patch.object(target, "create", side_effect=side_effect)
+    return patch.object(target, "create", return_value=return_value)
 
 
 class TestOpenAICompatibleBackendComplete:
@@ -28,10 +46,7 @@ class TestOpenAICompatibleBackendComplete:
         from raven.ai.openai_compatible import OpenAICompatibleBackend
 
         backend = OpenAICompatibleBackend()
-        with patch.object(
-            backend._client.chat.completions, "create",
-            return_value=_make_response("model output"),
-        ) as mock_create:
+        with _patch_create(backend, return_value=_raw(_make_response("model output"))) as mock_create:
             out = backend.complete(
                 "the prompt",
                 model="claude-opus-4-7",
@@ -39,7 +54,7 @@ class TestOpenAICompatibleBackendComplete:
                 timeout=600,
                 purpose="review",
             )
-        assert out == "model output"
+        assert out.text == "model output"
         _, kwargs = mock_create.call_args
         assert kwargs["model"] == "claude-opus-4-7"
         assert kwargs["messages"] == [{"role": "user", "content": "the prompt"}]
@@ -55,10 +70,7 @@ class TestOpenAICompatibleBackendComplete:
         from raven.ai.openai_compatible import OpenAICompatibleBackend
 
         backend = OpenAICompatibleBackend()
-        with patch.object(
-            backend._client.chat.completions, "create",
-            return_value=_make_response("x"),
-        ) as mock_create:
+        with _patch_create(backend, return_value=_raw(_make_response("x"))) as mock_create:
             backend.complete(
                 "p", model="m", effort=effort, timeout=60, purpose="review",
             )
@@ -69,15 +81,59 @@ class TestOpenAICompatibleBackendComplete:
         from raven.ai.openai_compatible import OpenAICompatibleBackend
 
         backend = OpenAICompatibleBackend()
-        with patch.object(
-            backend._client.chat.completions, "create",
-            return_value=_make_response("x"),
-        ) as mock_create:
+        with _patch_create(backend, return_value=_raw(_make_response("x"))) as mock_create:
             backend.complete(
                 "p", model="m", effort="none", timeout=60, purpose="review",
             )
         _, kwargs = mock_create.call_args
         assert "reasoning_effort" not in kwargs
+
+
+class TestOpenAICompatibleBackendUsageAndCost:
+    def test_usage_tokens_extracted(self):
+        from raven.ai.openai_compatible import OpenAICompatibleBackend
+
+        backend = OpenAICompatibleBackend()
+        resp = _make_response("ok", prompt_tokens=120, completion_tokens=34)
+        with _patch_create(backend, return_value=_raw(resp)):
+            out = backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        assert out.input_tokens == 120
+        assert out.output_tokens == 34
+
+    def test_litellm_cost_header_read(self):
+        from raven.ai.openai_compatible import OpenAICompatibleBackend
+
+        backend = OpenAICompatibleBackend()
+        with _patch_create(backend, return_value=_raw(_make_response("ok"), cost="0.0234")):
+            out = backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        assert out.cost_usd == 0.0234
+
+    def test_cost_none_when_header_absent(self):
+        from raven.ai.openai_compatible import OpenAICompatibleBackend
+
+        backend = OpenAICompatibleBackend()
+        with _patch_create(backend, return_value=_raw(_make_response("ok"))):  # no cost header
+            out = backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        assert out.cost_usd is None
+
+    def test_unparseable_cost_header_is_none(self):
+        from raven.ai.openai_compatible import OpenAICompatibleBackend
+
+        backend = OpenAICompatibleBackend()
+        with _patch_create(backend, return_value=_raw(_make_response("ok"), cost="not-a-number")):
+            out = backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        assert out.cost_usd is None
+
+    def test_missing_usage_yields_zero_tokens(self):
+        from raven.ai.openai_compatible import OpenAICompatibleBackend
+
+        backend = OpenAICompatibleBackend()
+        resp = _make_response("ok")
+        resp.usage = None  # some proxies omit usage entirely
+        with _patch_create(backend, return_value=_raw(resp)):
+            out = backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        assert out.input_tokens == 0 and out.output_tokens == 0
+        assert out.text == "ok"
 
 
 class TestOpenAICompatibleBackendErrorMapping:
@@ -86,10 +142,7 @@ class TestOpenAICompatibleBackendErrorMapping:
         from raven.ai.openai_compatible import OpenAICompatibleBackend
 
         backend = OpenAICompatibleBackend()
-        with patch.object(
-            backend._client.chat.completions, "create",
-            side_effect=openai.APITimeoutError(request=MagicMock()),
-        ):
+        with _patch_create(backend, side_effect=openai.APITimeoutError(request=MagicMock())):
             with pytest.raises(RuntimeError, match="timed out after 60s"):
                 backend.complete(
                     "p", model="m", effort="max", timeout=60, purpose="review",
@@ -101,9 +154,7 @@ class TestOpenAICompatibleBackendErrorMapping:
 
         backend = OpenAICompatibleBackend()
         err = openai.APIError("boom", request=MagicMock(), body=None)
-        with patch.object(
-            backend._client.chat.completions, "create", side_effect=err,
-        ):
+        with _patch_create(backend, side_effect=err):
             with pytest.raises(RuntimeError, match="AI backend error"):
                 backend.complete(
                     "p", model="m", effort="max", timeout=60, purpose="review",
@@ -114,10 +165,7 @@ class TestOpenAICompatibleBackendErrorMapping:
         from raven.ai.openai_compatible import OpenAICompatibleBackend
 
         backend = OpenAICompatibleBackend()
-        with patch.object(
-            backend._client.chat.completions, "create",
-            side_effect=openai.APIConnectionError(request=MagicMock()),
-        ):
+        with _patch_create(backend, side_effect=openai.APIConnectionError(request=MagicMock())):
             with pytest.raises(RuntimeError, match="AI backend error"):
                 backend.complete(
                     "p", model="m", effort="max", timeout=60, purpose="review",
@@ -129,10 +177,7 @@ class TestOpenAICompatibleBackendEmptyResponse:
         from raven.ai.openai_compatible import OpenAICompatibleBackend
 
         backend = OpenAICompatibleBackend()
-        with patch.object(
-            backend._client.chat.completions, "create",
-            return_value=_make_response("", finish_reason="length"),
-        ):
+        with _patch_create(backend, return_value=_raw(_make_response("", finish_reason="length"))):
             with pytest.raises(RuntimeError, match="finish_reason=length"):
                 backend.complete(
                     "p", model="m", effort="max", timeout=60, purpose="review",
@@ -144,10 +189,7 @@ class TestOpenAICompatibleBackendEmptyResponse:
         backend = OpenAICompatibleBackend()
         resp = _make_response("x", finish_reason="stop")
         resp.choices[0].message.content = None
-
-        with patch.object(
-            backend._client.chat.completions, "create", return_value=resp,
-        ):
+        with _patch_create(backend, return_value=_raw(resp)):
             with pytest.raises(RuntimeError, match="empty response"):
                 backend.complete(
                     "p", model="m", effort="max", timeout=60, purpose="review",
@@ -159,10 +201,7 @@ class TestOpenAICompatibleBackendEmptyResponse:
         backend = OpenAICompatibleBackend()
         resp = MagicMock()
         resp.choices = []
-
-        with patch.object(
-            backend._client.chat.completions, "create", return_value=resp,
-        ):
+        with _patch_create(backend, return_value=_raw(resp)):
             with pytest.raises(RuntimeError, match="no choices"):
                 backend.complete(
                     "p", model="m", effort="max", timeout=60, purpose="review",
@@ -176,20 +215,15 @@ class TestOpenAICompatibleBackendEmptyResponse:
 
         backend = OpenAICompatibleBackend()
         resp = _make_response("placeholder", finish_reason="stop")
-        # Simulate a multimodal/reasoning response: list of parts.
         part_text_a = MagicMock(type="text", text="first ")
         part_thinking = MagicMock(type="thinking", text="hidden")
         part_text_b = MagicMock(type="text", text="and second")
         resp.choices[0].message.content = [part_text_a, part_thinking, part_text_b]
-
-        with patch.object(
-            backend._client.chat.completions, "create", return_value=resp,
-        ):
+        with _patch_create(backend, return_value=_raw(resp)):
             out = backend.complete(
                 "p", model="m", effort="max", timeout=60, purpose="review",
             )
-        # Only text-typed parts concatenated; the "thinking" part is excluded.
-        assert out == "first and second"
+        assert out.text == "first and second"
 
     def test_unsupported_content_type_raises_empty_response(self):
         """If ``content`` is an unexpected type (e.g. dict, int — a proxy
@@ -200,10 +234,7 @@ class TestOpenAICompatibleBackendEmptyResponse:
         backend = OpenAICompatibleBackend()
         resp = _make_response("placeholder", finish_reason="stop")
         resp.choices[0].message.content = {"unexpected": "dict"}
-
-        with patch.object(
-            backend._client.chat.completions, "create", return_value=resp,
-        ):
+        with _patch_create(backend, return_value=_raw(resp)):
             with pytest.raises(RuntimeError, match="empty response"):
                 backend.complete(
                     "p", model="m", effort="max", timeout=60, purpose="review",
@@ -295,10 +326,7 @@ class TestOpenAICompatibleBackendMaxTokens:
         from raven.ai.openai_compatible import OpenAICompatibleBackend
 
         backend = OpenAICompatibleBackend()
-        with patch.object(
-            backend._client.chat.completions, "create",
-            return_value=_make_response("x"),
-        ) as mock_create:
+        with _patch_create(backend, return_value=_raw(_make_response("x"))) as mock_create:
             backend.complete(
                 "p", model="m", effort="max", timeout=60, purpose="review",
             )
@@ -310,10 +338,7 @@ class TestOpenAICompatibleBackendMaxTokens:
         from raven.ai.openai_compatible import OpenAICompatibleBackend
 
         backend = OpenAICompatibleBackend()
-        with patch.object(
-            backend._client.chat.completions, "create",
-            return_value=_make_response("x"),
-        ) as mock_create:
+        with _patch_create(backend, return_value=_raw(_make_response("x"))) as mock_create:
             backend.complete(
                 "p", model="m", effort="max", timeout=60, purpose="review",
             )

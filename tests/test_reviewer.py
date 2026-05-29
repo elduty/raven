@@ -5,7 +5,7 @@ import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-
+from raven.ai.base import CompletionResult
 from raven.reviewer import (
     _parse_response,
     _strip_lockfiles_and_binaries,
@@ -14,6 +14,13 @@ from raven.reviewer import (
     severity_gte,
     split_diff_by_file,
 )
+
+
+def _cr(text: str, input_tokens: int = 0, output_tokens: int = 0, cost_usd=None) -> CompletionResult:
+    """Wrap a model-output string as a CompletionResult (backends now
+    return this, not a bare str)."""
+    return CompletionResult(text=text, input_tokens=input_tokens,
+                            output_tokens=output_tokens, cost_usd=cost_usd)
 
 
 # ------------------------------------------------------------------ #
@@ -134,7 +141,7 @@ class TestReviewDiff:
         """Create a fake backend and install it as the cached backend."""
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.return_value = return_value
+        fake_backend.complete.return_value = _cr(return_value)
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
         return fake_backend
 
@@ -397,7 +404,7 @@ class TestChunkedReviewAllFail:
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
         fake_backend.complete.side_effect = [
-            json.dumps({"severity": "low", "summary": "ok", "findings": []}),
+            _cr(json.dumps({"severity": "low", "summary": "ok", "findings": []})),
             RuntimeError("claude CLI exited with code 1: err"),
         ]
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
@@ -443,7 +450,7 @@ class TestChunkedReviewConsolidation:
                          {"severity": "medium", "message": "issue 2"}]})
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.side_effect = [chunk_a, chunk_b, consolidated]
+        fake_backend.complete.side_effect = [_cr(chunk_a), _cr(chunk_b), _cr(consolidated)]
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
 
         import raven.reviewer as rev
@@ -475,7 +482,7 @@ class TestChunkedReviewConsolidation:
         chunk_b = json.dumps({"severity": "low", "summary": "B ok", "findings": []})
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.side_effect = [chunk_a, chunk_b]
+        fake_backend.complete.side_effect = [_cr(chunk_a), _cr(chunk_b)]
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
 
         import raven.reviewer as rev
@@ -498,7 +505,7 @@ class TestChunkedReviewConsolidation:
         single = json.dumps({"severity": "low", "summary": "ok", "findings": []})
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.side_effect = [single]
+        fake_backend.complete.side_effect = [_cr(single)]
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
 
         # Diff well under MAX_DIFF_LINES, so single-chunk path is used.
@@ -521,7 +528,7 @@ class TestChunkedReviewConsolidation:
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
         fake_backend.complete.side_effect = [
-            chunk_a, chunk_b, RuntimeError("consolidation backend timeout"),
+            _cr(chunk_a), _cr(chunk_b), RuntimeError("consolidation backend timeout"),
         ]
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
 
@@ -546,7 +553,7 @@ class TestChunkedReviewConsolidation:
             "findings": [{"severity": "high", "message": "issue"}]})
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.side_effect = [chunk, chunk, "not JSON at all"]
+        fake_backend.complete.side_effect = [_cr(chunk), _cr(chunk), _cr("not JSON at all")]
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
 
         import raven.reviewer as rev
@@ -562,6 +569,47 @@ class TestChunkedReviewConsolidation:
 
         assert result.get("consolidated") is not True
         assert len(result["findings"]) == 2  # raw merge
+
+
+class TestRecordAiUsage:
+    """_record_ai_usage emits the three AI metric families with the right
+    labels and resolves cost by priority (provider > table > none)."""
+
+    def setup_method(self):
+        from raven import metrics
+        with metrics._lock:
+            metrics._counters.clear()
+
+    def _out(self):
+        from raven import metrics
+        return metrics.format_prometheus()
+
+    def test_emits_calls_tokens_and_provider_cost(self):
+        from raven.reviewer import _record_ai_usage
+        _record_ai_usage("claude_cli", "m", "o/r",
+                         _cr("x", input_tokens=100, output_tokens=20, cost_usd=0.05))
+        out = self._out()
+        assert 'raven_ai_calls_total{backend="claude_cli",model="m",repo="o/r"} 1' in out
+        assert 'raven_ai_tokens_total{backend="claude_cli",kind="input",model="m",repo="o/r"} 100' in out
+        assert 'raven_ai_tokens_total{backend="claude_cli",kind="output",model="m",repo="o/r"} 20' in out
+        assert 'raven_ai_cost_usd_total{backend="claude_cli",model="m",repo="o/r"} 0.05' in out
+
+    def test_falls_back_to_price_table_when_no_provider_cost(self, monkeypatch):
+        import raven.reviewer as rv
+        monkeypatch.setattr(rv.pricing, "cost_usd", lambda model, i, o: 0.0123)
+        rv._record_ai_usage("openai_compatible", "m", "o/r",
+                            _cr("x", input_tokens=10, output_tokens=2, cost_usd=None))
+        assert 'raven_ai_cost_usd_total{backend="openai_compatible",model="m",repo="o/r"} 0.0123' in self._out()
+
+    def test_no_cost_series_when_neither_available(self, monkeypatch):
+        import raven.reviewer as rv
+        monkeypatch.setattr(rv.pricing, "cost_usd", lambda model, i, o: None)
+        rv._record_ai_usage("claude_cli", "m", "o/r",
+                            _cr("x", input_tokens=10, output_tokens=2, cost_usd=None))
+        out = self._out()
+        assert "raven_ai_cost_usd_total" not in out   # no cost recorded
+        assert "raven_ai_calls_total" in out          # but the call + tokens are
+        assert "raven_ai_tokens_total" in out
 
 
 class TestSeverityGte:
@@ -591,7 +639,7 @@ class TestRespondToCommentFileContext:
             return_value = '{"response": "Response text", "revise": null, "retract_findings": []}'
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.return_value = return_value
+        fake_backend.complete.return_value = _cr(return_value)
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
         return fake_backend
 
@@ -707,7 +755,7 @@ class TestReviewDiffPromptOverride:
         """
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.return_value = (
+        fake_backend.complete.return_value = _cr(
             '{"severity":"low","summary":"ok","findings":[]}'
         )
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
@@ -764,7 +812,7 @@ class TestRespondToCommentPromptOverride:
         """
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.return_value = '{"response": "A response body", "revise": null, "retract_findings": []}'
+        fake_backend.complete.return_value = _cr('{"response": "A response body", "revise": null, "retract_findings": []}')
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
         respond_to_comment(
             comment_body="please elaborate",
@@ -809,7 +857,7 @@ class TestReviewerDelegatesToBackend:
 
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.return_value = (
+        fake_backend.complete.return_value = _cr(
             '{"severity":"low","summary":"ok","findings":[]}'
         )
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
@@ -832,7 +880,7 @@ class TestReviewerDelegatesToBackend:
 
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.return_value = '{"response": "Thanks for the comment.", "revise": null, "retract_findings": []}'
+        fake_backend.complete.return_value = _cr('{"response": "Thanks for the comment.", "revise": null, "retract_findings": []}')
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
 
         result = rv.respond_to_comment(

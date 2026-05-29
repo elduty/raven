@@ -14,7 +14,7 @@ from contextlib import contextmanager
 
 import openai
 
-from raven.ai.base import AIBackend
+from raven.ai.base import AIBackend, CompletionResult
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,30 @@ _EFFORT_TO_REASONING = {
 }
 
 _MAX_CONCURRENT = max(int(os.environ.get("RAVEN_AI_MAX_CONCURRENT", "4")), 1)
+
+# LiteLLM proxies report the per-call cost in this response header. Other
+# OpenAI-compatible endpoints don't send it → cost stays None and the caller
+# falls back to the configured price table.
+_LITELLM_COST_HEADER = "x-litellm-response-cost"
+
+
+def _parse_cost_header(headers) -> float | None:
+    """Read the LiteLLM per-call cost header, or None if absent/unparseable.
+
+    ``headers`` is the httpx.Headers off the raw response (case-insensitive).
+    Cost is telemetry — a malformed value must never break the completion.
+    """
+    try:
+        raw = headers.get(_LITELLM_COST_HEADER)
+    except Exception:
+        return None
+    if raw in (None, ""):
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.debug("Unparseable %s header: %r", _LITELLM_COST_HEADER, raw)
+        return None
 
 
 class OpenAICompatibleBackend(AIBackend):
@@ -76,7 +100,7 @@ class OpenAICompatibleBackend(AIBackend):
         effort: str,
         timeout: int,
         purpose: str,
-    ) -> str:
+    ) -> CompletionResult:
         reasoning = _EFFORT_TO_REASONING.get(effort)
         kwargs = {
             "model": model,
@@ -93,13 +117,21 @@ class OpenAICompatibleBackend(AIBackend):
             purpose, model, reasoning or "off", len(prompt),
         )
 
+        # Use with_raw_response so we can read response headers — LiteLLM
+        # returns the per-call cost in ``x-litellm-response-cost``. ``.parse()``
+        # gives the usual typed ChatCompletion body. Non-LiteLLM endpoints
+        # simply won't send the header (cost stays None → caller falls back
+        # to the price table).
         with self._semaphore, self._track_request():
             try:
-                response = self._client.chat.completions.create(**kwargs)
+                raw = self._client.chat.completions.with_raw_response.create(**kwargs)
             except openai.APITimeoutError as e:
                 raise RuntimeError(f"AI backend timed out after {timeout}s: {e}")
             except openai.APIError as e:
                 raise RuntimeError(f"AI backend error: {e}")
+
+        cost_usd = _parse_cost_header(raw.headers)
+        response = raw.parse()
 
         if not response.choices:
             raise RuntimeError("AI backend returned no choices")
@@ -126,7 +158,18 @@ class OpenAICompatibleBackend(AIBackend):
                 f"AI backend returned empty response "
                 f"(finish_reason={choice.finish_reason})"
             )
-        return text
+
+        # Usage is best-effort — some proxies omit it. Never let a missing
+        # usage object break the response.
+        usage = getattr(response, "usage", None)
+        input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        return CompletionResult(
+            text=text,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
+        )
 
     def shutdown(self, grace_period: float = 2.0) -> int:
         """Close the HTTP client; return the count of in-flight requests

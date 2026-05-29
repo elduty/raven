@@ -1,6 +1,27 @@
 """AIBackend — abstract base class for AI provider backends."""
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+@dataclass
+class CompletionResult:
+    """Return value of ``AIBackend.complete``.
+
+    ``text`` is the model's raw text output (what callers consume).
+    ``input_tokens`` / ``output_tokens`` are the usage counts the backend
+    could extract (0 when unavailable). ``cost_usd`` is the
+    provider-reported cost for this call when the backend surfaces one
+    (Claude CLI ``total_cost_usd``; LiteLLM ``x-litellm-response-cost``),
+    or ``None`` when it doesn't — in which case the caller falls back to
+    the configured price table. Usage/cost are best-effort telemetry and
+    never affect ``text``.
+    """
+
+    text: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float | None = None
 
 
 class AIBackend(ABC):
@@ -22,16 +43,17 @@ class AIBackend(ABC):
         effort: str,
         timeout: int,
         purpose: str,
-    ) -> str:
+    ) -> CompletionResult:
         """Single-turn completion.
 
-        Returns the model's raw text output. Raises ``RuntimeError`` on
-        any transport, timeout, or protocol failure — reviewer.py catches
+        Returns a :class:`CompletionResult` carrying the model's text plus
+        best-effort token/cost telemetry. Raises ``RuntimeError`` on any
+        transport, timeout, or protocol failure — reviewer.py catches
         ``RuntimeError`` uniformly regardless of backend.
 
-        ``purpose`` is one of ``"review"`` | ``"respond"`` — used only
-        for log messages; backends may route or tune based on it but
-        need not.
+        ``purpose`` is one of ``"review"`` | ``"respond"`` |
+        ``"consolidate"`` — used for log messages and metric labels;
+        backends may route or tune based on it but need not.
         """
         raise NotImplementedError
 

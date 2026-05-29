@@ -8,6 +8,7 @@ keep passing during the refactor.
 """
 
 import contextlib
+import json
 import logging
 import os
 import re
@@ -70,9 +71,15 @@ _active_procs_lock = threading.Lock()
 # Passing an empty --allowed-tools denies every tool; if a future CLI
 # version changes the semantics, the output will surface the divergence
 # in the no-tools integration test rather than silently regress.
+#
+# --output-format json wraps the response in an envelope carrying the
+# response text under ``.result`` plus ``.usage`` (input_tokens /
+# output_tokens) and ``.total_cost_usd`` — parsed in complete() for token
+# and cost metrics. The envelope shape was confirmed against the installed
+# CLI (v2.1.156) rather than assumed.
 CLAUDE_BASE_ARGS = [
     CLAUDE_BIN, "-p",
-    "--output-format", "text",
+    "--output-format", "json",
     "--allowed-tools", "",
 ]
 
@@ -163,7 +170,41 @@ def terminate_active_processes(grace_period: float = 2.0) -> int:
     return len(procs)
 
 
-from raven.ai.base import AIBackend
+from raven.ai.base import AIBackend, CompletionResult
+
+
+def _parse_cli_json(stdout: str) -> CompletionResult:
+    """Parse the ``--output-format json`` envelope into a CompletionResult.
+
+    Expected shape (confirmed against CLI v2.1.156)::
+
+        {"result": "<text>", "total_cost_usd": 0.0893,
+         "usage": {"input_tokens": N, "output_tokens": M, ...}, ...}
+
+    Degrades gracefully: if stdout isn't the expected JSON object (CLI
+    version drift, an unexpected envelope), fall back to treating the raw
+    stdout as the response text with no usage/cost rather than failing the
+    review. Token/cost telemetry is best-effort; the review text is not.
+    """
+    try:
+        data = json.loads(stdout)
+        if not isinstance(data, dict) or "result" not in data:
+            raise ValueError("unexpected envelope shape")
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(
+            "Claude CLI json envelope unparseable (%s) — using raw stdout as text, "
+            "no token/cost recorded", e,
+        )
+        return CompletionResult(text=stdout)
+
+    usage = data.get("usage") or {}
+    cost = data.get("total_cost_usd")
+    return CompletionResult(
+        text=data.get("result", ""),
+        input_tokens=int(usage.get("input_tokens", 0) or 0),
+        output_tokens=int(usage.get("output_tokens", 0) or 0),
+        cost_usd=float(cost) if isinstance(cost, (int, float)) else None,
+    )
 
 
 class ClaudeCLIBackend(AIBackend):
@@ -185,7 +226,7 @@ class ClaudeCLIBackend(AIBackend):
         effort: str,
         timeout: int,
         purpose: str,
-    ) -> str:
+    ) -> CompletionResult:
         logger.info(
             "Claude CLI %s (model=%s effort=%s prompt_chars=%d)",
             purpose, model, effort, len(prompt),
@@ -211,7 +252,7 @@ class ClaudeCLIBackend(AIBackend):
             logger.error("claude CLI stdout: %s", stdout_safe)
             detail = _redact_secrets(result.stderr[:200] or result.stdout[:200])
             raise RuntimeError(f"claude CLI exited with code {result.returncode}: {detail}")
-        return result.stdout
+        return _parse_cli_json(result.stdout)
 
     def shutdown(self, grace_period: float = 2.0) -> int:
         return terminate_active_processes(grace_period)

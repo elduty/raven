@@ -218,13 +218,72 @@ class TestClaudeCLIBackend:
                 timeout=600,
                 purpose="review",
             )
-        assert output == "some model output"
+        # Non-json stdout → graceful fallback: text is the raw stdout.
+        assert output.text == "some model output"
         args, kwargs = mock_run.call_args
         cli_args = args[0]
         assert "--model" in cli_args and "claude-opus-4-7" in cli_args
         assert "--effort" in cli_args and "max" in cli_args
         assert kwargs["prompt"] == "the prompt"
         assert kwargs["timeout"] == 600
+
+
+class TestClaudeCLIJsonEnvelope:
+    """complete() parses the --output-format json envelope for text + usage
+    + cost, and degrades gracefully when the envelope is unexpected."""
+
+    def _run(self, stdout: str):
+        import json
+        backend = ClaudeCLIBackend()
+        fake = MagicMock(returncode=0, stdout=stdout, stderr="")
+        with patch("raven.ai.claude_cli._run_claude_cli", return_value=fake):
+            return backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+
+    def test_parses_text_tokens_and_cost(self):
+        import json
+        envelope = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "the review text",
+            "total_cost_usd": 0.0893745,
+            "usage": {"input_tokens": 5264, "output_tokens": 4,
+                      "cache_read_input_tokens": 17484},
+        })
+        out = self._run(envelope)
+        assert out.text == "the review text"
+        assert out.input_tokens == 5264
+        assert out.output_tokens == 4
+        assert out.cost_usd == 0.0893745
+
+    def test_malformed_json_falls_back_to_raw_text(self):
+        out = self._run("not json at all")
+        assert out.text == "not json at all"
+        assert out.input_tokens == 0 and out.output_tokens == 0
+        assert out.cost_usd is None
+
+    def test_json_without_result_key_falls_back(self):
+        import json
+        out = self._run(json.dumps({"unexpected": "shape"}))
+        assert out.text == json.dumps({"unexpected": "shape"})
+        assert out.cost_usd is None
+
+    def test_missing_usage_and_cost_yields_zero_none(self):
+        import json
+        out = self._run(json.dumps({"result": "text only"}))
+        assert out.text == "text only"
+        assert out.input_tokens == 0 and out.output_tokens == 0
+        assert out.cost_usd is None
+
+    def test_output_format_json_flag_present(self):
+        backend = ClaudeCLIBackend()
+        fake = MagicMock(returncode=0, stdout='{"result":"x"}', stderr="")
+        with patch("raven.ai.claude_cli._run_claude_cli", return_value=fake) as mock_run:
+            backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        cli_args = mock_run.call_args[0][0]
+        idx = cli_args.index("--output-format")
+        assert cli_args[idx + 1] == "json"
+        # injection guard still present
+        assert "--allowed-tools" in cli_args
+        assert cli_args[cli_args.index("--allowed-tools") + 1] == ""
 
     def test_complete_raises_runtimeerror_on_nonzero_exit(self):
         backend = ClaudeCLIBackend()

@@ -16,6 +16,13 @@ import os
 
 from unittest.mock import MagicMock, patch
 
+from raven.ai.base import CompletionResult
+
+
+def _cr(text: str) -> CompletionResult:
+    """Wrap model output as a CompletionResult (backends now return this)."""
+    return CompletionResult(text=text)
+
 
 
 class TestTrustTiers:
@@ -86,9 +93,9 @@ class TestTrustTiers:
         from raven.reviewer import review_diff
         fake_backend = MagicMock()
         fake_backend.name = "claude_cli"
-        fake_backend.complete.return_value = json.dumps(
+        fake_backend.complete.return_value = _cr(json.dumps(
             {"severity": "low", "summary": "ok", "findings": []}
-        )
+        ))
         with patch("raven.ai._cached_backend", fake_backend):
             review_diff("diff content\n", "user/repo",
                         claude_md="Project uses Python 3.12.")
@@ -226,7 +233,7 @@ class TestPromptBuilding:
 
         def fake_complete(prompt, **kwargs):
             captured["prompt"] = prompt
-            return '{"severity":"low","summary":"ok","findings":[]}'
+            return _cr('{"severity":"low","summary":"ok","findings":[]}')
 
         fake_backend.complete.side_effect = fake_complete
         monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
@@ -683,7 +690,7 @@ class TestRespondPromptBuilding:
             def complete(self, prompt, **kwargs):
                 captured["prompt"] = prompt
                 # Must be valid JSON per the respond_to_comment contract.
-                return '{"response": "ok", "revise": null, "retract_findings": []}'
+                return _cr('{"response": "ok", "revise": null, "retract_findings": []}')
 
         monkeypatch.setattr("raven.reviewer.get_backend", lambda: _Stub())
         return captured
@@ -926,7 +933,7 @@ class TestRespondJsonContract:
             name = "stub"
 
             def complete(self, prompt, **kwargs):
-                return raw_response
+                return _cr(raw_response)
 
         monkeypatch.setattr("raven.reviewer.get_backend", lambda: _Stub())
 
@@ -1012,7 +1019,7 @@ class TestRespondJsonContract:
 
             def complete(self, prompt, **kwargs):
                 captured["prompt"] = prompt
-                return '{"response": "ok", "revise": null, "retract_findings": []}'
+                return _cr('{"response": "ok", "revise": null, "retract_findings": []}')
 
         monkeypatch.setattr("raven.reviewer.get_backend", lambda: _Stub())
         from raven.reviewer import respond_to_comment

@@ -9,7 +9,8 @@ import secrets
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from raven.ai import get_backend
+from raven import metrics
+from raven.ai import get_backend, pricing
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,27 @@ def terminate_active_processes(grace_period: float = 2.0) -> int:
     lives in the backend's shutdown() method.
     """
     return get_backend().shutdown(grace_period)
+
+
+def _record_ai_usage(backend: str, model: str, repo: str, result) -> None:
+    """Emit token + cost + call metrics for one completion.
+
+    Best-effort telemetry — wrapped so a metrics hiccup never breaks a
+    review. Cost priority: provider-reported (``result.cost_usd``) wins;
+    else the fallback price table; else nothing (pricing already warns).
+    """
+    try:
+        labels = {"backend": backend, "model": model, "repo": repo}
+        metrics.add("raven_ai_calls_total", 1, labels)
+        metrics.add("raven_ai_tokens_total", result.input_tokens, {**labels, "kind": "input"})
+        metrics.add("raven_ai_tokens_total", result.output_tokens, {**labels, "kind": "output"})
+        cost = result.cost_usd
+        if cost is None:
+            cost = pricing.cost_usd(model, result.input_tokens, result.output_tokens)
+        if cost is not None:
+            metrics.add("raven_ai_cost_usd_total", cost, labels)
+    except Exception as e:  # pragma: no cover — telemetry must not break reviews
+        logger.debug("Failed to record AI usage metrics: %s", e)
 
 
 # Load review prompt from prompts/review.md (relative to this package)
@@ -727,8 +749,9 @@ def _consolidate_chunked_review(
         len(findings), repo_name, RAVEN_AI_MODEL, RAVEN_AI_EFFORT,
     )
 
+    backend = get_backend()
     try:
-        output = get_backend().complete(
+        completion = backend.complete(
             prompt,
             model=RAVEN_AI_MODEL,
             effort=RAVEN_AI_EFFORT,
@@ -740,7 +763,8 @@ def _consolidate_chunked_review(
                        repo_name, e)
         return None
 
-    result = _parse_response(output)
+    _record_ai_usage(backend.name, RAVEN_AI_MODEL, repo_name, completion)
+    result = _parse_response(completion.text)
     if result.get("_parse_error"):
         logger.warning("Consolidation pass parse error for %s — falling back to raw merge",
                        repo_name)
@@ -831,14 +855,16 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
         f"/{filename_hint}" if filename_hint else "",
         RAVEN_AI_MODEL, RAVEN_AI_EFFORT, diff.count("\n"),
     )
-    output = get_backend().complete(
+    backend = get_backend()
+    completion = backend.complete(
         prompt,
         model=RAVEN_AI_MODEL,
         effort=RAVEN_AI_EFFORT,
         timeout=RAVEN_AI_TIMEOUT,
         purpose="review",
     )
-    return _parse_response(output)
+    _record_ai_usage(backend.name, RAVEN_AI_MODEL, repo_name, completion)
+    return _parse_response(completion.text)
 
 
 def _parse_response(output: str) -> dict:
@@ -1222,11 +1248,13 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
         f" {file_path}:{line}" if file_path and line else (f" {file_path}" if file_path else ""),
         RAVEN_AI_MODEL, RAVEN_AI_EFFORT_COMMENT,
     )
-    raw = get_backend().complete(
+    backend = get_backend()
+    completion = backend.complete(
         prompt,
         model=RAVEN_AI_MODEL,
         effort=RAVEN_AI_EFFORT_COMMENT,
         timeout=RAVEN_AI_TIMEOUT,
         purpose="respond",
-    ).strip()
-    return _parse_respond_output(raw)
+    )
+    _record_ai_usage(backend.name, RAVEN_AI_MODEL, repo_name, completion)
+    return _parse_respond_output(completion.text.strip())

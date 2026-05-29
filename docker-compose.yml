@@ -83,6 +83,10 @@ services:
       # ── Observability (empty = /metrics returns 404; see raven/server.py).
       # When set, Prometheus must send `Authorization: Bearer <token>`.
       - RAVEN_METRICS_TOKEN=${RAVEN_METRICS_TOKEN:-}
+      # Fallback AI price table (JSON, $/1M tokens) for raven_ai_cost_usd_total.
+      # Only used for endpoints that don't self-report cost; claude_cli +
+      # LiteLLM report it natively. Empty = no fallback (tokens still tracked).
+      - RAVEN_AI_PRICES=${RAVEN_AI_PRICES:-}
       # Cache dir must live on the named volume — override any .env value.
       - RAVEN_CACHE_DIR=/data/raven
     volumes:
@@ -104,5 +108,65 @@ services:
       retries: 3
       start_period: 15s
 
+  # ── Observability (opt-in) ──────────────────────────────────────────────
+  # Only starts with:  docker compose --profile observability up -d
+  # Plain `docker compose up -d` runs Raven alone (no profile = excluded).
+  # See observability/README.md and docs/superpowers/specs/2026-05-29-observability-stack-design.md
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: raven-prometheus
+    profiles: ["observability"]
+    restart: unless-stopped
+    # /metrics is bearer-gated. Prometheus config has no env-var
+    # substitution, so we write the token to a file at boot (the image's
+    # busybox sh + printf) and point `credentials_file` at it. `$$` keeps
+    # compose from interpolating — the shell expands the container env var.
+    environment:
+      - RAVEN_METRICS_TOKEN=${RAVEN_METRICS_TOKEN:-}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        printf '%s' "$${RAVEN_METRICS_TOKEN}" > /tmp/raven_metrics_token
+        exec /bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=1825d
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - raven-prom-data:/prometheus
+    depends_on:
+      - raven
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: raven-grafana
+    profiles: ["observability"]
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - raven-grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
 volumes:
   raven-cache:
+  raven-prom-data:
+  raven-grafana-data:

@@ -152,6 +152,7 @@ All configuration is via environment variables. See `config.example.env` for the
 | `RAVEN_AI_API_BASE` | openai_compatible | — | Base URL of the OpenAI-compatible endpoint (LiteLLM proxy, vLLM, OpenRouter, OpenAI, etc.). |
 | `RAVEN_AI_API_KEY` | openai_compatible | — | API key for the OpenAI-compatible endpoint. |
 | `RAVEN_AI_MAX_TOKENS` | No | — | When set, passed as `max_tokens` to the `openai_compatible` backend. Use this to lift the model's default output cap (e.g., GPT-4o defaults to 16k) so long reviews don't truncate mid-JSON. Ignored by `claude_cli`. |
+| `RAVEN_AI_PRICES` | No | — | Fallback price table for the cost metric: JSON `{"model":{"input":N,"output":N}}` in USD per 1M tokens. Only used when the backend doesn't self-report cost (`claude_cli` and LiteLLM do, so this is usually unnecessary). Unset → tokens still tracked, cost stays 0. |
 | `NOTIFY_CHANNELS` | No | — | JSON array of notification channels (see below). |
 | `REVIEW_APPROVE_MAX_SEVERITY` | No | `low` | Approve PRs at or below this severity (`low`, `medium`, `high`). |
 | `MERGE_STRATEGY` | No | `squash` | Merge method (`squash`, `merge`, `rebase`). |
@@ -273,7 +274,8 @@ raven/
 │   ├── __init__.py        Backend registry + auto-selection (get_backend, _select_backend)
 │   ├── base.py            AIBackend ABC (complete, shutdown)
 │   ├── claude_cli.py      ClaudeCLIBackend — wraps the Claude Code CLI subprocess
-│   └── openai_compatible.py  OpenAICompatibleBackend — chat/completions via openai SDK
+│   ├── openai_compatible.py  OpenAICompatibleBackend — chat/completions via openai SDK
+│   └── pricing.py         Fallback model price table (RAVEN_AI_PRICES) for cost metric
 ├── reviewer.py            Diff chunking, JSON response parsing, routes through AIBackend
 ├── notifier.py            Channel-based notifications (Slack, webhook)
 ├── metrics.py             In-memory counters exposed via /metrics (Prometheus format)
@@ -281,6 +283,9 @@ prompts/
 ├── review.md              Review prompt template
 ├── respond.md             Conversational response prompt template
 ├── audit.md               Standalone prompt for operator-driven manual audits (not code-loaded)
+observability/             Opt-in Prometheus + Grafana bundle (--profile observability)
+├── prometheus/            Scrape config (bearer via boot-written token file)
+└── grafana/               Provisioned datasource + dashboards (raven.json)
 entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start + daily
 ```
 
@@ -339,6 +344,11 @@ entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start
 - `raven_retractions_total{repo,result}` — comment-driven finding retractions
 - `raven_response_parse_errors_total{repo}` — AI JSON parse failures
 - `raven_revision_submit_errors_total{repo}` — verdict-revision `submit_review` failures
+- `raven_ai_calls_total{backend,model,repo}` — AI completion calls
+- `raven_ai_tokens_total{backend,model,repo,kind}` — tokens consumed (`kind` = `input`/`output`)
+- `raven_ai_cost_usd_total{backend,model,repo}` — AI cost in USD
+
+**Token & cost metrics**: `raven_ai_tokens_total` and `raven_ai_cost_usd_total` track AI spend, broken down by backend, model, and repo. Cost is taken from the provider when it reports one — `claude_cli` exposes `total_cost_usd`, LiteLLM proxies return an `x-litellm-response-cost` header — so for those setups cost is exact and needs no configuration. For OpenAI-compatible endpoints that report no cost, set `RAVEN_AI_PRICES` (a JSON `model → {input, output}` $/1M-token table) to estimate it; without it, tokens are still tracked and cost stays 0.
 
 **Authentication**: the `/metrics` endpoint requires a bearer token. Set `RAVEN_METRICS_TOKEN` to enable; leave unset and the endpoint returns 404 (it doesn't advertise itself). Prometheus scrape config:
 
@@ -353,6 +363,15 @@ scrape_configs:
 
 `/healthz` stays open for load balancers — no auth required.
 
+**Dashboards & long-term storage**: an opt-in observability bundle ships Prometheus (5-year retention) and a provisioned Grafana dashboard as a Compose profile:
+
+```bash
+# Set RAVEN_METRICS_TOKEN and GRAFANA_ADMIN_PASSWORD in .env, then:
+docker compose --profile observability up -d
+```
+
+Grafana comes up at `http://<host>:${GRAFANA_PORT:-3000}` (login `admin` / `$GRAFANA_ADMIN_PASSWORD`) with the **Raven — Review, Reliability & Cost** dashboard already loaded: throughput by severity, merges/CI failures, average review duration, errors, comment activity, and token/cost breakdowns by model and repo — all filterable by a `repo` template variable. Plain `docker compose up` (no profile) runs Raven alone. See [`observability/README.md`](observability/README.md) for token-file handling, scraping a second instance, retention tuning, and licensing.
+
 ## Development
 
 ```bash
@@ -360,7 +379,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-674 tests across 13 test files covering webhook handling (BB DC `pr:comment:added`/`:edited` version-aware dedup, `pr:reviewer:approved`/`:changes_requested` parity with Gitea, activities-endpoint pagination cap with WARNING), review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), two-tier prompt trust model (`<repo_policy>` for CLAUDE.md + rules at base ref vs `<untrusted_input>` for diff + comments), chunked-review consolidation pass that re-applies repo policy to aggregated findings, three-mode review engagement (`all` / `gap` / `advisory`), three-way review output channels (`both` / `summary` / `inline`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
+700 tests across 14 test files covering webhook handling (BB DC `pr:comment:added`/`:edited` version-aware dedup, `pr:reviewer:approved`/`:changes_requested` parity with Gitea, activities-endpoint pagination cap with WARNING), review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), two-tier prompt trust model (`<repo_policy>` for CLAUDE.md + rules at base ref vs `<untrusted_input>` for diff + comments), chunked-review consolidation pass that re-applies repo policy to aggregated findings, three-mode review engagement (`all` / `gap` / `advisory`), three-way review output channels (`both` / `summary` / `inline`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
 
 ## CI
 

@@ -6,6 +6,36 @@ All notable changes to Raven are documented here. The format follows [Keep a Cha
 
 _Nothing yet._
 
+## v0.3.0 — 2026-05-29
+
+Raven now tells you what it costs and gives you somewhere to watch it. This release adds per-call token and cost metrics, a one-command permanent metrics-storage + dashboard bundle, and a couple of smaller review and metrics fixes.
+
+### New features
+
+- **Token & cost metrics.** Every AI call now records tokens and USD cost, broken down by backend, model, and repo: `raven_ai_tokens_total{…,kind=input|output}`, `raven_ai_cost_usd_total`, and `raven_ai_calls_total`. Cost is taken from the provider when it reports one — the `claude_cli` backend reads `total_cost_usd` from the CLI's JSON output, and LiteLLM proxies return an `x-litellm-response-cost` header — so for those setups cost is exact and needs no configuration. For OpenAI-compatible endpoints that report no cost (plain vLLM, etc.), set the new **`RAVEN_AI_PRICES`** fallback table (JSON `model → {input, output}` in $/1M-tokens) to estimate it. With no cost source at all, tokens are still tracked and cost stays 0.
+
+- **Observability bundle — Prometheus + Grafana in one command.** A new opt-in Docker Compose profile stands up permanent metrics storage and a pre-built dashboard alongside Raven:
+
+  ```bash
+  docker compose --profile observability up -d
+  ```
+
+  Prometheus scrapes Raven's bearer-gated `/metrics` with **5-year retention**, and a provisioned Grafana serves the **Raven — Review, Reliability & Cost** dashboard: throughput by severity, merges, CI failures, average review duration, errors, comment activity, and token/cost by model and repo — all filterable by a `repo` template variable. Plain `docker compose up` still runs Raven alone. New vars: **`GRAFANA_ADMIN_PASSWORD`**, **`GRAFANA_PORT`**. Ships a commented second-instance scrape job and a documented licensing position (Prometheus Apache-2.0; stock, unmodified Grafana AGPLv3 for internal viewing). See `observability/README.md`.
+
+- **Review footer shows the effort level.** The footer line that names the model now also reports the reasoning effort the review ran at, so you can tell at a glance whether a PR was reviewed at `max`, `medium`, etc.
+
+### Fixes
+
+- **Valid Prometheus exposition for labeled metrics.** The `/metrics` output placed the `_sum` / `_count` suffix after the label braces for labeled summaries (`name{labels}_sum`, which scrapers reject) and could repeat `# HELP` / `# TYPE` lines within a metric family. Suffixes now attach to the base metric name before the braces, and each family emits its HELP/TYPE exactly once. This is what lets the new dashboard's duration panel parse at all.
+
+### Notes
+
+- **Review-duration latency is a mean, not a percentile.** `raven_review_duration_seconds` is a Prometheus *summary* (sum + count, no quantiles), so the dashboard's duration panel shows `rate(_sum)/rate(_count)` — an average. True p95/p99 would require converting it to a histogram (a metrics-layer change), tracked in the backlog.
+
+### Stats
+
+- 700 tests across 14 test files.
+
 ## v0.2.0 — 2026-05-29
 
 Repo-supplied rules now actually steer reviews, you can choose where findings land, and Raven respects what developers resolve. This release also hardens the comment-thread retraction flow that shipped at the tail of v0.1.0 and fixes a class of Bitbucket Data Center thread-resolution bugs.

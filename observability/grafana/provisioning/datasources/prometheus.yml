@@ -1,0 +1,13 @@
+# Auto-provisions the Prometheus datasource on Grafana first boot.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: raven-prometheus   # referenced by the provisioned dashboard's panels
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 30s   # matches the Prometheus scrape_interval

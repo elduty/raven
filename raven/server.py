@@ -24,7 +24,7 @@ from .providers import GitProvider, get_provider, register_provider, registered_
 from .providers.gitea import GiteaProvider
 from .metrics import inc, Timer, format_prometheus
 from .notifier import notify
-from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, MAX_DIFF_LINES, terminate_active_processes, RespondParseError, RAVEN_AI_MODEL
+from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, MAX_DIFF_LINES, terminate_active_processes, RespondParseError, RAVEN_AI_MODEL, RAVEN_AI_EFFORT
 
 _SEVERITY_NAME = {v: k for k, v in SEVERITY_ORDER.items()}
 
@@ -2364,7 +2364,7 @@ def _format_comment(review: dict, mode: str = "review") -> str:
         lines.append(f"*Includes {n} finding(s) carried from unchanged files*")
 
     lines.append("")
-    lines.append(f"*Reviewed by Raven · {RAVEN_AI_MODEL} · {timestamp}*")
+    lines.append(f"*Reviewed by Raven · {RAVEN_AI_MODEL} · effort {RAVEN_AI_EFFORT} · {timestamp}*")
 
     return "\n".join(lines)
 

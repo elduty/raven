@@ -1,0 +1,37 @@
+# Prometheus scrape config for Raven.
+#
+# Mounted read-only into the prometheus container. The bearer token for the
+# /metrics endpoint is written to /tmp/raven_metrics_token at container boot
+# from $RAVEN_METRICS_TOKEN (see the prometheus service entrypoint in
+# docker-compose.yml) and referenced here via credentials_file — Prometheus
+# config has no native env-var substitution.
+
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+
+scrape_configs:
+  # The co-located Raven (same compose network → reachable as `raven:8080`).
+  - job_name: raven
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials_file: /tmp/raven_metrics_token
+    static_configs:
+      - targets: ["raven:8080"]
+
+  # ── Monitoring a SECOND Raven instance (opt-in) ─────────────────────────
+  # To scrape a remote Raven (e.g. a Bitbucket DC deployment on another host),
+  # add a job with its own URL + its own bearer token. Each job's token must
+  # live in its own file — write it at boot the same way the entrypoint writes
+  # the primary token, or bind-mount a file, then point credentials_file here.
+  #
+  # - job_name: raven-bbdc
+  #   metrics_path: /metrics
+  #   scheme: https
+  #   authorization:
+  #     type: Bearer
+  #     credentials_file: /tmp/raven_bbdc_metrics_token
+  #   static_configs:
+  #     - targets: ["raven-bbdc.internal.example.com:8080"]

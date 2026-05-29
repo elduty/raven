@@ -1,0 +1,252 @@
+{
+  "uid": "raven-overview",
+  "title": "Raven — Review, Reliability & Cost",
+  "tags": ["raven"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-7d", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "repo",
+        "label": "Repo",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+        "query": { "query": "label_values(raven_reviews_total, repo)", "refId": "repo" },
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Throughput & verdicts",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100
+    },
+    {
+      "id": 1,
+      "title": "Reviews / min by severity",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "/min" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum by (severity) (rate(raven_reviews_total{repo=~\"$repo\"}[5m])) * 60",
+          "legendFormat": "{{severity}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Reviews (selected range)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum(increase(raven_reviews_total{repo=~\"$repo\"}[$__range]))"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Merges (range)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum(increase(raven_merges_total{repo=~\"$repo\"}[$__range]))"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "CI failures (range)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum(increase(raven_ci_failures_total{repo=~\"$repo\"}[$__range]))"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Reviews skipped / min by reason",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 4, "w": 8, "x": 12, "y": 5 },
+      "fieldConfig": { "defaults": { "unit": "/min" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum by (reason) (rate(raven_reviews_skipped_total{repo=~\"$repo\"}[5m])) * 60",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Reliability & latency",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "id": 101
+    },
+    {
+      "id": 6,
+      "title": "Average review duration",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "description": "Mean review wall-clock. The metric is a Prometheus summary (sum/count) so this is the average, not a percentile — a histogram would be needed for p95.",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum(rate(raven_review_duration_seconds_sum{repo=~\"$repo\"}[5m])) / sum(rate(raven_review_duration_seconds_count{repo=~\"$repo\"}[5m]))",
+          "legendFormat": "avg duration"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Errors / min by type",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "fieldConfig": { "defaults": { "unit": "/min" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum by (type) (rate(raven_errors_total{repo=~\"$repo\"}[5m])) * 60",
+          "legendFormat": "{{type}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Comment activity / min (responses · retractions · revisions)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "/min" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum(rate(raven_responses_total{repo=~\"$repo\"}[5m])) * 60",
+          "legendFormat": "responses"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum(rate(raven_retractions_total{repo=~\"$repo\"}[5m])) * 60",
+          "legendFormat": "retractions"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum(rate(raven_verdict_revisions_total{repo=~\"$repo\"}[5m])) * 60",
+          "legendFormat": "verdict revisions"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Cost & tokens",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 25 },
+      "id": 102
+    },
+    {
+      "id": 9,
+      "title": "Cost (selected range)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 26 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 2 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum(increase(raven_ai_cost_usd_total{repo=~\"$repo\"}[$__range]))"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Cost / hour by model",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 26 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum by (model) (rate(raven_ai_cost_usd_total{repo=~\"$repo\"}[5m])) * 3600",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Tokens / hour by kind",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 8, "w": 9, "x": 15, "y": 26 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum by (kind) (rate(raven_ai_tokens_total{repo=~\"$repo\"}[5m])) * 3600",
+          "legendFormat": "{{kind}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Cost by repo (selected range)",
+      "type": "barchart",
+      "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 34 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "options": { "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raven-prometheus" },
+          "expr": "sum by (repo) (increase(raven_ai_cost_usd_total{repo=~\"$repo\"}[$__range]))",
+          "legendFormat": "{{repo}}",
+          "instant": true
+        }
+      ]
+    }
+  ]
+}
