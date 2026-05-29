@@ -43,6 +43,8 @@ services:
       - RAVEN_GITEA_AUTO_MERGE=${RAVEN_GITEA_AUTO_MERGE:-}
       # Review engagement mode: all | gap | advisory. Empty defaults to 'all'.
       - RAVEN_REVIEW_MODE=${RAVEN_REVIEW_MODE:-}
+      # Review output channels: both | summary | inline. Empty defaults to 'both'.
+      - RAVEN_REVIEW_OUTPUT=${RAVEN_REVIEW_OUTPUT:-}
       # ── AI model & effort (defaults must match raven/reviewer.py).
       # Apply to BOTH backends.
       - RAVEN_AI_MODEL=${RAVEN_AI_MODEL:-claude-opus-4-7}

@@ -57,6 +57,32 @@ def _resolve_review_mode() -> str:
 
 RAVEN_REVIEW_MODE = _resolve_review_mode()
 
+# Which review output channels Raven emits on a PR review:
+#   * both     — the summary comment (verdict + findings list) AND per-line
+#                inline comments (default).
+#   * summary  — only the summary comment; no inline comments.
+#   * inline   — only per-line inline comments; the summary body is trimmed
+#                to verdict + one-liner. Findings that have no postable
+#                file/line still appear in the body (nothing is lost).
+# Orthogonal to RAVEN_REVIEW_MODE (which controls blocking vs advisory).
+_VALID_REVIEW_OUTPUTS = {"both", "summary", "inline"}
+
+
+def _resolve_review_output() -> str:
+    # Same empty-string-as-unset handling as _resolve_review_mode: an unset
+    # docker-compose `${VAR:-}` becomes "" and must fall back to the default.
+    raw = os.environ.get("RAVEN_REVIEW_OUTPUT", "").strip().lower() or "both"
+    if raw not in _VALID_REVIEW_OUTPUTS:
+        logger.error(
+            "Invalid RAVEN_REVIEW_OUTPUT=%r (expected one of %s) — exiting",
+            raw, sorted(_VALID_REVIEW_OUTPUTS),
+        )
+        sys.exit(1)
+    return raw
+
+
+RAVEN_REVIEW_OUTPUT = _resolve_review_output()
+
 executor = ThreadPoolExecutor(
     max_workers=int(os.environ.get("RAVEN_MAX_WORKERS", "16")),
     thread_name_prefix="raven-review",
@@ -889,9 +915,31 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             inc("raven_errors_total", {"type": "parse_error", "repo": repo_full_name})
             return
 
-        # Submit formal review — must succeed before dismissing old reviews
+        # Output-channel selection (RAVEN_REVIEW_OUTPUT):
+        #   both     — summary body + inline comments
+        #   summary  — summary body only (no inline)
+        #   inline   — inline comments only; body trimmed to verdict +
+        #              one-liner, but findings WITHOUT a postable file/line
+        #              stay in the body so nothing is silently dropped.
+        post_inline = RAVEN_REVIEW_OUTPUT in ("both", "inline")
+
+        def _is_inline_postable(f: dict) -> bool:
+            return bool(f.get("file")) and isinstance(f.get("line"), int) and f["line"] > 0
+
+        # Submit formal review — must succeed before dismissing old reviews.
+        # In "inline" mode, the body's findings list is filtered to only the
+        # findings that can't be posted inline (no file/line) — inline-able
+        # findings live on their lines instead, so the body isn't a duplicate.
+        if RAVEN_REVIEW_OUTPUT == "inline":
+            body_review = {
+                **review,
+                "findings": [f for f in review.get("findings", [])
+                             if not _is_inline_postable(f)],
+            }
+        else:
+            body_review = review
         body = _format_comment(
-            review,
+            body_review,
             mode="advisory" if RAVEN_REVIEW_MODE == "advisory" else "review",
         )
         approve_sev = os.environ.get("REVIEW_APPROVE_MAX_SEVERITY", "low")
@@ -904,8 +952,8 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 "body": f"{SEVERITY_EMOJI.get(f.get('severity', 'low'), default_emoji)} **[{f.get('severity', 'low')}]** {f['message']}",
             }
             for f in review.get("findings", [])
-            if f.get("file") and isinstance(f.get("line"), int) and f["line"] > 0
-        ]
+            if _is_inline_postable(f)
+        ] if post_inline else []
         # Pass comment_only conditionally via dict-spread so out-of-tree
         # providers running in non-advisory modes never see the new kwarg.
         # (Default in the ABC doesn't propagate to overriders.)
@@ -952,10 +1000,14 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # dicts in cache get retagged with those new IDs via shared
         # references (carried = list of dict refs from cached_findings,
         # which are the same dicts as _previous_diffs[pr_key].findings).
+        # Only findings actually submitted as inline comments can be tagged
+        # with a comment_id. When inline output is suppressed (summary mode),
+        # nothing was posted inline, so this stays empty and the length-match
+        # guard below trivially passes (0 == 0) rather than warning.
         submitted_findings = [
             f for f in review.get("findings", [])
-            if f.get("file") and isinstance(f.get("line"), int) and f["line"] > 0
-        ]
+            if _is_inline_postable(f)
+        ] if post_inline else []
         posted_inline = (new_review or {}).get("inline_comments") or []
         # Defensive: providers MUST return inline_comments aligned by
         # index with input (None for failed posts). If lengths diverge —

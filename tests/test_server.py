@@ -4712,3 +4712,135 @@ class TestReviewMode:
         from raven.server import _resolve_review_mode
         monkeypatch.setenv("RAVEN_REVIEW_MODE", "   ")
         assert _resolve_review_mode() == "all"
+
+
+class TestReviewOutput:
+    """RAVEN_REVIEW_OUTPUT resolution: default, explicit values, validation.
+    Resolver reads os.environ at call time, so setenv is sufficient."""
+
+    def test_default_output_is_both(self, monkeypatch):
+        from raven.server import _resolve_review_output
+        monkeypatch.delenv("RAVEN_REVIEW_OUTPUT", raising=False)
+        assert _resolve_review_output() == "both"
+
+    def test_explicit_summary(self, monkeypatch):
+        from raven.server import _resolve_review_output
+        monkeypatch.setenv("RAVEN_REVIEW_OUTPUT", "summary")
+        assert _resolve_review_output() == "summary"
+
+    def test_explicit_inline(self, monkeypatch):
+        from raven.server import _resolve_review_output
+        monkeypatch.setenv("RAVEN_REVIEW_OUTPUT", "inline")
+        assert _resolve_review_output() == "inline"
+
+    def test_case_insensitive(self, monkeypatch):
+        from raven.server import _resolve_review_output
+        monkeypatch.setenv("RAVEN_REVIEW_OUTPUT", "  Summary  ")
+        assert _resolve_review_output() == "summary"
+
+    def test_invalid_output_raises_systemexit(self, monkeypatch):
+        from raven.server import _resolve_review_output
+        monkeypatch.setenv("RAVEN_REVIEW_OUTPUT", "bogus")
+        with pytest.raises(SystemExit):
+            _resolve_review_output()
+
+    def test_empty_env_var_falls_back_to_both(self, monkeypatch):
+        """docker-compose `${RAVEN_REVIEW_OUTPUT:-}` passes "" when unset —
+        must default to 'both', not crash the validator."""
+        from raven.server import _resolve_review_output
+        monkeypatch.setenv("RAVEN_REVIEW_OUTPUT", "")
+        assert _resolve_review_output() == "both"
+
+
+class TestReviewOutputChannels:
+    """End-to-end: RAVEN_REVIEW_OUTPUT controls whether the summary body
+    and/or inline comments reach submit_review."""
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def _payload(self):
+        return {
+            "repo": "owner/repo", "sender": "alice", "pr_number": 42,
+            "pr_title": "PR #42", "pr_url": "https://git/pulls/42",
+            "head_sha": "abc123", "head_ref": "feature", "base_ref": "main",
+        }
+
+    def _make_provider(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_head_sha.return_value = "abc123"
+        mc.fetch_pr_diff.return_value = "diff --git a/f.py b/f.py\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.submit_review.return_value = {"id": 1}
+        mc.add_label_to_pr.return_value = None
+        mc.merge_pr.return_value = True
+        mc.get_commit_status.return_value = "success"
+        return mc
+
+    _REVIEW = {
+        "severity": "medium",
+        "summary": "two issues",
+        "findings": [
+            {"severity": "high", "file": "f.py", "line": 3, "message": "inline-able"},
+            {"severity": "low", "message": "no file/line — body-only"},
+        ],
+    }
+
+    def _run(self, output_mode):
+        mc = self._make_provider()
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", output_mode),
+            patch("raven.server.review_diff", return_value=dict(self._REVIEW)),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+        # submit_review(repo, pr, body, approve=, inline_comments=, commit_id=, ...)
+        call = mc.submit_review.call_args
+        body = call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
+        inline = call.kwargs["inline_comments"]
+        return body, inline
+
+    def test_both_posts_body_and_inline(self):
+        body, inline = self._run("both")
+        assert "Findings:" in body
+        assert "inline-able" in body          # findings list present in body
+        assert len(inline) == 1               # the file/line finding posted inline
+        assert inline[0]["file"] == "f.py"
+
+    def test_summary_posts_body_no_inline(self):
+        body, inline = self._run("summary")
+        assert "Findings:" in body
+        assert "inline-able" in body
+        assert inline == []                   # no inline comments
+
+    def test_inline_posts_inline_and_bodyless_findings_only(self):
+        body, inline = self._run("inline")
+        # inline-able finding goes to the line, NOT the body findings list
+        assert len(inline) == 1
+        assert inline[0]["file"] == "f.py"
+        assert "inline-able" not in body
+        # the file-less finding has nowhere inline to go → kept in body
+        assert "no file/line — body-only" in body
+
+    def test_inline_clean_pr_still_posts_verdict_body(self):
+        """No findings at all → inline mode still posts a (minimal) body so
+        the formal review/verdict is recorded; inline list is empty."""
+        mc = self._make_provider()
+        clean = {"severity": "low", "summary": "all clear", "findings": []}
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", "inline"),
+            patch("raven.server.review_diff", return_value=clean),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+        call = mc.submit_review.call_args
+        body = call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
+        assert "all clear" in body
+        assert call.kwargs["inline_comments"] == []
