@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+from urllib.parse import urlsplit
 
 import requests
 
@@ -77,20 +78,51 @@ def notify(repo_name: str, ref: str, review: dict, link: str = "", action: str =
             else:
                 logger.warning("Unknown notification channel type: %s", channel_type)
         except Exception as e:
-            logger.error("Notification failed for channel %s: %s", channel_type, e)
+            # Never log str(e): requests exceptions embed the full request URL,
+            # and webhook URLs are bearer-equivalent secrets (for Slack incoming
+            # webhooks the path IS the credential). Log only the exception class,
+            # the HTTP status when available (no secret material; distinguishes a
+            # revoked/mistyped webhook 404 from a transient 5xx), and the
+            # hostname (NOT netloc, which would leak userinfo like user:pass@).
+            logger.error(
+                "Notification failed for channel %s (%s): %s",
+                channel_type,
+                _redacted_host(channel.get("url", "")),
+                _exception_summary(e),
+            )
 
     return any_sent
 
 
+def _redacted_host(url: str) -> str:
+    """Hostname (plus port, if any) of a channel URL — safe to log.
+
+    Excludes the path (Slack webhook credential) and userinfo (basic-auth
+    credentials), both of which urlsplit's netloc would include.
+    """
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        return f"{host}:{parts.port}" if parts.port else host
+    except ValueError:
+        return ""
+
+
+def _exception_summary(e: Exception) -> str:
+    """Exception class name, plus the HTTP status code when present."""
+    status = getattr(getattr(e, "response", None), "status_code", "")
+    return f"{type(e).__name__} (HTTP {status})" if status else type(e).__name__
+
+
 # ── Message formatting ────────────────────────────────────────────── #
 
-SEVERITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+SEVERITY_EMOJI = {"high": "🔴", "medium": "🟠", "low": "🟡"}
 
 
 def _format_message(repo_name: str, ref: str, review: dict, link: str, action: str) -> str:
     severity = review.get("severity", "low")
     summary = review.get("summary", "")
-    emoji = SEVERITY_EMOJI.get(severity, "🟢")
+    emoji = SEVERITY_EMOJI.get(severity, "🟡")
 
     if action == "merge_failed":
         header = "🦅 *Raven* — ⚠️ Auto-merge failed"

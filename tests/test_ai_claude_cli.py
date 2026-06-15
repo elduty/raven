@@ -7,7 +7,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 
-from raven.ai.base import AIBackend
+from raven.ai.base import AIBackend, AIError
 from raven.ai.claude_cli import (
     _active_procs,
     _active_procs_lock,
@@ -316,6 +316,83 @@ class TestClaudeCLIJsonEnvelope:
                     "p", model="m", effort="max", timeout=60, purpose="review",
                 )
 
+
+class TestClaudeCLIErrorClassification:
+    """The CLI collapses every failure mode to a non-zero exit + stderr
+    text (or a TimeoutExpired). classify the cause into an ``AIError.reason``
+    so server.py can post an actionable comment and reviewer.py can decide
+    whether to retry. Reasons come from the stderr/stdout text the CLI
+    emits — usage caps, rate limits, and auth failures each have a
+    recognisable shape."""
+
+    def _fail(self, *, returncode=1, stderr="", stdout=""):
+        backend = ClaudeCLIBackend()
+        fake = MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
+        with patch("raven.ai.claude_cli._run_claude_cli", return_value=fake):
+            with pytest.raises(AIError) as ei:
+                backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        return ei.value
+
+    def test_timeout_classified(self):
+        backend = ClaudeCLIBackend()
+        with patch(
+            "raven.ai.claude_cli._run_claude_cli",
+            side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=5),
+        ):
+            with pytest.raises(AIError) as ei:
+                backend.complete("p", model="m", effort="max", timeout=5, purpose="review")
+        assert ei.value.reason == "timeout"
+        assert ei.value.retryable is True
+
+    def test_usage_limit_classified_from_stderr(self):
+        # Claude CLI emits a usage/session cap message when the plan's
+        # limit is hit — resets hours later, so an in-process retry can't help.
+        err = self._fail(stderr="Claude AI usage limit reached. Your limit will reset at 5pm.")
+        assert err.reason == "usage_limit"
+        assert err.retryable is False
+
+    def test_session_limit_classified_from_stderr(self):
+        err = self._fail(stderr="5-hour session limit reached; try again later")
+        assert err.reason == "usage_limit"
+        assert err.retryable is False
+
+    def test_rate_limit_classified_from_stderr(self):
+        err = self._fail(stderr="API Error: 429 rate_limit_error: too many requests")
+        assert err.reason == "rate_limit"
+        assert err.retryable is True
+
+    def test_auth_failure_classified_from_stderr(self):
+        err = self._fail(stderr="API Error: 401 authentication_error: invalid x-api-key")
+        assert err.reason == "auth"
+        assert err.retryable is False
+
+    def test_server_error_classified_from_stderr(self):
+        err = self._fail(stderr="API Error: 529 overloaded_error: upstream overloaded")
+        assert err.reason == "backend_5xx"
+        assert err.retryable is True
+
+    def test_unrecognised_nonzero_exit_is_unknown(self):
+        err = self._fail(returncode=2, stderr="some unexpected failure")
+        assert err.reason == "unknown"
+        assert err.retryable is False
+
+    def test_missing_binary_classified_as_unknown(self):
+        backend = ClaudeCLIBackend()
+        with patch("raven.ai.claude_cli._run_claude_cli", side_effect=FileNotFoundError):
+            with pytest.raises(AIError) as ei:
+                backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        # A missing binary is a deploy fault, not a transient one — don't retry.
+        assert ei.value.reason == "unknown"
+        assert ei.value.retryable is False
+
+    def test_classification_does_not_leak_token_into_message(self, monkeypatch):
+        # The exception message must stay redacted — it flows to operator
+        # logs and (via server.py) the comment-building helper.
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-supersecrettoken1234567890")
+        err = self._fail(stderr="401 auth failed for sk-ant-supersecrettoken1234567890")
+        assert "supersecrettoken" not in str(err)
+        assert err.reason == "auth"
+
     def test_shutdown_delegates_to_terminate_active_processes(self):
         backend = ClaudeCLIBackend()
         with patch(
@@ -371,6 +448,156 @@ class TestClaudeCLIJsonEnvelope:
         assert "--allowed-tools" in cli_args
         tools_idx = cli_args.index("--allowed-tools")
         assert cli_args[tools_idx + 1] == ""
+
+
+# ------------------------------------------------------------------ #
+#  Working-directory isolation                                         #
+# ------------------------------------------------------------------ #
+
+class TestCwdIsolation:
+    """The CLI subprocess must NOT inherit the service's working directory.
+
+    The claude CLI ships file tools (grep/read) that operate relative to
+    its cwd. Inheriting the app's cwd let reviews "verify" claims against
+    the deployed container's own /app checkout — observed twice producing
+    confident false "implementation absent" findings (PR #160 round-5,
+    PR #163): greps of a checkout that is stale relative to the reviewed
+    repo's main, and for any repo other than Raven itself an entirely
+    unrelated codebase. Each spawn gets a fresh empty temp dir so the
+    model's only evidence is what the prompt provides."""
+
+    @staticmethod
+    def _cm_mock(**attrs) -> MagicMock:
+        m = MagicMock(**attrs)
+        m.__enter__.return_value = m
+        m.__exit__.return_value = None
+        return m
+
+    def test_popen_receives_isolated_empty_cwd(self):
+        """Popen must be called with a cwd kwarg pointing at a directory
+        that exists, is empty, and is not the service's own cwd."""
+        fake_proc = self._cm_mock(returncode=0)
+        captured = {}
+
+        with patch("raven.ai.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen:
+            def fake_communicate(input, timeout):
+                cwd = mock_popen.call_args.kwargs.get("cwd")
+                captured["cwd"] = cwd
+                captured["exists_during_call"] = cwd is not None and os.path.isdir(cwd)
+                captured["empty_during_call"] = (
+                    cwd is not None and os.path.isdir(cwd) and os.listdir(cwd) == []
+                )
+                return ("stdout", "stderr")
+
+            fake_proc.communicate.side_effect = fake_communicate
+            _run_claude_cli(["claude"], prompt="hi", timeout=10)
+
+        assert captured["cwd"] is not None, "Popen was not given an isolated cwd"
+        assert captured["cwd"] != os.getcwd()
+        assert captured["exists_during_call"] is True
+        assert captured["empty_during_call"] is True
+
+    def test_isolated_cwd_removed_after_success(self):
+        fake_proc = self._cm_mock(returncode=0)
+        fake_proc.communicate.return_value = ("stdout", "stderr")
+
+        with patch("raven.ai.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen:
+            _run_claude_cli(["claude"], prompt="hi", timeout=10)
+            cwd = mock_popen.call_args.kwargs.get("cwd")
+
+        assert cwd is not None
+        assert not os.path.exists(cwd), "isolated cwd leaked after a successful call"
+
+    def test_isolated_cwd_removed_on_timeout(self):
+        import subprocess as sp
+
+        fake_proc = self._cm_mock()
+        fake_proc.communicate.side_effect = sp.TimeoutExpired(cmd="claude", timeout=1)
+
+        with patch("raven.ai.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen:
+            with pytest.raises(sp.TimeoutExpired):
+                _run_claude_cli(["claude"], prompt="hi", timeout=1)
+            cwd = mock_popen.call_args.kwargs.get("cwd")
+
+        assert cwd is not None
+        assert not os.path.exists(cwd), "isolated cwd leaked after a timeout"
+
+    def test_isolated_cwd_removed_on_non_timeout_exception(self):
+        fake_proc = self._cm_mock()
+        fake_proc.communicate.side_effect = BrokenPipeError("pipe gone")
+
+        with patch("raven.ai.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen:
+            with pytest.raises(BrokenPipeError):
+                _run_claude_cli(["claude"], prompt="hi", timeout=10)
+            cwd = mock_popen.call_args.kwargs.get("cwd")
+
+        assert cwd is not None
+        assert not os.path.exists(cwd), "isolated cwd leaked after an exception"
+
+    def test_isolated_cwd_removed_even_if_cli_wrote_files(self):
+        """If the CLI drops session/debug files into its cwd, cleanup must
+        still remove the directory (recursive delete, not bare rmdir)."""
+        fake_proc = self._cm_mock(returncode=0)
+
+        with patch("raven.ai.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen:
+            def fake_communicate(input, timeout):
+                cwd = mock_popen.call_args.kwargs["cwd"]
+                with open(os.path.join(cwd, "session.json"), "w") as f:
+                    f.write("{}")
+                return ("stdout", "stderr")
+
+            fake_proc.communicate.side_effect = fake_communicate
+            _run_claude_cli(["claude"], prompt="hi", timeout=10)
+            cwd = mock_popen.call_args.kwargs["cwd"]
+
+        assert not os.path.exists(cwd)
+
+    def test_popen_env_is_scoped_and_keeps_cli_auth(self, monkeypatch):
+        """The child's env is now scoped to a fail-closed allowlist (see
+        TestSubprocessEnvAllowlist) rather than a full passthrough — but the
+        CLI's own auth must still reach it, so CLAUDE_CODE_OAUTH_TOKEN
+        survives the scoping and the env override is present (not None)."""
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-token")
+        fake_proc = self._cm_mock(returncode=0)
+        fake_proc.communicate.return_value = ("stdout", "stderr")
+
+        with patch("raven.ai.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen:
+            _run_claude_cli(["claude"], prompt="hi", timeout=10)
+
+        env = mock_popen.call_args.kwargs.get("env")
+        assert env is not None  # env IS scoped now (no longer full passthrough)
+        assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "claude-token"
+
+    def test_complete_disables_builtin_tools_entirely(self):
+        """Defense-in-depth: ``--tools ""`` removes every built-in tool from
+        the model's set. ``--allowed-tools`` alone only governs permission
+        auto-approval — in -p mode read-only file tools (grep/read) still
+        ran, which is how the false "implementation absent" findings were
+        produced. The empty cwd is the primary isolation; this flag makes
+        the tools not exist at all."""
+        backend = ClaudeCLIBackend()
+        fake_result = MagicMock(returncode=0, stdout="output", stderr="")
+
+        with patch("raven.ai.claude_cli._run_claude_cli", return_value=fake_result) as mock_run:
+            backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        cli_args = mock_run.call_args[0][0]
+        assert "--tools" in cli_args
+        assert cli_args[cli_args.index("--tools") + 1] == ""
+
+    def test_each_call_gets_a_fresh_cwd(self):
+        """Per-call isolation: two spawns must not share a directory, so
+        nothing one call leaves behind is visible to the next."""
+        fake_proc = self._cm_mock(returncode=0)
+        fake_proc.communicate.return_value = ("stdout", "stderr")
+
+        with patch("raven.ai.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen:
+            _run_claude_cli(["claude"], prompt="hi", timeout=10)
+            first = mock_popen.call_args.kwargs.get("cwd")
+            _run_claude_cli(["claude"], prompt="hi", timeout=10)
+            second = mock_popen.call_args.kwargs.get("cwd")
+
+        assert first is not None and second is not None
+        assert first != second
 
 
 # ------------------------------------------------------------------ #
@@ -444,3 +671,70 @@ class TestRedactSecrets:
                 backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
         assert "supersecret-token-xyz" not in str(excinfo.value)
         assert "***REDACTED***" in str(excinfo.value)
+
+
+# ------------------------------------------------------------------ #
+#  Subprocess env allowlist (audit 2026-06-13 finding #3)             #
+# ------------------------------------------------------------------ #
+
+class TestSubprocessEnvAllowlist:
+    """The Claude CLI child must inherit only an allowlisted env subset —
+    never Raven's platform credentials. The CLI self-updates nightly from
+    npm, so a compromised release inheriting GITEA_TOKEN / BITBUCKET_DC_TOKEN
+    / webhook secrets / API keys could exfiltrate org push+merge creds. The
+    allowlist is fail-closed: a new secret added to Raven's env later does
+    NOT leak unless explicitly permitted."""
+
+    @staticmethod
+    def _cm_mock(**attrs):
+        m = MagicMock(**attrs)
+        m.__enter__.return_value = m
+        m.__exit__.return_value = None
+        m.communicate.return_value = ("ok", "")
+        return m
+
+    def _capture_env(self):
+        fake_proc = self._cm_mock(returncode=0)
+        with patch("raven.ai.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen:
+            _run_claude_cli(["claude"], prompt="hi", timeout=10)
+        env = mock_popen.call_args.kwargs.get("env")
+        assert env is not None, "Popen called without a scoped env allowlist"
+        return env
+
+    def test_strips_raven_platform_secrets(self, monkeypatch):
+        for k, v in {
+            "GITEA_TOKEN": "git-secret",
+            "BITBUCKET_DC_TOKEN": "bb-secret",
+            "GITEA_WEBHOOK_SECRET": "wh-secret",
+            "BITBUCKET_DC_WEBHOOK_SECRET": "bbwh-secret",
+            "RAVEN_AI_API_KEY": "ai-secret",
+            "RAVEN_METRICS_TOKEN": "metrics-secret",
+        }.items():
+            monkeypatch.setenv(k, v)
+        env = self._capture_env()
+        for k in ("GITEA_TOKEN", "BITBUCKET_DC_TOKEN", "GITEA_WEBHOOK_SECRET",
+                  "BITBUCKET_DC_WEBHOOK_SECRET", "RAVEN_AI_API_KEY",
+                  "RAVEN_METRICS_TOKEN"):
+            assert k not in env, f"{k} leaked into the CLI subprocess env"
+
+    def test_keeps_cli_auth_and_system_essentials(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-token")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "refresh-token")
+        monkeypatch.setenv("HOME", "/home/raven")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        env = self._capture_env()
+        assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "claude-token"
+        assert env.get("CLAUDE_CODE_OAUTH_REFRESH_TOKEN") == "refresh-token"
+        assert env.get("HOME") == "/home/raven"
+        assert env.get("PATH") == "/usr/bin:/bin"
+
+    def test_keeps_proxy_tls_and_locale_for_networked_envs(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy:8080")
+        monkeypatch.setenv("NODE_EXTRA_CA_CERTS", "/etc/ssl/corp.pem")
+        monkeypatch.setenv("SSL_CERT_FILE", "/etc/ssl/cert.pem")
+        monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+        env = self._capture_env()
+        assert env.get("HTTPS_PROXY") == "http://proxy:8080"
+        assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/ssl/corp.pem"
+        assert env.get("SSL_CERT_FILE") == "/etc/ssl/cert.pem"
+        assert env.get("LC_ALL") == "en_US.UTF-8"

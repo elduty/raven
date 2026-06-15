@@ -9,7 +9,7 @@ from urllib.parse import quote
 import requests
 from flask import abort
 
-from raven.providers import GitProvider
+from raven.providers import GitProvider, DiffTruncatedError
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +158,21 @@ class BitbucketDCProvider(GitProvider):
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
         if "application/json" in content_type:
-            diff_text = self._json_diff_to_unified(resp.json())
+            data = resp.json()
+            # Fail closed on a truncated diff: BB DC caps diff size and
+            # returns only part of the change. Reviewing the partial diff
+            # would let Raven APPROVE + auto-merge code the model never saw
+            # (audit 2026-06-13 finding #1). Refuse instead — the review
+            # flow's error handler posts an actionable comment and blocks
+            # the merge; the comment / cached-merge flows abort safely too.
+            if self._diff_response_truncated(data):
+                raise DiffTruncatedError(
+                    f"Bitbucket DC returned a truncated diff for PR #{pr_number}: "
+                    f"the change exceeds the server's diff size limit, so part of "
+                    f"it is missing from the response. Refusing to review a partial "
+                    f"diff (would risk approving/merging unseen code)."
+                )
+            diff_text = self._json_diff_to_unified(data)
         else:
             diff_text = resp.text
         if not diff_text.strip():
@@ -194,6 +208,43 @@ class BitbucketDCProvider(GitProvider):
                     for line_obj in segment.get("lines", []):
                         lines.append(f"{prefix}{line_obj.get('line', '')}")
         return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _diff_response_truncated(data: dict) -> bool:
+        """True if a BB DC JSON diff response signals truncation at ANY level.
+
+        BB DC caps diff size and flags truncation on the overall response
+        AND, independently, on individual file diffs, hunks, segments, and
+        lines (Atlassian's streaming-diff model: the top-level flag means
+        "at least one hunk was omitted"; the finer flags mark a hunk/segment
+        cut mid-content, which the top-level flag does not always reflect).
+        Any of them means the model would see incomplete code, so we check
+        every level and fail closed. Absent flags read falsy, so a complete
+        diff never trips a false positive.
+        """
+        if not isinstance(data, dict):
+            return False
+        if data.get("truncated"):
+            return True
+        for d in data.get("diffs") or []:
+            if not isinstance(d, dict):
+                continue
+            if d.get("truncated"):
+                return True
+            for h in d.get("hunks") or []:
+                if not isinstance(h, dict):
+                    continue
+                if h.get("truncated"):
+                    return True
+                for seg in h.get("segments") or []:
+                    if not isinstance(seg, dict):
+                        continue
+                    if seg.get("truncated"):
+                        return True
+                    for ln in seg.get("lines") or []:
+                        if isinstance(ln, dict) and ln.get("truncated"):
+                            return True
+        return False
 
     def fetch_file(self, repo_full_name: str, path: str, ref: str = "HEAD") -> str:
         """Return file contents, or empty string if not found.
@@ -545,6 +596,14 @@ class BitbucketDCProvider(GitProvider):
     def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
         """Return all comments on a PR via the activities endpoint.
 
+        Returned in **chronological (oldest-first)** order to match the
+        Gitea provider's contract — consumers (``server._process_comment``'s
+        ``[-COMMENT_HISTORY:]`` "last N", ``reviewer._build_pr_context_section``'s
+        ``reversed(...)`` budget walk) assume oldest-first. The BB DC
+        ``/activities`` endpoint pages newest-first, so we collect across
+        all pages (newest→oldest) and reverse the assembled list once
+        before returning.
+
         Returns only **top-level** comments (each activity's root comment).
         Replies nested in the ``comments`` array of each activity are not
         extracted — they're already surfaced to the AI via the per-trigger
@@ -582,6 +641,10 @@ class BitbucketDCProvider(GitProvider):
                     "older comments beyond the cap are missing from the prompt context.",
                     pr_number, _ACTIVITIES_MAX_PAGES,
                 )
+        # The activities feed pages newest-first; reverse the fully
+        # assembled list once so callers get chronological (oldest-first)
+        # order, matching the Gitea provider's contract.
+        all_comments.reverse()
         return all_comments
 
     def post_pr_comment(self, repo_full_name: str, pr_number: int, body: str,
@@ -625,17 +688,24 @@ class BitbucketDCProvider(GitProvider):
         """
         project, repo = _split_repo(repo_full_name)
 
-        # Post inline comments first; capture per-anchor returned IDs.
-        posted_inline = (
-            self._post_inline_comments(project, repo, pr_number, inline_comments)
-            if inline_comments else []
-        )
-
-        # Post the main review comment
+        # Post the main review comment FIRST. BB DC has no single-POST
+        # review API (unlike Gitea), so the main comment and the inline
+        # anchors are separate POSTs. If we posted the anchors first and
+        # the main-comment POST then raised, the caller treats the whole
+        # submit_review as failed and re-posts everything on the next
+        # pass — duplicating every (already-posted) inline comment. By
+        # posting the main comment first, a main-comment failure leaves
+        # zero inline anchors on the PR: no orphans, no dupes (audit #14).
         comment_url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/comments"
         resp = self.session.post(comment_url, json={"text": body}, timeout=15)
         resp.raise_for_status()
         result = resp.json()
+
+        # Then post inline comments; capture per-anchor returned IDs.
+        posted_inline = (
+            self._post_inline_comments(project, repo, pr_number, inline_comments)
+            if inline_comments else []
+        )
         result["inline_comments"] = posted_inline
 
         # Approve / needs-work — skipped in comment_only mode so the
@@ -795,7 +865,12 @@ class BitbucketDCProvider(GitProvider):
                  head_sha: str = "", merge_when_checks_succeed: bool = False) -> bool:
         """Merge a PR with deleteSourceBranch. Strategy is controlled by repo settings in BB DC.
 
-        head_sha and merge_when_checks_succeed are accepted for ABC compatibility but not used.
+        When head_sha is provided, the merge is pinned to the reviewed head: the PR's
+        current fromRef.latestCommit must match head_sha or the merge is refused
+        (force-push protection). The `version` param in the merge POST covers the
+        remaining GET-to-POST gap — a concurrent push bumps the version and the
+        merge fails with 409. merge_when_checks_succeed is accepted for ABC
+        compatibility but not used.
         """
         project, repo = _split_repo(repo_full_name)
         # Need PR version for merge
@@ -804,7 +879,18 @@ class BitbucketDCProvider(GitProvider):
         if pr_resp.status_code != 200:
             logger.error("Failed to fetch PR #%d for merge: %s", pr_number, pr_resp.status_code)
             return False
-        version = pr_resp.json().get("version", 0)
+        pr_data = pr_resp.json()
+        version = pr_data.get("version", 0)
+
+        if head_sha:
+            latest_commit = pr_data.get("fromRef", {}).get("latestCommit", "")
+            if latest_commit != head_sha:
+                logger.warning(
+                    "Refusing to merge PR #%d in %s: head moved since review "
+                    "(reviewed %s, current %s) — possible force-push",
+                    pr_number, repo_full_name, head_sha, latest_commit,
+                )
+                return False
 
         merge_url = f"{pr_url}/merge"
         resp = self.session.post(

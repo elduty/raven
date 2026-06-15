@@ -8,6 +8,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 
+from raven.providers import DiffTruncatedError
 from raven.providers.bitbucket_dc import BitbucketDCProvider, _split_repo
 
 BB_DC_BASE = "https://bitbucket.example.com"
@@ -446,25 +447,92 @@ class TestSubmitReview:
         assert put_payload["status"] == "NEEDS_WORK"
         assert "/participants/raven-bot" in mock_put.call_args[0][0]
 
-    def test_inline_comments_posted_before_review(self, client):
+    def test_main_comment_posted_before_inline(self, client):
+        """The main review comment is posted FIRST, then inline anchors,
+        then approve. Ordering matters: if the main comment POST fails,
+        no inline comments will have been posted (no orphans/dupes on the
+        re-post that the caller drives after a failed submit_review)."""
+        main_resp = MagicMock(status_code=201, raise_for_status=MagicMock())
+        main_resp.json.return_value = {"id": 12}
         inline_resp = MagicMock(status_code=201, raise_for_status=MagicMock())
-        inline_resp.json.return_value = {}
-        comment_resp = MagicMock(status_code=201, raise_for_status=MagicMock())
-        comment_resp.json.return_value = {"id": 12}
+        inline_resp.json.return_value = {"id": 77}
         approve_resp = MagicMock(status_code=200, raise_for_status=MagicMock())
 
-        with patch.object(client.session, "post", side_effect=[inline_resp, comment_resp, approve_resp]) as mock_post:
+        with patch.object(client.session, "post", side_effect=[main_resp, inline_resp, approve_resp]) as mock_post:
             client.submit_review(
                 "PROJ/repo", 5, "Review body", approve=True,
                 inline_comments=[{"file": "main.py", "line": 10, "body": "fix this"}],
             )
 
-        # First call should be the inline comment with anchor
-        inline_payload = mock_post.call_args_list[0][1]["json"]
+        calls = mock_post.call_args_list
+        # First call: the main review comment (no anchor).
+        first_payload = calls[0][1]["json"]
+        assert first_payload["text"] == "Review body"
+        assert "anchor" not in first_payload
+        # Second call: the inline anchor comment.
+        inline_payload = calls[1][1]["json"]
         assert inline_payload["text"] == "fix this"
         assert inline_payload["anchor"]["path"] == "main.py"
         assert inline_payload["anchor"]["line"] == 10
         assert inline_payload["anchor"]["lineType"] == "ADDED"
+        # Third call: approve.
+        assert "/approve" in calls[2][0][0]
+
+    def test_main_comment_failure_posts_no_inline(self, client):
+        """If the MAIN review-comment POST raises, no inline anchors are
+        posted — _post_inline_comments is never reached. This guards the
+        orphaned/duplicated-comment window (audit #14): the caller treats
+        the whole submit_review as failed and re-posts on the next pass,
+        so any already-posted inline comments would be duplicated."""
+        import requests
+        main_resp = MagicMock(status_code=500)
+        main_resp.raise_for_status.side_effect = requests.HTTPError("boom")
+
+        with patch.object(client.session, "post", return_value=main_resp), \
+             patch.object(client, "_post_inline_comments") as mock_inline:
+            with pytest.raises(requests.HTTPError):
+                client.submit_review(
+                    "PROJ/repo", 5, "Review body", approve=True,
+                    inline_comments=[{"file": "main.py", "line": 10, "body": "fix this"}],
+                )
+
+        # The main-comment POST failed before any inline anchor was posted.
+        mock_inline.assert_not_called()
+
+    def test_happy_path_returns_aligned_inline_comments(self, client):
+        """Reorder preserves the return contract: the result is the
+        main-comment dict extended with an `inline_comments` list aligned
+        to the input (same length, with comment_ids for posted anchors)."""
+        inline = [
+            {"file": "a.py", "line": 5, "body": "f1"},
+            {"file": "b.py", "line": 8, "body": "f2"},
+        ]
+        posts = []
+        def fake_post(url, json=None, timeout=None):
+            posts.append((url, json))
+            mr = MagicMock(status_code=201, raise_for_status=MagicMock())
+            if "anchor" in (json or {}):
+                # Anchor posts return ids 200, 201, ... by order seen.
+                cid = 200 + sum(1 for p in posts[:-1] if "anchor" in (p[1] or {}))
+                mr.json.return_value = {"id": cid}
+            elif "/approve" in url:
+                mr.json.return_value = {}
+            else:
+                mr.json.return_value = {"id": 12, "text": "Review body"}
+            return mr
+
+        with patch.object(client.session, "post", side_effect=fake_post):
+            result = client.submit_review(
+                "PROJ/repo", 5, "Review body", approve=True,
+                inline_comments=inline,
+            )
+
+        # Main-comment dict is the base of the return value.
+        assert result["id"] == 12
+        ic = result["inline_comments"]
+        assert len(ic) == 2  # aligned to input length
+        assert ic[0] == {"file": "a.py", "line": 5, "comment_id": 200}
+        assert ic[1] == {"file": "b.py", "line": 8, "comment_id": 201}
 
     def test_comment_only_skips_participant_status(self, client):
         """comment_only=True posts the body comment but skips the
@@ -575,6 +643,55 @@ class TestMergePr:
 
         assert result is False
 
+    def test_merge_refused_on_head_sha_mismatch(self, client):
+        """Force-push between review and merge: latestCommit != reviewed head_sha -> no merge POST."""
+        pr_resp = MagicMock(status_code=200, raise_for_status=MagicMock())
+        pr_resp.json.return_value = {
+            "version": 3,
+            "fromRef": {"latestCommit": "attacker999"},
+        }
+
+        with patch.object(client.session, "get", return_value=pr_resp), \
+             patch.object(client.session, "post") as mock_post:
+            result = client.merge_pr("PROJ/repo", 7, head_sha="reviewed123")
+
+        assert result is False
+        mock_post.assert_not_called()
+
+    def test_merge_proceeds_on_head_sha_match(self, client):
+        pr_resp = MagicMock(status_code=200, raise_for_status=MagicMock())
+        pr_resp.json.return_value = {
+            "version": 3,
+            "fromRef": {"latestCommit": "reviewed123"},
+        }
+        merge_resp = MagicMock(status_code=200)
+        merge_resp.json.return_value = {}
+
+        with patch.object(client.session, "get", return_value=pr_resp), \
+             patch.object(client.session, "post", return_value=merge_resp) as mock_post:
+            result = client.merge_pr("PROJ/repo", 7, head_sha="reviewed123")
+
+        assert result is True
+        mock_post.assert_called_once()
+        assert mock_post.call_args[1]["params"]["version"] == 3
+
+    def test_merge_without_head_sha_skips_comparison(self, client):
+        """Legacy behavior: empty head_sha merges without pinning, even if latestCommit differs."""
+        pr_resp = MagicMock(status_code=200, raise_for_status=MagicMock())
+        pr_resp.json.return_value = {
+            "version": 5,
+            "fromRef": {"latestCommit": "whatever456"},
+        }
+        merge_resp = MagicMock(status_code=200)
+        merge_resp.json.return_value = {}
+
+        with patch.object(client.session, "get", return_value=pr_resp), \
+             patch.object(client.session, "post", return_value=merge_resp) as mock_post:
+            result = client.merge_pr("PROJ/repo", 7)
+
+        assert result is True
+        mock_post.assert_called_once()
+
 
 # ------------------------------------------------------------------ #
 #  get_commit_status aggregation                                      #
@@ -661,6 +778,65 @@ class TestFetchPrDiff:
             client.fetch_pr_diff("PROJ/repo", 42)
         url = mock_get.call_args[0][0]
         assert "/projects/PROJ/repos/repo/pull-requests/42/diff" in url
+
+    # ── Truncated-diff fail-closed (audit 2026-06-13 finding #1) ──────── #
+    # BB DC caps diff size and flags truncation on the overall response and
+    # on individual file diffs / hunks / segments / lines. A truncated diff
+    # means the model would see only part of the PR; reviewing (and possibly
+    # APPROVING + auto-merging) that partial diff is the silent-unseen-code
+    # hole. fetch_pr_diff must refuse it at every truncation level.
+
+    def test_truncated_top_level_raises(self, client):
+        data = {
+            "diffs": [{"source": {"toString": "a.py"},
+                       "destination": {"toString": "a.py"}, "hunks": []}],
+            "truncated": True,
+        }
+        with _mock_get(client, json_data=data, content_type="application/json"):
+            with pytest.raises(DiffTruncatedError, match="truncated"):
+                client.fetch_pr_diff("PROJ/repo", 7)
+
+    def test_truncated_per_file_raises(self, client):
+        data = {"diffs": [{"source": {"toString": "a.py"},
+                           "destination": {"toString": "a.py"},
+                           "truncated": True, "hunks": []}]}
+        with _mock_get(client, json_data=data, content_type="application/json"):
+            with pytest.raises(DiffTruncatedError):
+                client.fetch_pr_diff("PROJ/repo", 7)
+
+    def test_truncated_hunk_raises(self, client):
+        data = {"diffs": [{"source": {"toString": "a.py"},
+                           "destination": {"toString": "a.py"},
+                           "hunks": [{"truncated": True, "segments": []}]}]}
+        with _mock_get(client, json_data=data, content_type="application/json"):
+            with pytest.raises(DiffTruncatedError):
+                client.fetch_pr_diff("PROJ/repo", 7)
+
+    def test_truncated_segment_raises(self, client):
+        data = {"diffs": [{"source": {"toString": "a.py"},
+                           "destination": {"toString": "a.py"},
+                           "hunks": [{"segments": [{"truncated": True,
+                                                    "lines": []}]}]}]}
+        with _mock_get(client, json_data=data, content_type="application/json"):
+            with pytest.raises(DiffTruncatedError):
+                client.fetch_pr_diff("PROJ/repo", 7)
+
+    def test_non_truncated_json_diff_succeeds(self, client):
+        """Guard against false positives: a complete JSON diff (all
+        truncated flags false/absent) converts and returns normally."""
+        data = {
+            "diffs": [{"source": {"toString": "a.py"},
+                       "destination": {"toString": "a.py"},
+                       "truncated": False,
+                       "hunks": [{"sourceLine": 1, "sourceSpan": 1,
+                                  "destinationLine": 1, "destinationSpan": 2,
+                                  "segments": [{"type": "ADDED",
+                                                "lines": [{"line": "x"}]}]}]}],
+            "truncated": False,
+        }
+        with _mock_get(client, json_data=data, content_type="application/json"):
+            result = client.fetch_pr_diff("PROJ/repo", 7)
+        assert "diff --git a/a.py b/a.py" in result
 
 
 # ------------------------------------------------------------------ #
@@ -1326,13 +1502,17 @@ class TestSubmitReviewInlineIds:
             {"file": "a.py", "line": 1, "body": "f1"},
             {"file": "a.py", "line": 2, "body": "f2"},
         ]
-        call = [0]
+        anchor_calls = [0]
         def fake_post(url, json=None, timeout=None):
-            call[0] += 1
             mr = MagicMock()
             mr.raise_for_status = MagicMock()
             if "anchor" in (json or {}):
-                if call[0] == 1:
+                # Key success/failure off the anchor index (not the
+                # global call count) so the test is robust to where the
+                # main-comment POST lands in the sequence. First anchor
+                # succeeds; second fails.
+                anchor_calls[0] += 1
+                if anchor_calls[0] == 1:
                     mr.status_code = 200
                     mr.json.return_value = {"id": 500}
                 else:
@@ -1440,3 +1620,68 @@ class TestGetResolvedCommentIds:
         with patch.object(client.session, "get", side_effect=fake_get):
             resolved = client.get_resolved_comment_ids("proj/repo", 1)
         assert resolved == {10, 20}
+
+
+class TestGetPrComments:
+    """``get_pr_comments`` returns top-level PR comments in **chronological
+    (oldest-first)** order, matching the Gitea provider's contract.
+
+    The BB DC ``/activities`` endpoint pages newest-first, but every
+    consumer (``server._process_comment``'s ``[-COMMENT_HISTORY:]`` "last
+    N", ``reviewer._build_pr_context_section``'s ``reversed(...)`` budget
+    walk) assumes oldest-first like Gitea. So the provider reverses the
+    fully-paginated feed once before returning."""
+
+    def _activities_response(self, comments, is_last=True, next_start=None):
+        """Wrap the given comment dicts as ``action=COMMENTED`` activities."""
+        return {
+            "values": [{"action": "COMMENTED", "comment": c} for c in comments],
+            "isLastPage": is_last,
+            "nextPageStart": next_start or 0,
+        }
+
+    def _comment(self, cid):
+        return {"id": cid, "author": {"slug": f"user{cid}"}, "text": f"comment {cid}"}
+
+    def test_returns_chronological_across_pages(self, client):
+        """The activities feed is newest-first and paginated: page 1 holds
+        the newest comments [3, 2], page 2 the oldest [1]. ``get_pr_comments``
+        must reverse the assembled feed so callers see oldest-first → [1, 2, 3]."""
+        page1 = self._activities_response(
+            [self._comment(3), self._comment(2)], is_last=False, next_start=50,
+        )
+        page2 = self._activities_response([self._comment(1)], is_last=True)
+        pages = [page1, page2]
+
+        def fake_get(url, params=None, timeout=None):
+            start = (params or {}).get("start", 0)
+            mr = MagicMock(status_code=200)
+            mr.raise_for_status = MagicMock()
+            mr.json.return_value = pages[0] if start == 0 else pages[1]
+            return mr
+
+        with patch.object(client.session, "get", side_effect=fake_get):
+            comments = client.get_pr_comments("proj/repo", 1)
+        assert [c["id"] for c in comments] == [1, 2, 3]
+
+    def test_single_page_newest_first_reversed(self, client):
+        """A single newest-first page [2, 1] is returned oldest-first [1, 2]."""
+        with _mock_get(client, status=200,
+                       json_data=self._activities_response(
+                           [self._comment(2), self._comment(1)])):
+            comments = client.get_pr_comments("proj/repo", 1)
+        assert [c["id"] for c in comments] == [1, 2]
+
+    def test_normalizes_comment_shape(self, client):
+        """Each comment is normalized to the contract shape:
+        ``{user: {login}, body, id}`` (author.slug → user.login,
+        text → body)."""
+        with _mock_get(client, status=200,
+                       json_data=self._activities_response([self._comment(7)])):
+            comments = client.get_pr_comments("proj/repo", 1)
+        assert comments == [{"user": {"login": "user7"}, "body": "comment 7", "id": 7}]
+
+    def test_returns_empty_when_no_comments(self, client):
+        with _mock_get(client, status=200,
+                       json_data=self._activities_response([])):
+            assert client.get_pr_comments("proj/repo", 1) == []

@@ -31,9 +31,10 @@ COPY entrypoint.sh ./entrypoint.sh
 # Logs directory
 RUN mkdir -p /app/logs
 
-ENV PYTHONUNBUFFERED=1 \
-    RAVEN_AI_MODEL=claude-opus-4-7 \
-    RAVEN_AI_EFFORT=max
+# RAVEN_AI_MODEL / RAVEN_AI_EFFORT defaults are single-sourced in
+# raven/reviewer.py (mirrored in docker-compose.yml). Not set here so the
+# image can't carry a third, drifting default.
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 

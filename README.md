@@ -39,7 +39,7 @@ Reviews typically complete in 10-30 seconds. Diffs up to 3000 lines are reviewed
 
 All of the above are optional and independent; missing files are skipped silently.
 
-Pushing new commits to a PR branch triggers an incremental re-review (only changed files). Findings from unchanged files are carried forward and included in the consolidated verdict. Clicking "re-request review" or adding Raven as a reviewer also triggers a fresh review.
+Pushing new commits to a PR branch triggers an incremental re-review (only changed files). Findings from unchanged files are re-validated rather than blindly carried: the model sees them as a "prior findings" block and explicitly drops the ones the push made obsolete (anything it doesn't explicitly drop is kept, so a malformed answer can never erase findings), and the survivors are included in the consolidated verdict. Clicking "re-request review" or adding Raven as a reviewer also triggers a fresh review.
 
 **Review mode**: `RAVEN_REVIEW_MODE` controls engagement and how blocking Raven's verdict is.
 
@@ -61,7 +61,7 @@ Developers can @mention Raven in PR comments to ask questions or dispute finding
 
 - **Immediate acknowledgment** — on Gitea, Raven reacts 👀 to the triggering comment within a second so you know it was picked up, even though the Claude response takes 10–30s.
 - **Threaded replies** — on platforms that support comment threads (Bitbucket Data Center), Raven replies inside the thread rather than posting a top-level comment.
-- **No re-@mention inside Raven's threads** — any reply in a thread where Raven has already participated triggers a follow-up, so the conversation flows naturally.
+- **No re-@mention inside Raven's threads** — any reply in a thread where Raven has already participated triggers a follow-up, so the conversation flows naturally. To require an explicit tag on *every* reply (and never auto-engage on an untagged in-thread reply), set `RAVEN_REPLY_REQUIRE_MENTION`; tags match the bot's account username plus any `RAVEN_MENTION_NAMES`.
 - **Active-thread context** — Raven sees the whole conversation it's replying inside (root + replies), not just the last 20 PR-wide comments. The thread root (usually Raven's own original finding) is always preserved through truncation. Cap via `RAVEN_RESPOND_THREAD_TOTAL_CHARS` (default 8000).
 - **Line-aware context** — inline diff comments get a line-numbered snippet of the file injected into the prompt, so Raven answers about the exact code without having to parse hunk headers.
 - **Verdict re-evaluation** — when the conversation provides substantive new information (e.g. "this isn't a bug because the path is unreachable", "this pattern is intentional convention"), Raven can submit a NEW formal review revising its prior verdict. Auto-merge gates fire on `needs_work → approve` flips and also on retraction-only paths when the prior verdict was already approve (Bitbucket DC "all comments resolved" unblock). Cap via `RAVEN_RESPOND_VERDICT_BODY_CHARS` (default 4000).
@@ -157,14 +157,25 @@ All configuration is via environment variables. See `config.example.env` for the
 | `REVIEW_APPROVE_MAX_SEVERITY` | No | `low` | Approve PRs at or below this severity (`low`, `medium`, `high`). |
 | `MERGE_STRATEGY` | No | `squash` | Merge method (`squash`, `merge`, `rebase`). |
 | `MAX_DIFF_LINES` | No | `3000` | Max diff lines before splitting review by file. |
+| `RAVEN_MAX_FILE_LINES` | No | `500` | Max lines a changed file may have for its full contents to be attached to the review prompt. Larger files are skipped, and the prompt discloses the omission so the model knows its evidence is incomplete. |
+| `RAVEN_MAX_FILES` | No | `10` | Max changed files whose full contents are attached to the review prompt. Files beyond the cap are skipped and disclosed in the prompt like line-cap omissions. |
+| `RAVEN_CARRIED_REVALIDATION_MAX` | No | `20` | Max carried findings offered to the incremental review for re-validation (top severity first). Overflow findings are carried verbatim — never silently dropped — keeping the prompt bounded on PRs with large finding sets. |
 | `CI_WAIT_TIMEOUT` | No | `300` | Seconds to wait for CI before giving up. `0` to skip CI check. |
+| `RAVEN_REQUIRE_CI` | No | — | Require CI to register before auto-merging. Off by default: a "no status yet" result counts as "no CI configured" and the PR can merge immediately. Set truthy (`1`/`true`/`yes`) on repos that always run CI, so an unregistered status is treated as pending and Raven waits (up to `CI_WAIT_TIMEOUT`) instead of merging before CI starts. |
 | `SKIP_REPOS` | No | — | Comma-separated `owner/repo` list to skip. |
 | `SKIP_AUTHORS` | No | — | Comma-separated author names to skip. |
-| `RAVEN_AI_MODEL` | No | `claude-opus-4-7` | Model to use for reviews. Backend-agnostic — the string is whatever your active backend (and any proxy) routes. |
+| `RAVEN_AI_MODEL` | No | `claude-opus-4-8` | Model to use for reviews. Backend-agnostic — the string is whatever your active backend (and any proxy) routes. |
 | `RAVEN_AI_EFFORT` | No | `max` | Thinking effort on PR reviews (`none`, `low`, `medium`, `high`, `max`). `none` omits `reasoning_effort` from the OpenAI-compatible request entirely — use it when routing to non-reasoning models behind a proxy that doesn't strip the param. |
 | `RAVEN_AI_EFFORT_COMMENT` | No | `medium` | Thinking effort on comment replies (`none`, `low`, `medium`, `high`, `max`). Q&A rarely needs max. |
-| `RAVEN_AI_TIMEOUT` | No | `600` | Per-request timeout in seconds (CLI subprocess for `claude_cli`, HTTP call for `openai_compatible`). |
+| `RAVEN_AI_TIMEOUT` | No | `1800` | Per-request timeout in seconds (CLI subprocess for `claude_cli`, HTTP call for `openai_compatible`). Sized for the default `max` effort on medium-large diffs; lower it (e.g. `600`) if you route to a faster model or run a lower effort. |
+| `RAVEN_AI_RETRY` | No | `1` | Retries for **transient** AI failures (timeout, rate-limit 429, backend 5xx) before giving up and posting a classified failure comment. Usage-cap / auth / unknown errors never retry. `0` disables retry. **Wall-time note:** each retry can add up to `RAVEN_AI_TIMEOUT + RAVEN_AI_RETRY_BACKOFF` seconds — with defaults a single review tops out near ~3603s (2×1800 + 3) instead of 1800s. For a chunked (large-diff) review, retry is per-chunk. |
+| `RAVEN_AI_RETRY_BACKOFF` | No | `3` | Fixed backoff in seconds slept between an AI call and its retry. |
 | `RAVEN_COMMENT_HISTORY` | No | `20` | Recent comments passed to Claude as conversation context (for @mention replies). |
+| `RAVEN_RESPOND_THREAD_TOTAL_CHARS` | No | `8000` | Char cap on the "Active Thread" block when replying to a PR comment. Preserves the thread root (Raven's original finding) + newest replies; drops the middle with a truncation marker. |
+| `RAVEN_RESPOND_VERDICT_BODY_CHARS` | No | `4000` | Char cap on the prior-verdict body shown when Raven may revise its verdict. Middle-truncates (keeps first + last paragraphs). |
+| `RAVEN_MAX_PR_REPLIES_PER_HOUR` | No | `20` | Circuit breaker against comment-reply loops: max AI replies Raven posts on one PR per rolling hour (bot-authored comments are skipped outright). Guards against another auto-responder driving unbounded paid replies. `0` disables the limit. |
+| `RAVEN_MENTION_NAMES` | No | `Raven` | Display name(s) that count as an `@mention` of Raven, in addition to the bot's account username — comma-separated, recognized in **both** modes. Set empty to match only the account username. (`@`-strings inside `` `code` `` spans and email / `user@host` local parts never count.) |
+| `RAVEN_REPLY_REQUIRE_MENTION` | No | — | Mention-only mode. When truthy (`1`/`true`/`yes`), Raven replies to a comment **only** if it tags Raven (account username or a `RAVEN_MENTION_NAMES` display name), and never to an untagged in-thread reply. Unset (default) keeps current behaviour: a tag **or** any reply inside a thread Raven is already in triggers a response. |
 | `RAVEN_REVIEW_COMMENT_CONTEXT` | No | `20` | Max non-bot PR comments included in the review prompt's "PR Conversation" section. `0` disables the subsection. |
 | `RAVEN_REVIEW_PR_CONTEXT_ITEM_CHARS` | No | `4000` | Per-item character cap applied to PR title, description, and each comment body before they're concatenated into the review prompt. Approximate — a truncation marker of ~30-40 chars is appended after the prefix. `0` disables truncation (keep full text). |
 | `RAVEN_REVIEW_PR_CONTEXT_TOTAL_CHARS` | No | `16000` | Global budget across the whole PR Context block (title + description + all included comments). Prevents discussion from dwarfing a small diff in the prompt. Comments are added newest-first until the budget is hit. `0` disables the global cap (per-item caps still apply). |
@@ -176,6 +187,7 @@ All configuration is via environment variables. See `config.example.env` for the
 | `RAVEN_LABEL_NAME` | No | `raven-reviewed` | Label name added to reviewed PRs. |
 | `RAVEN_CACHE_DIR` | No | `/tmp/raven` | Directory for persistent findings cache. Use a Docker volume in production. |
 | `RAVEN_MAX_CACHED_PRS` | No | `200` | Max PR entries in the findings cache (LRU eviction). |
+| `RAVEN_METRICS_TOKEN` | No | — | Bearer token gating the `/metrics` endpoint. Unset → `/metrics` returns 404 (disabled). When set, Prometheus must send `Authorization: Bearer <token>`. |
 | `RAVEN_MAX_WORKERS` | No | `16` | Main review pool size (webhook dispatch, diff fetch, Claude CLI, review submission). |
 | `RAVEN_CI_WAIT_WORKERS` | No | `32` | Dedicated pool for the post-review CI-wait-and-merge phase. Sized larger than the main pool because these tasks spend nearly all their time sleeping. |
 | `RAVEN_AI_MAX_CONCURRENT` | No | `4` | Max concurrent in-flight AI calls. For `claude_cli` this caps subprocesses (memory); for `openai_compatible` it caps simultaneous HTTP requests to the proxy. |
@@ -195,7 +207,7 @@ Raven talks to an LLM through one of two pluggable backends. It picks one at sta
 
 If both credential sets are present, `openai_compatible` wins. To pin the selection explicitly, set `RAVEN_AI_BACKEND=claude_cli` or `RAVEN_AI_BACKEND=openai_compatible`.
 
-The `openai_compatible` backend talks to any endpoint that speaks OpenAI chat/completions — a LiteLLM proxy, vLLM, OpenRouter, actual OpenAI, etc. The upstream model is whatever the endpoint routes; set `RAVEN_AI_MODEL` to a string that endpoint accepts (e.g. `claude-opus-4-7`, `anthropic/claude-opus-4-7`, or a proxy-defined alias).
+The `openai_compatible` backend talks to any endpoint that speaks OpenAI chat/completions — a LiteLLM proxy, vLLM, OpenRouter, actual OpenAI, etc. The upstream model is whatever the endpoint routes; set `RAVEN_AI_MODEL` to a string that endpoint accepts (e.g. `claude-opus-4-8`, `anthropic/claude-opus-4-8`, or a proxy-defined alias).
 
 `RAVEN_AI_EFFORT` / `RAVEN_AI_EFFORT_COMMENT` map to the backend's reasoning controls: the Claude CLI passes them as `--effort`; the OpenAI-compatible backend translates `max→high`, `high→high`, `medium→medium`, `low→low`, `none→` (parameter omitted). The target model / proxy is expected to translate `reasoning_effort` further if it hosts an Anthropic model (LiteLLM does this natively).
 
@@ -206,7 +218,7 @@ Example LiteLLM proxy setup:
 ```bash
 export RAVEN_AI_API_BASE=http://proxy.internal:4000
 export RAVEN_AI_API_KEY=sk-proxy-key
-export RAVEN_AI_MODEL=claude-opus-4-7
+export RAVEN_AI_MODEL=claude-opus-4-8
 # do NOT set CLAUDE_CODE_OAUTH_TOKEN
 ```
 
@@ -233,9 +245,10 @@ Raven auto-merges a PR when all of these are true:
 1. Raven is a listed reviewer of the PR (auto-added or manually added).
 2. No other reviewer or requested reviewer is listed — Raven is the only reviewer.
 3. Raven submitted an `APPROVED` review with severity ≤ `REVIEW_APPROVE_MAX_SEVERITY`.
-4. The consolidated verdict (including carried findings from unchanged files) meets the threshold.
-5. CI passes, or CI_WAIT_TIMEOUT is configured to skip CI.
-6. Head SHA hasn't changed since CI was checked (force-push protection).
+4. The consolidated verdict (including re-validated carried findings from unchanged files) meets the threshold.
+5. No coverage gap — every chunk of the diff was actually reviewed (oversized/failed chunks force `needs_work` and block both merge paths until re-reviewed).
+6. CI passes, or CI_WAIT_TIMEOUT is configured to skip CI.
+7. Head SHA hasn't changed since CI was checked (force-push protection).
 
 No other merge path exists. Raven never merges a PR that has any other reviewer or requested reviewer listed — that case is left for humans.
 
@@ -250,9 +263,9 @@ Raven submits formal reviews (APPROVED or REQUEST_CHANGES on Gitea, approve/need
 
 **Findings:**
 - 🔴 [high] `db.py:execute()` — user input concatenated directly into SQL string
-- 🟡 [medium] `auth.py:login()` — no rate limiting on failed attempts
+- 🟠 [medium] `auth.py:login()` — no rate limiting on failed attempts
 
-*Reviewed by Raven · claude-opus-4-7 · 2026-03-22 00:41 UTC*
+*Reviewed by Raven · claude-opus-4-8 · effort max · 2026-03-22 00:41 UTC*
 ```
 
 Each finding with a file and line number is also posted as an inline comment on the exact diff line.
@@ -311,7 +324,8 @@ entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start
    - Adds the `raven-reviewed` label
    - Caches findings to disk (persists across restarts, invalidated on model/prompt change)
    - Auto-merge decision: when Raven is sole reviewer and consolidated verdict approves
-   - On unhandled error: clears dedup entry, posts "internal error" comment
+   - On a transient AI failure (timeout / rate-limit / backend 5xx): retries once (configurable) before giving up
+   - On unhandled error: clears dedup entry, posts a **classified** failure comment naming the cause + next step
 
 ### Safety gates
 
@@ -323,10 +337,11 @@ entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start
 - **CI gate**: waits for CI to pass; failure/timeout blocks merge with notification
 - **Force-push protection**: verifies head SHA hasn't changed before merging
 - **PR dedup**: 30 s in-memory cache keyed on `(repo, pr_number, head_sha)` absorbs webhook redelivery storms without dropping legitimate new pushes (a new SHA is treated as a fresh event, not a duplicate)
-- **Consolidated incremental reviews**: carried findings from unchanged files included in verdict
+- **Consolidated incremental reviews**: findings from unchanged files are re-validated by the model (explicit-drop contract — a malformed answer keeps everything) and included in the verdict; drops apply to the cache only after the review posts, and resolve their inline threads
+- **Coverage-gap guard**: oversized or failed review chunks set a sticky per-file gap — the verdict is forced to `needs_work` and both merge paths refuse auto-merge until the gap files are re-reviewed cleanly (or leave the PR)
 - **Stale review dismissal**: previous Raven reviews dismissed after new review is posted
 - **Cache invalidation**: findings cache wiped automatically on model or prompt change
-- **Error visibility**: unhandled exceptions post "internal error" comment and clear dedup entry
+- **Classified failure handling**: AI failures are classified (`timeout` / `rate_limit` / `backend_5xx` / `usage_limit` / `auth` / `unknown`); transient classes retry once (`RAVEN_AI_RETRY`) and the posted comment names the cause and the actionable next step (e.g. "raise `RAVEN_AI_TIMEOUT`", "resets on the next push") instead of an opaque "internal error". Counted in `raven_review_failures_total{reason,repo}`. Comment text is static per-reason — no exception detail is interpolated, so credential-bearing error strings can't leak. Dedup entry is cleared so a webhook retry can re-attempt.
 - **Always 200**: all webhook responses return HTTP 200 to prevent retry loops
 - **Graceful shutdown**: on SIGTERM, queued reviews and CI-wait tasks are cancelled and in-flight Claude CLI subprocesses are SIGTERMed so gunicorn's graceful-shutdown window isn't consumed by discarded work
 
@@ -337,6 +352,7 @@ entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start
 - `raven_review_duration_seconds{repo}` — Claude CLI call duration
 - `raven_merges_total{repo}` — successful auto-merges
 - `raven_errors_total{type,repo}` — errors by type
+- `raven_review_failures_total{reason,repo}` — classified review failures (`reason` = `timeout`/`rate_limit`/`backend_5xx`/`usage_limit`/`auth`/`unknown`)
 - `raven_ci_failures_total{repo}` — CI failures
 - `raven_responses_total{repo}` — comment responses
 - `raven_reviews_skipped_total{reason,repo}` — skipped reviews
@@ -370,7 +386,7 @@ scrape_configs:
 docker compose --profile observability up -d
 ```
 
-Grafana comes up at `http://<host>:${GRAFANA_PORT:-3000}` (login `admin` / `$GRAFANA_ADMIN_PASSWORD`) with the **Raven — Review, Reliability & Cost** dashboard already loaded: throughput by severity, merges/CI failures, average review duration, errors, comment activity, and token/cost breakdowns by model and repo — all filterable by a `repo` template variable. Plain `docker compose up` (no profile) runs Raven alone. See [`observability/README.md`](observability/README.md) for token-file handling, scraping a second instance, retention tuning, and licensing.
+Grafana comes up at `http://localhost:${GRAFANA_PORT:-3000}` — **bound to localhost by default** so the `admin` fallback password isn't exposed on all interfaces (login `admin` / `$GRAFANA_ADMIN_PASSWORD`; for off-host access, override the port binding behind a reverse proxy and set `GRAFANA_ADMIN_PASSWORD`) — with the **Raven — Review, Reliability & Cost** dashboard already loaded: throughput by severity, merges/CI failures, average review duration, errors, comment activity, and token/cost breakdowns by model and repo — all filterable by a `repo` template variable. Plain `docker compose up` (no profile) runs Raven alone. See [`observability/README.md`](observability/README.md) for token-file handling, scraping a second instance, retention tuning, and licensing.
 
 ## Development
 
@@ -379,7 +395,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-700 tests across 14 test files covering webhook handling (BB DC `pr:comment:added`/`:edited` version-aware dedup, `pr:reviewer:approved`/`:changes_requested` parity with Gitea, activities-endpoint pagination cap with WARNING), review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), two-tier prompt trust model (`<repo_policy>` for CLAUDE.md + rules at base ref vs `<untrusted_input>` for diff + comments), chunked-review consolidation pass that re-applies repo policy to aggregated findings, three-mode review engagement (`all` / `gap` / `advisory`), three-way review output channels (`both` / `summary` / `inline`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
+~800 tests across 16 test files covering webhook handling (BB DC `pr:comment:added`/`:edited` version-aware dedup, `pr:reviewer:approved`/`:changes_requested` parity with Gitea, activities-endpoint pagination cap with WARNING), review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), two-tier prompt trust model (`<repo_policy>` for CLAUDE.md + rules at base ref vs `<untrusted_input>` for diff + comments), chunked-review consolidation pass that re-applies repo policy to aggregated findings, three-mode review engagement (`all` / `gap` / `advisory`), three-way review output channels (`both` / `summary` / `inline`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
 
 ## CI
 

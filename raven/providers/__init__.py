@@ -3,6 +3,20 @@
 from abc import ABC, abstractmethod
 
 
+class DiffTruncatedError(RuntimeError):
+    """A provider's diff API returned a truncated (incomplete) diff.
+
+    The platform capped the diff size (e.g. Bitbucket DC's ``diff.max.lines``),
+    so part of the PR's changes are missing from the response. Subclasses
+    ``RuntimeError`` so the existing ``except RuntimeError`` / ``except
+    Exception`` handlers in the review and comment flows catch it and fail
+    CLOSED — no review, no approve, no auto-merge — rather than silently
+    reviewing a partial diff (which could approve/merge code the model never
+    saw). ``server.py`` maps it to an actionable operator comment and a
+    classified failure metric.
+    """
+
+
 class GitProvider(ABC):
     """Abstract interface for git platform operations."""
 
@@ -57,7 +71,11 @@ class GitProvider(ABC):
 
     @abstractmethod
     def get_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
-        """Return comments as [{"user": {"login": str}, "body": str, "id": int}]."""
+        """Return comments as [{"user": {"login": str}, "body": str, "id": int}].
+
+        Order is **chronological (oldest-first)** — consumers slice the tail
+        for "most recent N", so providers must normalise to oldest-first.
+        """
         ...
 
     def get_pr_description(self, repo: str, pr_number: int) -> str:

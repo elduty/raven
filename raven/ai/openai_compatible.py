@@ -14,9 +14,20 @@ from contextlib import contextmanager
 
 import openai
 
-from raven.ai.base import AIBackend, CompletionResult
+from raven.ai.base import AIBackend, AIError, CompletionResult
 
 logger = logging.getLogger(__name__)
+
+
+def _classify_openai_status(status: int | None) -> str:
+    """Map an HTTP status code from an openai SDK error to an AIError reason."""
+    if status == 429:
+        return "rate_limit"
+    if status in (401, 403):
+        return "auth"
+    if status is not None and 500 <= status < 600:
+        return "backend_5xx"
+    return "unknown"
 
 _EFFORT_TO_REASONING = {
     "max":    "high",
@@ -126,15 +137,28 @@ class OpenAICompatibleBackend(AIBackend):
             try:
                 raw = self._client.chat.completions.with_raw_response.create(**kwargs)
             except openai.APITimeoutError as e:
-                raise RuntimeError(f"AI backend timed out after {timeout}s: {e}")
+                # APITimeoutError subclasses APIConnectionError — keep it
+                # first so a timeout isn't miscategorised as a generic
+                # connection drop.
+                raise AIError(f"AI backend timed out after {timeout}s: {e}", reason="timeout")
+            except openai.APIStatusError as e:
+                # A response with an HTTP status (429 / 401 / 5xx / other).
+                raise AIError(
+                    f"AI backend error: {e}",
+                    reason=_classify_openai_status(getattr(e, "status_code", None)),
+                )
+            except openai.APIConnectionError as e:
+                # No HTTP response — DNS failure, connection reset, etc.
+                # Transient; retry can help.
+                raise AIError(f"AI backend error: {e}", reason="backend_5xx")
             except openai.APIError as e:
-                raise RuntimeError(f"AI backend error: {e}")
+                raise AIError(f"AI backend error: {e}", reason="unknown")
 
         cost_usd = _parse_cost_header(raw.headers)
         response = raw.parse()
 
         if not response.choices:
-            raise RuntimeError("AI backend returned no choices")
+            raise AIError("AI backend returned no choices", reason="unknown")
         choice = response.choices[0]
         # The OpenAI SDK guarantees ``content: str | None`` for standard
         # chat completions, but proxies (LiteLLM, vLLM, Ollama shim) and
@@ -154,9 +178,10 @@ class OpenAICompatibleBackend(AIBackend):
         else:
             text = ""
         if not text:
-            raise RuntimeError(
+            raise AIError(
                 f"AI backend returned empty response "
-                f"(finish_reason={choice.finish_reason})"
+                f"(finish_reason={choice.finish_reason})",
+                reason="unknown",
             )
 
         # Usage is best-effort — some proxies omit it. Never let a missing

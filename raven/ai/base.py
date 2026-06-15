@@ -4,6 +4,48 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 
+# Retryable failure classes: a short in-process retry can plausibly help.
+# ``usage_limit`` (Claude plan cap) resets hours later, ``auth`` needs a
+# config fix, and ``unknown`` is unclassified — none benefit from an
+# immediate retry, so they're excluded.
+_RETRYABLE_REASONS = frozenset({"timeout", "rate_limit", "backend_5xx"})
+
+
+class AIError(RuntimeError):
+    """A classified AI-backend failure.
+
+    Carries a ``.reason`` so the cause survives from the backend (where the
+    real exception type is known) up to server.py, which turns it into an
+    actionable operator-facing comment + the ``raven_review_failures_total``
+    metric, and reviewer.py, which decides whether to retry.
+
+    Subclasses ``RuntimeError`` deliberately: reviewer.py and server.py
+    already catch ``RuntimeError`` / ``Exception`` uniformly across both
+    backends, so every existing handler keeps working — the ``.reason`` is
+    additive.
+
+    ``reason`` is one of:
+      ``timeout``      — request exceeded RAVEN_AI_TIMEOUT (RETRYABLE)
+      ``rate_limit``   — provider 429 (RETRYABLE, after a backoff)
+      ``backend_5xx``  — provider 5xx / transient connection drop (RETRYABLE)
+      ``usage_limit``  — Claude plan/session cap; resets later (NOT retryable)
+      ``auth``         — bad/expired credentials (NOT retryable)
+      ``unknown``      — unclassified fallback (NOT retryable)
+
+    ``parse_error`` is intentionally NOT an AIError reason — a malformed
+    model response flows through reviewer.py's existing ``_parse_error``
+    dict path, not this exception type.
+    """
+
+    def __init__(self, message: str, *, reason: str = "unknown") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+    @property
+    def retryable(self) -> bool:
+        return self.reason in _RETRYABLE_REASONS
+
+
 @dataclass
 class CompletionResult:
     """Return value of ``AIBackend.complete``.

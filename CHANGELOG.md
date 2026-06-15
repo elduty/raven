@@ -4,7 +4,30 @@ All notable changes to Raven are documented here. The format follows [Keep a Cha
 
 ## Unreleased
 
-_Nothing yet._
+### New features
+
+- **Mention-only reply mode.** New `RAVEN_REPLY_REQUIRE_MENTION` (default off) makes Raven reply to a PR comment **only** when it tags Raven — the bot's account username or any display name in the new `RAVEN_MENTION_NAMES` (comma-separated, default `Raven`). Unset, the previous behaviour is unchanged: a tag **or** any reply inside a thread Raven is already in triggers a response. Suppressed replies increment `raven_responses_skipped_total{reason="no_mention"}`.
+- **`RAVEN_REQUIRE_CI` auto-merge gate.** When set, an unregistered (`none`) CI status is treated as *pending* rather than *passed*, so a CI-enabled repo can't auto-merge in the window before its checks register.
+- **Per-PR reply circuit breaker.** `RAVEN_MAX_PR_REPLIES_PER_HOUR` (default 20) caps Raven's replies per PR per rolling hour; together with a bot-author filter on the comment flow this prevents reply loops between bots.
+
+### Changed
+
+- **Default review model is now `claude-opus-4-8` at `max` effort**, single-sourced in `raven/reviewer.py` and mirrored by docker-compose / config.example.env / README. The stale `Dockerfile` model/effort ENV was dropped, and `tests/test_config_consistency.py` guards the compose↔code agreement.
+- **`RAVEN_AI_TIMEOUT` default raised 600 → 1800s** to fit max-effort reviews of medium-large diffs. Worst-case added wall time per AI call is `RAVEN_AI_RETRY × (RAVEN_AI_TIMEOUT + RAVEN_AI_RETRY_BACKOFF)` — size accordingly.
+- **Severity colors are now 🔴 high / 🟠 medium / 🟡 low** (green dropped) across review bodies and notifications.
+
+### Fixes
+
+- **Bitbucket DC truncated diffs now fail closed.** BB DC caps diff size (`diff.max.lines`) and flags truncation on the overall diff response and on individual file diffs, hunks, segments, and lines. `fetch_pr_diff` previously ignored those flags and reviewed whatever partial diff was returned — so a large PR could be formally **approved and auto-merged from a diff the model never fully saw**. It now detects truncation at every level and raises `DiffTruncatedError`, failing closed across all paths (review, comment-reply, and cached-merge dispatch). The operator gets an actionable comment (split the PR, or raise the server's diff limit) and a classified `raven_review_failures_total{reason="diff_truncated"}` metric. Known limitation: the `text/plain` diff fallback used only by older BB DC servers carries no structured truncation flag and is not covered.
+
+- **Claude CLI subprocess no longer inherits Raven's platform secrets.** The `claude_cli` backend spawned the CLI with the full service environment — `GITEA_TOKEN`, `BITBUCKET_DC_TOKEN`, both webhook secrets, `RAVEN_AI_API_KEY`, `RAVEN_METRICS_TOKEN`. Since the CLI is a binary that self-updates nightly from npm and is fed attacker-influenced prompt content, that was an unnecessarily large credential blast radius. The child's environment is now scoped to a **fail-closed allowlist** (`HOME`/`PATH`/locale/proxy/TLS plus the CLI's own `CLAUDE_CODE_*`/`ANTHROPIC_*` auth); everything else — including any secret added to Raven's env in future — is dropped. CLI auth and networked / corporate-TLS setups keep working.
+
+- **Bitbucket DC PR comments are returned oldest-first.** `get_pr_comments` previously returned newest-first, contradicting the chronological order every consumer (thread reconstruction, history context) assumes.
+- **Comment replies no longer false-trigger on `@`-strings that aren't mentions.** Email addresses / `user@host` local parts and `@names` inside code spans or fenced blocks are stripped before mention matching; both reply modes recognize the configured display names.
+- **Chunk-failure markers no longer interpolate `str(e)`** into PR-visible comments — they post a static message keyed on `AIError.reason`, keeping the exception (which can embed an `openai_compatible` proxy URL) in logs only. Mirrors the PR #156 static-template rule.
+- **Webhook request body is capped before HMAC buffering.** Flask `MAX_CONTENT_LENGTH` (25 MB) bounds `request.get_data()` so an oversized body can't exhaust memory ahead of signature verification.
+- **Grafana binds to `127.0.0.1` by default** in the observability profile, so the `admin` password fallback is never reachable on all interfaces. Off-host access requires overriding the binding behind a reverse proxy and setting `GRAFANA_ADMIN_PASSWORD`.
+- **Bitbucket DC `submit_review` posts the main review comment before inline anchors**, so a late failure can't orphan inline comments (a retry would otherwise duplicate them).
 
 ## v0.3.0 — 2026-05-29
 

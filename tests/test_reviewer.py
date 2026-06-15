@@ -5,7 +5,7 @@ import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-from raven.ai.base import CompletionResult
+from raven.ai.base import AIError, CompletionResult
 from raven.reviewer import (
     _parse_response,
     _strip_lockfiles_and_binaries,
@@ -130,6 +130,34 @@ class TestParseResponse:
         raw = '{"severity": "low", "summary": "x", "findings": null}'
         result = _parse_response(raw)
         assert result["findings"] == []
+
+    def test_dropped_carried_passes_through(self):
+        """Carried-findings re-validation: the model reports which carried
+        findings this push RESOLVED via a top-level `dropped_carried` int
+        array (drop is the explicit action; everything else is kept). The
+        validator must pass it through untouched."""
+        raw = ('{"severity": "low", "summary": "x", "findings": [], '
+               '"dropped_carried": [0, 2]}')
+        result = _parse_response(raw)
+        assert result["dropped_carried"] == [0, 2]
+
+    def test_dropped_carried_absent_means_no_key(self):
+        """No `dropped_carried` in the model output → key absent from the
+        result. Caller treats absence the same as [] — keep everything —
+        so a schema-echoing model can never erase carried findings."""
+        raw = '{"severity": "low", "summary": "x", "findings": []}'
+        result = _parse_response(raw)
+        assert "dropped_carried" not in result
+
+    def test_dropped_carried_invalid_entries_omitted(self):
+        """Garbage shapes (non-list, non-int entries, booleans — bool is
+        an int subclass) must NOT pass through — an invalid answer must
+        read as 'drop nothing', never as a drop instruction."""
+        for bad in ('"all"', '[0, "1"]', '[true]', '{"0": true}', "null"):
+            raw = ('{"severity": "low", "summary": "x", "findings": [], '
+                   f'"dropped_carried": {bad}}}')
+            result = _parse_response(raw)
+            assert "dropped_carried" not in result, f"shape {bad} leaked through"
 
 
 # ------------------------------------------------------------------ #
@@ -268,6 +296,144 @@ class TestReviewDiff:
         result = review_diff("diff content\n", "user/myrepo")
         fake_backend.complete.assert_called_once()
         assert result["severity"] == "low"
+
+
+# ------------------------------------------------------------------ #
+#  Retry on retryable AIError (timeout / rate_limit / backend_5xx)    #
+# ------------------------------------------------------------------ #
+
+class TestReviewRetry:
+    """reviewer.py retries the backend call ONCE for transient AIError
+    classes (timeout / rate_limit / backend_5xx), with a short fixed
+    backoff, before giving up. Non-retryable classes (usage_limit / auth
+    / unknown) propagate immediately — a short retry can't help. Retry is
+    bounded at the backend-call level (not whole-PR), so it never re-runs
+    diff fetch / posting.
+
+    All ``time.sleep`` is patched so the suite stays fast.
+    """
+
+    _OK = json.dumps({"severity": "low", "summary": "ok", "findings": []})
+
+    def _backend(self, monkeypatch, *, side_effect=None, return_value=None):
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        if side_effect is not None:
+            fake.complete.side_effect = side_effect
+        else:
+            fake.complete.return_value = _cr(return_value)
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+        return fake
+
+    def test_retryable_timeout_retried_once_then_succeeds(self, monkeypatch):
+        from raven.ai.base import AIError
+        fake = self._backend(monkeypatch, side_effect=[
+            AIError("timed out", reason="timeout"),
+            _cr(self._OK),
+        ])
+        with patch("raven.reviewer.time.sleep") as mock_sleep:
+            result = review_diff("diff content\n", "user/repo")
+        assert result["severity"] == "low"
+        assert fake.complete.call_count == 2
+        mock_sleep.assert_called_once()  # one backoff between the two attempts
+
+    def test_retryable_failure_twice_gives_up_and_raises(self, monkeypatch):
+        from raven.ai.base import AIError
+        fake = self._backend(monkeypatch, side_effect=AIError("429", reason="rate_limit"))
+        with patch("raven.reviewer.time.sleep"):
+            with pytest.raises(AIError) as ei:
+                review_diff("diff content\n", "user/repo")
+        # Exactly one retry: initial + 1 = 2 attempts.
+        assert fake.complete.call_count == 2
+        assert ei.value.reason == "rate_limit"
+
+    def test_backend_5xx_is_retried(self, monkeypatch):
+        from raven.ai.base import AIError
+        fake = self._backend(monkeypatch, side_effect=[
+            AIError("503", reason="backend_5xx"),
+            _cr(self._OK),
+        ])
+        with patch("raven.reviewer.time.sleep"):
+            review_diff("diff content\n", "user/repo")
+        assert fake.complete.call_count == 2
+
+    def test_usage_limit_not_retried(self, monkeypatch):
+        from raven.ai.base import AIError
+        fake = self._backend(monkeypatch, side_effect=AIError("limit", reason="usage_limit"))
+        with patch("raven.reviewer.time.sleep") as mock_sleep:
+            with pytest.raises(AIError) as ei:
+                review_diff("diff content\n", "user/repo")
+        assert fake.complete.call_count == 1  # no retry
+        mock_sleep.assert_not_called()
+        assert ei.value.reason == "usage_limit"
+
+    def test_auth_not_retried(self, monkeypatch):
+        from raven.ai.base import AIError
+        fake = self._backend(monkeypatch, side_effect=AIError("401", reason="auth"))
+        with patch("raven.reviewer.time.sleep"):
+            with pytest.raises(AIError):
+                review_diff("diff content\n", "user/repo")
+        assert fake.complete.call_count == 1
+
+    def test_unknown_not_retried(self, monkeypatch):
+        from raven.ai.base import AIError
+        fake = self._backend(monkeypatch, side_effect=AIError("???", reason="unknown"))
+        with patch("raven.reviewer.time.sleep"):
+            with pytest.raises(AIError):
+                review_diff("diff content\n", "user/repo")
+        assert fake.complete.call_count == 1
+
+    def test_plain_runtimeerror_not_retried(self, monkeypatch):
+        # A non-AIError RuntimeError (e.g. an out-of-tree backend) has no
+        # .reason — treat as non-retryable and propagate, unchanged.
+        fake = self._backend(monkeypatch, side_effect=RuntimeError("boom"))
+        with patch("raven.reviewer.time.sleep"):
+            with pytest.raises(RuntimeError):
+                review_diff("diff content\n", "user/repo")
+        assert fake.complete.call_count == 1
+
+    def test_retry_count_honours_env_zero(self, monkeypatch):
+        # RAVEN_AI_RETRY=0 disables retry entirely (operator escape hatch).
+        from raven.ai.base import AIError
+        monkeypatch.setattr("raven.reviewer.RAVEN_AI_RETRY", 0)
+        fake = self._backend(monkeypatch, side_effect=AIError("t", reason="timeout"))
+        with patch("raven.reviewer.time.sleep"):
+            with pytest.raises(AIError):
+                review_diff("diff content\n", "user/repo")
+        assert fake.complete.call_count == 1
+
+    def test_backoff_uses_configured_constant(self, monkeypatch):
+        from raven.ai.base import AIError
+        monkeypatch.setattr("raven.reviewer.RAVEN_AI_RETRY_BACKOFF", 4)
+        fake = self._backend(monkeypatch, side_effect=[
+            AIError("t", reason="timeout"),
+            _cr(self._OK),
+        ])
+        with patch("raven.reviewer.time.sleep") as mock_sleep:
+            review_diff("diff content\n", "user/repo")
+        mock_sleep.assert_called_once_with(4)
+
+    def test_respond_to_comment_retries_transient(self, monkeypatch):
+        from raven.ai.base import AIError
+        respond_json = json.dumps({"response": "here you go"})
+        fake = self._backend(monkeypatch, side_effect=[
+            AIError("timed out", reason="timeout"),
+            _cr(respond_json),
+        ])
+        with patch("raven.reviewer.time.sleep"):
+            result = respond_to_comment(
+                "what about X?", [], "diff", "user/repo",
+            )
+        assert result["response"] == "here you go"
+        assert fake.complete.call_count == 2
+
+    def test_respond_to_comment_does_not_retry_auth(self, monkeypatch):
+        from raven.ai.base import AIError
+        fake = self._backend(monkeypatch, side_effect=AIError("401", reason="auth"))
+        with patch("raven.reviewer.time.sleep"):
+            with pytest.raises(AIError):
+                respond_to_comment("what about X?", [], "diff", "user/repo")
+        assert fake.complete.call_count == 1
 
 
 # ------------------------------------------------------------------ #
@@ -419,6 +585,333 @@ class TestChunkedReviewAllFail:
         assert result.get("_parse_error") is not True
         assert result["chunked"] is True
         assert result["chunks_reviewed"] == 1
+
+
+class TestChunkedUnreviewedChunksBlockMerge:
+    """Audit fix (high/reliability): a chunk that was skipped-as-oversized
+    or failed must make the review non-auto-mergeable. server.py treats
+    ``_parse_error`` as "don't post the review at all", so partial reviews
+    instead get their severity floored at ``medium`` — above the default
+    approve threshold (``low``) — while the review (with its findings,
+    including the ⚠️ skip-marker) still posts.
+
+    The floor is operator visibility only; the authoritative signal is
+    ``coverage_gap``/``coverage_gap_files`` (asserted per return path
+    below), which server.py uses to force needs_work and gate both
+    merge-dispatch paths. Full lifecycle covered by the docs in
+    CLAUDE.md ("Coverage-gap tracking") and the end-to-end tests in
+    tests/test_server.py::TestCoverageGapBlocksMerge."""
+
+    def test_oversized_chunk_floors_severity_to_medium(self, monkeypatch):
+        """One clean reviewable file + one oversized (> MAX_DIFF_LINES*3)
+        file. The clean chunk reviews as 'low', but part of the PR was
+        never reviewed — the result must NOT be approvable: severity is
+        floored at 'medium', without the _parse_error flag (the partial
+        review should still post)."""
+        big_diff = (
+            "diff --git a/a.py b/a.py\n" + "+line\n" * 50 +
+            "diff --git a/b.py b/b.py\n" + "+line\n" * 400
+        )
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(
+            json.dumps({"severity": "low", "summary": "clean", "findings": []})
+        )
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100  # oversized threshold = 300 lines
+        try:
+            result = review_diff(big_diff, "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        # Only a.py was reviewed; b.py (400 lines > 300) was skipped.
+        assert fake_backend.complete.call_count == 1
+        assert result["chunked"] is True
+        assert result["chunks_reviewed"] == 1
+        # Partial review must still post — no parse-error flag.
+        assert result.get("_parse_error") is not True
+        # Sticky machine-readable signal for server.py's merge gates,
+        # plus the structural per-file form so server.py can clear the
+        # gap once the named file changes and is re-reviewed.
+        assert result.get("coverage_gap") is True
+        assert result.get("coverage_gap_files") == ["b.py"]
+        # But it must not be auto-mergeable: severity floored above 'low'.
+        assert result["severity"] != "low"
+        from raven.reviewer import SEVERITY_ORDER
+        assert SEVERITY_ORDER[result["severity"]] >= SEVERITY_ORDER["medium"]
+        # The skip marker is present and itself non-approve severity.
+        markers = [f for f in result["findings"] if "skipped (too large" in f["message"]]
+        assert len(markers) == 1
+        assert SEVERITY_ORDER[markers[0]["severity"]] >= SEVERITY_ORDER["medium"]
+        # The marker carries its gap filename so server.py's
+        # _findings_by_file buckets it under that file — the per-file
+        # carry then drops it exactly when the file changes, in lockstep
+        # with the coverage_gap_files carry. A file-less marker would
+        # land in the '' bucket, which is carried on EVERY incremental
+        # pass: one gap event would pin the merged severity at the
+        # marker's floor forever and re-post the stale marker on every
+        # push, even after the oversized file was fixed.
+        assert markers[0].get("file") == "b.py"
+        # No 'line' key — _is_inline_postable must keep markers out of
+        # inline comments (there's no meaningful line for a whole-file
+        # skip).
+        assert "line" not in markers[0]
+
+    def test_failed_chunk_floors_severity_to_medium(self, monkeypatch):
+        """A chunk whose review call raises is also unreviewed code —
+        same severity floor as the oversized skip."""
+        big_diff = (
+            "diff --git a/a.py b/a.py\n" + "+line\n" * 200 +
+            "diff --git a/b.py b/b.py\n" + "+line\n" * 200
+        )
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = [
+            _cr(json.dumps({"severity": "low", "summary": "ok", "findings": []})),
+            RuntimeError("claude CLI exited with code 1: err"),
+        ]
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result.get("_parse_error") is not True
+        assert result["chunks_reviewed"] == 1
+        assert result.get("coverage_gap") is True
+        # Chunks run in parallel, so WHICH file got the RuntimeError is
+        # nondeterministic — but exactly one failed and it must be named.
+        gap_files = result.get("coverage_gap_files")
+        assert isinstance(gap_files, list) and len(gap_files) == 1
+        assert gap_files[0] in {"a.py", "b.py"}
+        # Failed-chunk markers carry 'file' too — same per-file
+        # carry-forward lifecycle as the oversized-skip markers.
+        markers = [f for f in result["findings"] if f["message"].startswith("⚠️")]
+        assert len(markers) == 1
+        assert markers[0].get("file") == gap_files[0]
+        from raven.reviewer import SEVERITY_ORDER
+        assert SEVERITY_ORDER[result["severity"]] >= SEVERITY_ORDER["medium"]
+
+    def test_failed_chunk_marker_does_not_leak_exception_text(self, monkeypatch):
+        """Audit #4 (security): a chunk-review exception becomes a PR-visible
+        coverage-gap marker. The marker message must NOT interpolate the raw
+        exception text — ``openai_compatible`` AIErrors embed the proxy URL +
+        response-body fragments (``f"AI backend error: {e}"``), so leaking
+        ``str(e)`` into a PR comment exposes internal infra. The marker must
+        be a STATIC message keyed on the classified ``reason``."""
+        big_diff = (
+            "diff --git a/a.py b/a.py\n" + "+line\n" * 200 +
+            "diff --git a/b.py b/b.py\n" + "+line\n" * 200
+        )
+        secret_url = "https://user:s3cret@proxy.internal/v1"
+        # One chunk reviews clean; the other raises a credential-shaped
+        # AIError. _review_single_chunk is mocked directly so the failure
+        # hits _review_chunk's except branch without the retry wrapper
+        # re-invoking the backend.
+        clean = {"severity": "low", "summary": "ok", "findings": []}
+
+        def _fake_chunk(diff, repo_name, *args, **kwargs):
+            if kwargs.get("filename_hint") == "b.py" or "b.py" in diff:
+                raise AIError(
+                    f"AI backend error: connect to {secret_url} failed",
+                    reason="backend_5xx",
+                )
+            return dict(clean)
+
+        monkeypatch.setattr("raven.reviewer._review_single_chunk", _fake_chunk)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result.get("coverage_gap") is True
+        assert result.get("coverage_gap_files") == ["b.py"]
+        markers = [f for f in result["findings"] if f["message"].startswith("⚠️")]
+        assert len(markers) == 1
+        msg = markers[0]["message"]
+        # (a) the raw exception text / credentials must NOT appear.
+        assert "s3cret" not in msg
+        assert secret_url not in msg
+        assert "AI backend error" not in msg
+        # (b) the static marker names the classified reason.
+        assert "backend_5xx" in msg
+        assert markers[0].get("file") == "b.py"
+
+    def test_no_coverage_gap_on_clean_chunked_review(self, monkeypatch):
+        """All chunks reviewable and reviewed → no coverage-gap flag, so
+        server.py's merge gates don't fire on healthy chunked reviews."""
+        big_diff = (
+            "diff --git a/a.py b/a.py\n" + "+line\n" * 200 +
+            "diff --git a/b.py b/b.py\n" + "+line\n" * 200
+        )
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(
+            json.dumps({"severity": "low", "summary": "ok", "findings": []})
+        )
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["chunks_reviewed"] == 2
+        assert not result.get("coverage_gap")
+        assert not result.get("coverage_gap_files")
+        assert result["severity"] == "low"
+
+    def test_floor_follows_approve_threshold(self, monkeypatch):
+        """The floor is one level above the configured approve threshold,
+        not hard-coded 'medium' — an operator with
+        REVIEW_APPROVE_MAX_SEVERITY=medium approves medium reviews, so a
+        coverage-gap review must come back 'high'."""
+        monkeypatch.setenv("REVIEW_APPROVE_MAX_SEVERITY", "medium")
+        big_diff = (
+            "diff --git a/a.py b/a.py\n" + "+line\n" * 50 +
+            "diff --git a/b.py b/b.py\n" + "+line\n" * 400
+        )
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(
+            json.dumps({"severity": "low", "summary": "clean", "findings": []})
+        )
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["severity"] == "high"
+        markers = [f for f in result["findings"] if "skipped (too large" in f["message"]]
+        assert markers and markers[0]["severity"] == "high"
+
+    def test_floor_caps_at_high_so_flag_is_the_real_gate(self, monkeypatch):
+        """With REVIEW_APPROVE_MAX_SEVERITY=high the floor caps at 'high',
+        which is still approvable — the severity floor alone cannot block
+        the merge. The coverage_gap flag must be set so server.py's
+        explicit gate does."""
+        monkeypatch.setenv("REVIEW_APPROVE_MAX_SEVERITY", "high")
+        big_diff = (
+            "diff --git a/a.py b/a.py\n" + "+line\n" * 50 +
+            "diff --git a/b.py b/b.py\n" + "+line\n" * 400
+        )
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(
+            json.dumps({"severity": "low", "summary": "clean", "findings": []})
+        )
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["severity"] == "high"
+        assert result.get("coverage_gap") is True
+
+    def test_skip_marker_survives_consolidation(self, monkeypatch):
+        """The consolidation pass may DROP findings — but the skip-marker
+        is the only signal of incomplete coverage, so it is excluded from
+        the consolidation input and re-appended to the consolidated
+        result. Even when the consolidation model returns a finding list
+        without the marker (and severity 'low'), the marker must be in
+        the final findings and the severity floor must hold."""
+        big_diff = (
+            "diff --git a/a.py b/a.py\n" + "+line\n" * 200 +
+            "diff --git a/b.py b/b.py\n" + "+line\n" * 200 +
+            "diff --git a/c.py b/c.py\n" + "+line\n" * 400
+        )
+        chunk = json.dumps({"severity": "low", "summary": "ok",
+            "findings": [{"severity": "low", "message": "nit"}]})
+        # Consolidation returns a list WITHOUT the skip marker.
+        consolidated = json.dumps({"severity": "low", "summary": "Consolidated",
+            "findings": [{"severity": "low", "message": "nit"}]})
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = [_cr(chunk), _cr(chunk), _cr(consolidated)]
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100  # c.py (400 lines) > 300 → skipped
+        try:
+            result = review_diff(
+                big_diff, "user/repo",
+                rules={".claude/rules/policy.md": "max 1 finding"},
+            )
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        # Two chunk calls + one consolidation call.
+        assert fake_backend.complete.call_count == 3
+        assert result.get("consolidated") is True
+        # Marker findings are NOT handed to the consolidation model …
+        consolidation_prompt = fake_backend.complete.call_args_list[-1].args[0]
+        assert "skipped (too large" not in consolidation_prompt
+        # … but ARE re-appended to the final result, carrying 'file'.
+        markers = [f for f in result["findings"] if "skipped (too large" in f["message"]]
+        assert len(markers) == 1
+        assert markers[0].get("file") == "c.py"
+        # The flag (and the per-file list) rides on the consolidated result too.
+        assert result.get("coverage_gap") is True
+        assert result.get("coverage_gap_files") == ["c.py"]
+        # Severity floor applies to the consolidated result too.
+        from raven.reviewer import SEVERITY_ORDER
+        assert SEVERITY_ORDER[result["severity"]] >= SEVERITY_ORDER["medium"]
+
+    def test_all_chunks_oversized_behaves_like_all_fail(self, monkeypatch):
+        """Every chunk oversized → nothing reviewed → same hard-stop as
+        the existing all-fail path: _parse_error blocks auto-merge."""
+        big_diff = (
+            "diff --git a/a.py b/a.py\n" + "+line\n" * 400 +
+            "diff --git a/b.py b/b.py\n" + "+line\n" * 400
+        )
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        fake_backend.complete.assert_not_called()
+        assert result.get("_parse_error") is True
+        assert result.get("coverage_gap") is True
+        assert result.get("coverage_gap_files") == ["a.py", "b.py"]
+        assert result["chunked"] is True
+        assert result["chunks_reviewed"] == 0
+        # Both skip markers present so the operator sees what was missed,
+        # each naming its file.
+        markers = [f for f in result["findings"] if "skipped (too large" in f["message"]]
+        assert len(markers) == 2
+        assert sorted(m.get("file") for m in markers) == ["a.py", "b.py"]
 
 
 class TestChunkedReviewConsolidation:

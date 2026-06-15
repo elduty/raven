@@ -35,7 +35,12 @@ services:
       - REVIEW_APPROVE_MAX_SEVERITY=${REVIEW_APPROVE_MAX_SEVERITY:-low}
       - MERGE_STRATEGY=${MERGE_STRATEGY:-squash}
       - MAX_DIFF_LINES=${MAX_DIFF_LINES:-3000}
+      - RAVEN_MAX_FILE_LINES=${RAVEN_MAX_FILE_LINES:-500}
+      - RAVEN_MAX_FILES=${RAVEN_MAX_FILES:-10}
+      - RAVEN_CARRIED_REVALIDATION_MAX=${RAVEN_CARRIED_REVALIDATION_MAX:-20}
       - CI_WAIT_TIMEOUT=${CI_WAIT_TIMEOUT:-300}
+      # Toggle (empty = off): require CI to register before auto-merging.
+      - RAVEN_REQUIRE_CI=${RAVEN_REQUIRE_CI:-}
       # Filters: empty means no filter — don't add a fake default.
       - SKIP_REPOS=${SKIP_REPOS:-}
       - SKIP_AUTHORS=${SKIP_AUTHORS:-}
@@ -47,10 +52,12 @@ services:
       - RAVEN_REVIEW_OUTPUT=${RAVEN_REVIEW_OUTPUT:-}
       # ── AI model & effort (defaults must match raven/reviewer.py).
       # Apply to BOTH backends.
-      - RAVEN_AI_MODEL=${RAVEN_AI_MODEL:-claude-opus-4-7}
+      - RAVEN_AI_MODEL=${RAVEN_AI_MODEL:-claude-opus-4-8}
       - RAVEN_AI_EFFORT=${RAVEN_AI_EFFORT:-max}
       - RAVEN_AI_EFFORT_COMMENT=${RAVEN_AI_EFFORT_COMMENT:-medium}
-      - RAVEN_AI_TIMEOUT=${RAVEN_AI_TIMEOUT:-600}
+      - RAVEN_AI_TIMEOUT=${RAVEN_AI_TIMEOUT:-1800}
+      - RAVEN_AI_RETRY=${RAVEN_AI_RETRY:-1}
+      - RAVEN_AI_RETRY_BACKOFF=${RAVEN_AI_RETRY_BACKOFF:-3}
       # ── AI backend (pick ONE of the credential sets below; see README)
       - RAVEN_AI_BACKEND=${RAVEN_AI_BACKEND:-}
       - RAVEN_AI_API_BASE=${RAVEN_AI_API_BASE:-}
@@ -58,6 +65,14 @@ services:
       - RAVEN_AI_MAX_TOKENS=${RAVEN_AI_MAX_TOKENS:-}
       # ── Comment replies (default must match raven/server.py)
       - RAVEN_COMMENT_HISTORY=${RAVEN_COMMENT_HISTORY:-20}
+      - RAVEN_MAX_PR_REPLIES_PER_HOUR=${RAVEN_MAX_PR_REPLIES_PER_HOUR:-20}
+      # Display names that count as an @mention (comma-separated; default
+      # "Raven"). ${VAR-default} (no colon) so an explicit empty value in .env
+      # disables display-name mentions (account username still matches).
+      - RAVEN_MENTION_NAMES=${RAVEN_MENTION_NAMES-Raven}
+      # Toggle (empty = off): reply only to comments that tag Raven (account or
+      # a display name above); never on an untagged in-thread reply.
+      - RAVEN_REPLY_REQUIRE_MENTION=${RAVEN_REPLY_REQUIRE_MENTION:-}
       # ── Comment reply context budgets (defaults must match raven/reviewer.py).
       # Thread block preserves root + newest replies, drops the middle.
       # Verdict body middle-truncates. See config.example.env for details.
@@ -149,7 +164,11 @@ services:
     profiles: ["observability"]
     restart: unless-stopped
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      # Bound to localhost by default so the admin-password fallback ("admin")
+      # is never reachable on all interfaces. For off-host access, override
+      # this binding (e.g. via docker-compose.override.yml) behind a reverse
+      # proxy AND set GRAFANA_ADMIN_PASSWORD.
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_AUTH_ANONYMOUS_ENABLED=false

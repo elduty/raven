@@ -607,8 +607,14 @@ class GiteaProvider(GitProvider):
         url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/commits/{sha}/status"
         resp = self.session.get(url, timeout=10)
         if resp.status_code != 200:
-            return "none"
-        data = resp.json()
+            # API error — treat as pending to avoid merging with incomplete CI info
+            logger.warning("Commit status API returned %d for %s", resp.status_code, sha[:8])
+            return "pending"
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.warning("Commit status API returned malformed JSON for %s", sha[:8])
+            return "pending"
         state = data.get("state", "")
         if not state or not data.get("statuses"):
             return "none"

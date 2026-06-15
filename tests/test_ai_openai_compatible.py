@@ -172,6 +172,84 @@ class TestOpenAICompatibleBackendErrorMapping:
                 )
 
 
+class TestOpenAICompatibleErrorClassification:
+    """The openai SDK already distinguishes failure types — map them to
+    ``AIError.reason`` so server.py posts an actionable comment and
+    reviewer.py can retry the transient classes (timeout / 429 / 5xx) but
+    not auth. Status-bearing errors are classified by their HTTP code."""
+
+    @staticmethod
+    def _status_error(cls, status):
+        import httpx
+        req = httpx.Request("POST", "https://proxy.example/v1/chat/completions")
+        resp = httpx.Response(status, request=req)
+        return cls("boom", response=resp, body=None)
+
+    def _raise(self, exc):
+        from raven.ai.base import AIError
+        from raven.ai.openai_compatible import OpenAICompatibleBackend
+
+        backend = OpenAICompatibleBackend()
+        with _patch_create(backend, side_effect=exc):
+            with pytest.raises(AIError) as ei:
+                backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        return ei.value
+
+    def test_timeout_classified(self):
+        import openai
+        err = self._raise(openai.APITimeoutError(request=MagicMock()))
+        assert err.reason == "timeout"
+        assert err.retryable is True
+
+    def test_rate_limit_classified(self):
+        import openai
+        err = self._raise(self._status_error(openai.RateLimitError, 429))
+        assert err.reason == "rate_limit"
+        assert err.retryable is True
+
+    def test_auth_classified_401(self):
+        import openai
+        err = self._raise(self._status_error(openai.AuthenticationError, 401))
+        assert err.reason == "auth"
+        assert err.retryable is False
+
+    def test_permission_denied_classified_as_auth_403(self):
+        import openai
+        err = self._raise(self._status_error(openai.PermissionDeniedError, 403))
+        assert err.reason == "auth"
+        assert err.retryable is False
+
+    def test_server_error_classified_503(self):
+        import openai
+        err = self._raise(self._status_error(openai.InternalServerError, 503))
+        assert err.reason == "backend_5xx"
+        assert err.retryable is True
+
+    def test_connection_error_classified_as_transient(self):
+        import openai
+        # No HTTP response (DNS/conn reset) — treat as transient/retryable.
+        err = self._raise(openai.APIConnectionError(request=MagicMock()))
+        assert err.reason == "backend_5xx"
+        assert err.retryable is True
+
+    def test_other_4xx_classified_as_unknown(self):
+        import openai
+        err = self._raise(self._status_error(openai.APIStatusError, 418))
+        assert err.reason == "unknown"
+        assert err.retryable is False
+
+    def test_empty_response_classified_as_unknown(self):
+        from raven.ai.base import AIError
+        from raven.ai.openai_compatible import OpenAICompatibleBackend
+
+        backend = OpenAICompatibleBackend()
+        with _patch_create(backend, return_value=_raw(_make_response("", finish_reason="length"))):
+            with pytest.raises(AIError) as ei:
+                backend.complete("p", model="m", effort="max", timeout=60, purpose="review")
+        assert ei.value.reason == "unknown"
+        assert ei.value.retryable is False
+
+
 class TestOpenAICompatibleBackendEmptyResponse:
     def test_empty_content_raises_runtimeerror_with_finish_reason(self):
         from raven.ai.openai_compatible import OpenAICompatibleBackend

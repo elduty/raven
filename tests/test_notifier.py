@@ -192,11 +192,122 @@ class TestNotify:
             assert mock_post.call_count == 2
 
 
+class TestFailureLogRedaction:
+    """Webhook URLs are bearer-equivalent secrets (Slack: the path IS the
+    credential). requests exceptions embed the full URL, so failure logs must
+    never interpolate the exception text."""
+
+    SECRET_URL = "https://hooks.slack.com/services/T00/B00/SECRETtoken"
+
+    def _http_error(self):
+        import requests as req
+        # Same shape requests builds in raise_for_status():
+        return req.HTTPError(f"404 Client Error: Not Found for url: {self.SECRET_URL}")
+
+    def test_secret_url_not_logged_on_failure(self, caplog):
+        channel = {"type": "slack", "url": self.SECRET_URL}
+        with patch("raven.notifier._load_channels", return_value=[channel]):
+            with patch("raven.notifier.requests.post") as mock_post:
+                fail_resp = MagicMock()
+                fail_resp.raise_for_status.side_effect = self._http_error()
+                mock_post.return_value = fail_resp
+                with caplog.at_level("DEBUG", logger="raven.notifier"):
+                    result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
+        assert result is False
+        all_logs = "\n".join(r.getMessage() for r in caplog.records)
+        assert "SECRETtoken" not in all_logs
+        assert "/services/" not in all_logs
+
+    def test_failure_still_logged_with_class_and_channel(self, caplog):
+        channel = {"type": "slack", "url": self.SECRET_URL}
+        with patch("raven.notifier._load_channels", return_value=[channel]):
+            with patch("raven.notifier.requests.post") as mock_post:
+                fail_resp = MagicMock()
+                fail_resp.raise_for_status.side_effect = self._http_error()
+                mock_post.return_value = fail_resp
+                with caplog.at_level("DEBUG", logger="raven.notifier"):
+                    notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert errors, "channel failure must be logged at ERROR"
+        assert any("slack" in m for m in errors)
+        assert any("HTTPError" in m for m in errors)
+        # Host is fine to log — only the path is secret
+        assert any("hooks.slack.com" in m for m in errors)
+
+    def test_connection_error_url_not_logged(self, caplog):
+        import requests as req
+        channel = {"type": "webhook", "url": "https://internal.host/capability/SECRETtoken"}
+        exc = req.ConnectionError(
+            f"Max retries exceeded with url: /capability/SECRETtoken "
+            f"(host='internal.host') for https://internal.host/capability/SECRETtoken"
+        )
+        with patch("raven.notifier._load_channels", return_value=[channel]):
+            with patch("raven.notifier.requests.post", side_effect=exc):
+                with caplog.at_level("DEBUG", logger="raven.notifier"):
+                    result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
+        assert result is False
+        all_logs = "\n".join(r.getMessage() for r in caplog.records)
+        assert "SECRETtoken" not in all_logs
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert any("ConnectionError" in m for m in errors)
+
+    def test_userinfo_not_logged_on_failure(self, caplog):
+        """urlsplit().netloc includes userinfo — only hostname (+port) may be logged."""
+        import requests as req
+        channel = {"type": "webhook", "url": "https://user:SECRETPASS@internal.host/hook"}
+        with patch("raven.notifier._load_channels", return_value=[channel]):
+            with patch("raven.notifier.requests.post", side_effect=req.ConnectionError("down")):
+                with caplog.at_level("DEBUG", logger="raven.notifier"):
+                    result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
+        assert result is False
+        all_logs = "\n".join(r.getMessage() for r in caplog.records)
+        assert "SECRETPASS" not in all_logs
+        assert "user:" not in all_logs
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert any("internal.host" in m for m in errors)
+
+    def test_http_status_code_logged_on_failure(self, caplog):
+        """Status code distinguishes revoked/mistyped webhook (404) from transient
+        5xx and carries no secret material — it must survive the redaction."""
+        import requests as req
+        channel = {"type": "slack", "url": self.SECRET_URL}
+        resp = MagicMock(status_code=404)
+        exc = req.HTTPError(f"404 Client Error: Not Found for url: {self.SECRET_URL}", response=resp)
+        with patch("raven.notifier._load_channels", return_value=[channel]):
+            with patch("raven.notifier.requests.post") as mock_post:
+                fail_resp = MagicMock()
+                fail_resp.raise_for_status.side_effect = exc
+                mock_post.return_value = fail_resp
+                with caplog.at_level("DEBUG", logger="raven.notifier"):
+                    notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert any("404" in m for m in errors)
+        all_logs = "\n".join(r.getMessage() for r in caplog.records)
+        assert "SECRETtoken" not in all_logs
+
+    def test_other_channels_still_notified_after_failure(self, caplog):
+        import requests as req
+        ch1 = {"type": "slack", "url": self.SECRET_URL}
+        ch2 = {"type": "webhook", "url": "https://ok.test/hooks", "token": "b"}
+        with patch("raven.notifier._load_channels", return_value=[ch1, ch2]):
+            with patch("raven.notifier.requests.post") as mock_post:
+                fail_resp = MagicMock()
+                fail_resp.raise_for_status.side_effect = self._http_error()
+                ok_resp = MagicMock(status_code=200, raise_for_status=MagicMock())
+                mock_post.side_effect = [fail_resp, ok_resp]
+                with caplog.at_level("DEBUG", logger="raven.notifier"):
+                    result = notify("owner/repo", "ref", {"severity": "low", "summary": "ok"})
+        assert result is True
+        assert mock_post.call_count == 2
+        all_logs = "\n".join(r.getMessage() for r in caplog.records)
+        assert "SECRETtoken" not in all_logs
+
+
 class TestFormatMessage:
     def test_needs_review_header(self):
         text = _format_message("owner/repo", "PR #5", {"severity": "medium", "summary": "Missing validation"}, "", "needs_review")
         assert "needs your review" in text
-        assert "🟡" in text
+        assert "🟠" in text
 
     def test_merge_failed_header(self):
         text = _format_message("owner/repo", "PR #3", {"severity": "low", "summary": "Clean"}, "", "merge_failed")

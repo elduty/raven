@@ -445,6 +445,57 @@ class TestMergePr:
 
 
 # ------------------------------------------------------------------ #
+#  get_commit_status                                                  #
+# ------------------------------------------------------------------ #
+
+class TestGetCommitStatus:
+    def test_success_state_passthrough(self, client):
+        data = {"state": "success", "statuses": [{"status": "success"}]}
+        with _mock_get(client, json_data=data):
+            assert client.get_commit_status("owner/repo", "abc123") == "success"
+
+    def test_pending_state_passthrough(self, client):
+        data = {"state": "pending", "statuses": [{"status": "pending"}]}
+        with _mock_get(client, json_data=data):
+            assert client.get_commit_status("owner/repo", "abc123") == "pending"
+
+    def test_failure_state_passthrough(self, client):
+        data = {"state": "failure", "statuses": [{"status": "failure"}]}
+        with _mock_get(client, json_data=data):
+            assert client.get_commit_status("owner/repo", "abc123") == "failure"
+
+    def test_empty_statuses_returns_none(self, client):
+        """200 with no statuses means the repo genuinely has no CI."""
+        data = {"state": "", "statuses": []}
+        with _mock_get(client, json_data=data):
+            assert client.get_commit_status("owner/repo", "abc123") == "none"
+
+    def test_api_error_returns_pending(self, client):
+        """API errors return 'pending' to avoid merging with incomplete CI info."""
+        with _mock_get(client, status=500):
+            assert client.get_commit_status("owner/repo", "abc123") == "pending"
+
+    def test_rate_limit_returns_pending(self, client):
+        with _mock_get(client, status=429):
+            assert client.get_commit_status("owner/repo", "abc123") == "pending"
+
+    def test_malformed_json_returns_pending(self, client):
+        """A 200 with an unparseable body is incomplete CI info, not 'no CI'."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.side_effect = ValueError("malformed body")
+        with patch.object(client.session, "get", return_value=mock_resp):
+            assert client.get_commit_status("owner/repo", "abc123") == "pending"
+
+    def test_url_contains_commit_status_endpoint(self, client):
+        data = {"state": "success", "statuses": [{"status": "success"}]}
+        with _mock_get(client, json_data=data) as mock_get:
+            client.get_commit_status("owner/repo", "abc123")
+        url = mock_get.call_args[0][0]
+        assert "/commits/abc123/status" in url
+
+
+# ------------------------------------------------------------------ #
 #  Label operations                                                   #
 # ------------------------------------------------------------------ #
 

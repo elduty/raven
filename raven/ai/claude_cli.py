@@ -12,7 +12,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -68,9 +70,17 @@ _active_procs_lock = threading.Lock()
 # user-controlled content (diff text, PR comments, conversation history) —
 # without an explicit tool allowlist, a prompt-injection could coerce the
 # model into running tools with access to credentials and the network.
-# Passing an empty --allowed-tools denies every tool; if a future CLI
-# version changes the semantics, the output will surface the divergence
-# in the no-tools integration test rather than silently regress.
+# Two layers, because --allowed-tools "" alone proved insufficient: it
+# governs permission auto-approval, but in -p mode read-only file tools
+# (grep/read) run without prompting anyway — which is how reviews
+# "verified" claims against the deployed container's own /app checkout
+# (false "implementation absent" findings on PR #160 / PR #163).
+#   --tools ""         — removes every built-in tool from the model's set
+#                        (per CLI help: 'Use "" to disable all tools').
+#   --allowed-tools "" — kept as the original auto-approval deny layer.
+# The third layer (primary for the stale-checkout incidents) is cwd
+# isolation in _run_claude_cli: even a tool that slips through both
+# flags sees only an empty temp directory.
 #
 # --output-format json wraps the response in an envelope carrying the
 # response text under ``.result`` plus ``.usage`` (input_tokens /
@@ -80,8 +90,60 @@ _active_procs_lock = threading.Lock()
 CLAUDE_BASE_ARGS = [
     CLAUDE_BIN, "-p",
     "--output-format", "json",
+    "--tools", "",
     "--allowed-tools", "",
 ]
+
+
+# ── Subprocess env allowlist ──────────────────────────────────────────────
+# The Claude CLI child inherits ONLY the env vars matched below — never
+# Raven's platform credentials (GITEA_TOKEN, BITBUCKET_DC_TOKEN,
+# *_WEBHOOK_SECRET, RAVEN_AI_API_KEY, RAVEN_METRICS_TOKEN, …). The CLI is a
+# binary that self-updates nightly from npm, and Raven feeds it
+# attacker-influenced prompt content; without this scoping a single
+# compromised release (or a prompt-injection reaching a tool despite the
+# tool-disabling flags) could read every secret needed to push to and merge
+# across the org. The CLI's OWN auth (CLAUDE_CODE_*/ANTHROPIC_*) and the
+# system / locale / proxy / TLS vars it needs to run and reach the API are
+# allowlisted explicitly.
+#
+# Fail-closed by design: anything not matched is dropped, so a NEW secret
+# added to Raven's environment later never leaks by default. A var the CLI
+# genuinely needs but that isn't listed fails the CLI VISIBLY (classified
+# review failure) — the safe direction, never silent credential exposure.
+_CLI_ENV_ALLOW_EXACT = frozenset({
+    # System / shell
+    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM", "TZ", "TMPDIR", "PWD",
+    # Locale
+    "LANG", "LANGUAGE",
+    # Proxy (libraries read both upper- and lower-case spellings)
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    # TLS / CA bundles
+    "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+})
+_CLI_ENV_ALLOW_PREFIX = (
+    "CLAUDE_CODE_",   # the CLI's own auth (OAuth token/refresh) + config
+    "ANTHROPIC_",     # alternate Anthropic API-key auth / config
+    "LC_",            # locale (LC_ALL, LC_CTYPE, …)
+    "XDG_",           # config / cache / data dirs the CLI may use
+    "SSL_",           # SSL_CERT_FILE / SSL_CERT_DIR
+    "NODE_",          # NODE_EXTRA_CA_CERTS, NODE_OPTIONS — node runtime / TLS
+)
+
+
+def _build_subprocess_env() -> dict[str, str]:
+    """Allowlisted environment for the Claude CLI child.
+
+    A copy of the process environment filtered to ``_CLI_ENV_ALLOW_EXACT``
+    ∪ (anything starting with one of ``_CLI_ENV_ALLOW_PREFIX``). Everything
+    else — including Raven's platform credentials — is dropped. See the
+    allowlist comment above for the fail-closed rationale.
+    """
+    return {
+        k: v for k, v in os.environ.items()
+        if k in _CLI_ENV_ALLOW_EXACT or k.startswith(_CLI_ENV_ALLOW_PREFIX)
+    }
 
 
 def _run_claude_cli(args: list[str], *, prompt: str, timeout: int) -> subprocess.CompletedProcess:
@@ -104,31 +166,52 @@ def _run_claude_cli(args: list[str], *, prompt: str, timeout: int) -> subprocess
 
     Raises ``subprocess.TimeoutExpired`` and ``FileNotFoundError`` with
     the same semantics as ``subprocess.run`` so callers can catch them.
+
+    The child runs in a fresh empty temp directory (``cwd=``), never the
+    service's own working directory. The CLI's file tools (grep/read)
+    operate relative to its cwd; inheriting the app's cwd let reviews
+    "verify" claims against the deployed container's own /app checkout —
+    a copy that is stale relative to the reviewed repo's main and, for
+    any repo other than Raven itself, an entirely unrelated codebase
+    (observed producing confident false "implementation absent" findings
+    on PR #160 and PR #163). A per-call directory (rather than one shared
+    at init) guarantees each spawn starts empty even if a previous CLI
+    invocation dropped session/debug files. The child's environment is
+    scoped to an allowlist (``_build_subprocess_env``) so it still finds its
+    OAuth credentials via ``CLAUDE_CODE_OAUTH_TOKEN`` / HOME-based config but
+    NEVER inherits Raven's platform secrets (git / Bitbucket tokens, webhook
+    secrets, API keys).
     """
-    with subprocess.Popen(
-        args,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ) as proc:
-        with _active_procs_lock:
-            _active_procs.add(proc)
-        try:
-            stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            raise
-        except BaseException:
-            # Any other exception (BrokenPipeError, OSError, KeyboardInterrupt):
-            # kill the child so the with-exit wait() doesn't block.
-            # subprocess.run uses the same bare-except pattern.
-            proc.kill()
-            raise
-        finally:
+    isolated_cwd = tempfile.mkdtemp(prefix="raven-claude-cli-")
+    try:
+        with subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=isolated_cwd,
+            env=_build_subprocess_env(),
+        ) as proc:
             with _active_procs_lock:
-                _active_procs.discard(proc)
+                _active_procs.add(proc)
+            try:
+                stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise
+            except BaseException:
+                # Any other exception (BrokenPipeError, OSError, KeyboardInterrupt):
+                # kill the child so the with-exit wait() doesn't block.
+                # subprocess.run uses the same bare-except pattern.
+                proc.kill()
+                raise
+            finally:
+                with _active_procs_lock:
+                    _active_procs.discard(proc)
+    finally:
+        shutil.rmtree(isolated_cwd, ignore_errors=True)
     return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
 
 
@@ -170,7 +253,45 @@ def terminate_active_processes(grace_period: float = 2.0) -> int:
     return len(procs)
 
 
-from raven.ai.base import AIBackend, CompletionResult
+from raven.ai.base import AIBackend, AIError, CompletionResult
+
+
+# Classification of a non-zero CLI exit into an AIError.reason. The CLI
+# collapses every API failure to a stderr/stdout line, so we pattern-match
+# the (already-redacted) text. Order matters: usage/session caps are
+# checked before the generic rate-limit pattern because a plan cap is NOT
+# retryable in-process (resets hours later) while a 429 is. Patterns are
+# matched case-insensitively against the redacted detail string.
+_USAGE_LIMIT_MARKERS = ("usage limit", "session limit", "quota", "plan limit")
+_RATE_LIMIT_MARKERS = ("rate limit", "rate_limit", "429", "too many requests")
+_AUTH_MARKERS = (
+    "401", "403", "authentication", "invalid x-api-key", "invalid api key",
+    "unauthorized", "permission denied", "forbidden", "oauth",
+)
+# Anthropic surfaces overload as 529; 5xx generally is transient/retryable.
+_SERVER_ERROR_MARKERS = (
+    "500", "502", "503", "504", "529", "overloaded", "internal server error",
+    "bad gateway", "service unavailable",
+)
+
+
+def _classify_cli_failure(detail: str) -> str:
+    """Map a redacted CLI failure string to an :class:`AIError` reason.
+
+    ``usage_limit`` (plan cap) is checked before ``rate_limit`` so a plan
+    cap — which a short retry can't fix — never masquerades as a retryable
+    429. Returns ``"unknown"`` when nothing matches.
+    """
+    low = (detail or "").lower()
+    if any(m in low for m in _USAGE_LIMIT_MARKERS):
+        return "usage_limit"
+    if any(m in low for m in _RATE_LIMIT_MARKERS):
+        return "rate_limit"
+    if any(m in low for m in _AUTH_MARKERS):
+        return "auth"
+    if any(m in low for m in _SERVER_ERROR_MARKERS):
+        return "backend_5xx"
+    return "unknown"
 
 
 def _parse_cli_json(stdout: str) -> CompletionResult:
@@ -236,9 +357,11 @@ class ClaudeCLIBackend(AIBackend):
             try:
                 result = _run_claude_cli(args, prompt=prompt, timeout=timeout)
             except subprocess.TimeoutExpired:
-                raise RuntimeError(f"claude CLI timed out after {timeout}s")
+                raise AIError(f"claude CLI timed out after {timeout}s", reason="timeout")
             except FileNotFoundError:
-                raise RuntimeError(f"claude CLI not found at {CLAUDE_BIN}")
+                # A missing binary is a deploy fault, not transient — don't
+                # retry. ``unknown`` keeps it out of the retry path.
+                raise AIError(f"claude CLI not found at {CLAUDE_BIN}", reason="unknown")
 
         if result.returncode != 0:
             # Redact token-shaped substrings before logging — the CLI
@@ -251,7 +374,11 @@ class ClaudeCLIBackend(AIBackend):
             logger.error("claude CLI stderr: %s", stderr_safe)
             logger.error("claude CLI stdout: %s", stdout_safe)
             detail = _redact_secrets(result.stderr[:200] or result.stdout[:200])
-            raise RuntimeError(f"claude CLI exited with code {result.returncode}: {detail}")
+            reason = _classify_cli_failure(detail)
+            raise AIError(
+                f"claude CLI exited with code {result.returncode}: {detail}",
+                reason=reason,
+            )
         return _parse_cli_json(result.stdout)
 
     def shutdown(self, grace_period: float = 2.0) -> int:
