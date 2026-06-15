@@ -697,9 +697,15 @@ class BitbucketDCProvider(GitProvider):
         # posting the main comment first, a main-comment failure leaves
         # zero inline anchors on the PR: no orphans, no dupes (audit #14).
         comment_url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/comments"
-        resp = self.session.post(comment_url, json={"text": body}, timeout=15)
-        resp.raise_for_status()
-        result = resp.json()
+        # Skip the main comment entirely when the body is empty
+        # (RAVEN_REVIEW_OUTPUT=inline with everything anchored inline). BB DC
+        # rejects an empty comment `text`, and an inline-only review needs no
+        # standalone summary. The inline anchors + verdict below still post.
+        result: dict = {}
+        if body and body.strip():
+            resp = self.session.post(comment_url, json={"text": body}, timeout=15)
+            resp.raise_for_status()
+            result = resp.json()
 
         # Then post inline comments; capture per-anchor returned IDs.
         posted_inline = (

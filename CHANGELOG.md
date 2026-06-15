@@ -2,7 +2,9 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
-## Unreleased
+## v0.4.0 — 2026-06-15
+
+Review-output control plus a security and reliability hardening batch. Highlights: mention-only replies and a per-PR reply circuit breaker, an opt-in require-CI merge gate, the default reviewer moving to Claude Opus 4.8 at max effort, and `inline` output mode dropping its summary comment — alongside a set of fail-closed fixes (truncated diffs, Claude CLI subprocess secret isolation, a webhook body-size cap, and Grafana bound to localhost).
 
 ### New features
 
@@ -15,6 +17,7 @@ All notable changes to Raven are documented here. The format follows [Keep a Cha
 - **Default review model is now `claude-opus-4-8` at `max` effort**, single-sourced in `raven/reviewer.py` and mirrored by docker-compose / config.example.env / README. The stale `Dockerfile` model/effort ENV was dropped, and `tests/test_config_consistency.py` guards the compose↔code agreement.
 - **`RAVEN_AI_TIMEOUT` default raised 600 → 1800s** to fit max-effort reviews of medium-large diffs. Worst-case added wall time per AI call is `RAVEN_AI_RETRY × (RAVEN_AI_TIMEOUT + RAVEN_AI_RETRY_BACKOFF)` — size accordingly.
 - **Severity colors are now 🔴 high / 🟠 medium / 🟡 low** (green dropped) across review bodies and notifications.
+- **`RAVEN_REVIEW_OUTPUT=inline` no longer posts a summary/recommendation comment.** It previously posted a trimmed verdict + one-liner body; now inline mode posts only per-line comments. Findings that can't be anchored to a line (PR-wide notes, ⚠️ coverage-gap markers) get a minimal body listing just those so nothing is dropped, and a clean PR posts only the verdict. On Bitbucket DC the empty main comment is skipped (BB DC rejects empty comment text); the verdict and inline anchors still post.
 
 ### Fixes
 
@@ -24,10 +27,22 @@ All notable changes to Raven are documented here. The format follows [Keep a Cha
 
 - **Bitbucket DC PR comments are returned oldest-first.** `get_pr_comments` previously returned newest-first, contradicting the chronological order every consumer (thread reconstruction, history context) assumes.
 - **Comment replies no longer false-trigger on `@`-strings that aren't mentions.** Email addresses / `user@host` local parts and `@names` inside code spans or fenced blocks are stripped before mention matching; both reply modes recognize the configured display names.
-- **Chunk-failure markers no longer interpolate `str(e)`** into PR-visible comments — they post a static message keyed on `AIError.reason`, keeping the exception (which can embed an `openai_compatible` proxy URL) in logs only. Mirrors the PR #156 static-template rule.
+- **Chunk-failure markers no longer interpolate `str(e)`** into PR-visible comments — they post a static message keyed on `AIError.reason`, keeping the exception (which can embed an `openai_compatible` proxy URL) in logs only.
 - **Webhook request body is capped before HMAC buffering.** Flask `MAX_CONTENT_LENGTH` (25 MB) bounds `request.get_data()` so an oversized body can't exhaust memory ahead of signature verification.
 - **Grafana binds to `127.0.0.1` by default** in the observability profile, so the `admin` password fallback is never reachable on all interfaces. Off-host access requires overriding the binding behind a reverse proxy and setting `GRAFANA_ADMIN_PASSWORD`.
 - **Bitbucket DC `submit_review` posts the main review comment before inline anchors**, so a late failure can't orphan inline comments (a retry would otherwise duplicate them).
+
+### Migration
+
+Most changes are backward compatible. Notable items:
+
+- **Default review model changed** to `claude-opus-4-8` at `max` effort, and `RAVEN_AI_TIMEOUT` now defaults to 1800s. Override `RAVEN_AI_MODEL` / `RAVEN_AI_EFFORT` / `RAVEN_AI_TIMEOUT` if you depended on the previous defaults.
+- **`RAVEN_REVIEW_OUTPUT=inline` no longer posts a summary comment** — only inline comments, plus a minimal body for findings that have no line. No action needed unless you relied on the inline-mode summary body.
+- **New optional env vars**, all defaulting to off / prior behavior: `RAVEN_REPLY_REQUIRE_MENTION`, `RAVEN_MENTION_NAMES`, `RAVEN_REQUIRE_CI`, `RAVEN_MAX_PR_REPLIES_PER_HOUR`. See the README configuration table.
+
+### Stats
+
+- 926 tests across 15 test files.
 
 ## v0.3.0 — 2026-05-29
 

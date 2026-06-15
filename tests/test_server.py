@@ -6502,16 +6502,41 @@ class TestReviewOutputChannels:
 
     def test_inline_posts_inline_and_bodyless_findings_only(self):
         body, inline = self._run("inline")
-        # inline-able finding goes to the line, NOT the body findings list
+        # inline-able finding goes to the line, NOT the body
         assert len(inline) == 1
         assert inline[0]["file"] == "f.py"
         assert "inline-able" not in body
-        # the file-less finding has nowhere inline to go → kept in body
+        # the file-less finding has nowhere inline to go → kept in a MINIMAL
+        # body so it isn't dropped...
         assert "no file/line — body-only" in body
+        # ...but with NO recommendation: no review-summary prose, no footer.
+        assert "two issues" not in body
+        assert "Reviewed by Raven" not in body
 
-    def test_inline_clean_pr_still_posts_verdict_body(self):
-        """No findings at all → inline mode still posts a (minimal) body so
-        the formal review/verdict is recorded; inline list is empty."""
+    def test_inline_all_anchored_posts_no_body(self):
+        """Every finding has a line → all post inline, body is empty: inline
+        mode shows no summary/recommendation comment at all."""
+        mc = self._make_provider()
+        review = {
+            "severity": "high", "summary": "one issue",
+            "findings": [{"severity": "high", "file": "f.py", "line": 3,
+                          "message": "boom"}],
+        }
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", "inline"),
+            patch("raven.server.review_diff", return_value=review),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+        call = mc.submit_review.call_args
+        body = call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
+        assert call.kwargs["inline_comments"][0]["file"] == "f.py"
+        assert body == ""
+
+    def test_inline_clean_pr_posts_no_body(self):
+        """No findings → inline mode posts NO recommendation body (empty
+        string); the formal verdict is still recorded via submit_review."""
         mc = self._make_provider()
         clean = {"severity": "low", "summary": "all clear", "findings": []}
         with (
@@ -6523,8 +6548,27 @@ class TestReviewOutputChannels:
             _process_pr(mc, self._payload())
         call = mc.submit_review.call_args
         body = call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
-        assert "all clear" in body
+        assert body == ""
         assert call.kwargs["inline_comments"] == []
+
+    def test_inline_blocking_no_findings_posts_minimal_body(self):
+        """needs_work verdict but the model returned no findings → a one-line
+        body is still posted so the blocking review isn't content-less (Gitea
+        rejects an empty body with no inline comments for a non-approve)."""
+        mc = self._make_provider()
+        review = {"severity": "high", "summary": "blocked", "findings": []}
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", "inline"),
+            patch("raven.server.review_diff", return_value=review),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+        call = mc.submit_review.call_args
+        body = call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
+        assert body != ""
+        assert "blocked" in body
+        assert call.kwargs["approve"] is False
 
 
 class TestCachedMergeDispatch:

@@ -1530,21 +1530,8 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             return bool(f.get("file")) and isinstance(f.get("line"), int) and f["line"] > 0
 
         # Submit formal review — must succeed before dismissing old reviews.
-        # In "inline" mode, the body's findings list is filtered to only the
-        # findings that can't be posted inline (no file/line) — inline-able
-        # findings live on their lines instead, so the body isn't a duplicate.
-        if RAVEN_REVIEW_OUTPUT == "inline":
-            body_review = {
-                **review,
-                "findings": [f for f in review.get("findings", [])
-                             if not _is_inline_postable(f)],
-            }
-        else:
-            body_review = review
-        body = _format_comment(
-            body_review,
-            mode="advisory" if RAVEN_REVIEW_MODE == "advisory" else "review",
-        )
+        # Verdict + inline comments are computed first; the inline-mode body
+        # (below) needs to know whether anything was posted inline.
         approve_sev = os.environ.get("REVIEW_APPROVE_MAX_SEVERITY", "low")
         approve = severity_gte(approve_sev, review["severity"])
         # Coverage gap forces needs_work: a formal APPROVE is externally
@@ -1571,6 +1558,37 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             for f in review.get("findings", [])
             if _is_inline_postable(f)
         ] if post_inline else []
+
+        # Build the summary body per output channel:
+        #   both / summary → full review summary.
+        #   inline         → NO recommendation comment. Inline-able findings
+        #                    live on their lines; only findings with no
+        #                    postable file/line (PR-wide notes and ⚠️
+        #                    coverage-gap markers) get a MINIMAL body so they
+        #                    aren't silently dropped. Empty body when there
+        #                    are none — a clean PR posts just the verdict.
+        if RAVEN_REVIEW_OUTPUT == "inline":
+            leftover = [f for f in review.get("findings", [])
+                        if not _is_inline_postable(f)]
+            body = _format_inline_leftovers(leftover)
+            # Never submit a content-less non-approve review: Gitea rejects an
+            # empty body + no inline comments for a COMMENT / REQUEST_CHANGES
+            # event. (A clean APPROVE with an empty body is fine and stays
+            # intentionally silent.) Reachable only if the model returns a
+            # blocking verdict with zero findings.
+            if not body and not inline_comments and (
+                RAVEN_REVIEW_MODE == "advisory" or not approve
+            ):
+                sev = review.get("severity", "low")
+                body = (
+                    f"🦅 **Raven** — {SEVERITY_EMOJI.get(sev, default_emoji)} "
+                    f"**{sev.upper()}** — {review.get('summary') or 'changes requested'}"
+                )
+        else:
+            body = _format_comment(
+                review,
+                mode="advisory" if RAVEN_REVIEW_MODE == "advisory" else "review",
+            )
         # Pass comment_only conditionally via dict-spread so out-of-tree
         # providers running in non-advisory modes never see the new kwarg.
         # (Default in the ABC doesn't propagate to overriders.)
@@ -3153,6 +3171,25 @@ def _format_comment(review: dict, mode: str = "review") -> str:
     lines.append("")
     lines.append(f"*Reviewed by Raven · {RAVEN_AI_MODEL} · effort {RAVEN_AI_EFFORT} · {timestamp}*")
 
+    return "\n".join(lines)
+
+
+def _format_inline_leftovers(findings: list[dict]) -> str:
+    """Minimal body for ``RAVEN_REVIEW_OUTPUT=inline``.
+
+    Inline mode posts no summary/recommendation comment. The only findings
+    that can't ride on a diff line are those with no postable file/line —
+    PR-wide notes and ⚠️ coverage-gap markers (filename, no line). Those are
+    listed in a short body so they aren't silently dropped. Returns ``""``
+    when every finding is inline-anchored, so a clean review posts no body.
+    """
+    if not findings:
+        return ""
+    lines = ["🦅 **Raven** — findings without an inline location:", ""]
+    for f in findings:
+        f_sev = f.get("severity", "low")
+        f_emoji = SEVERITY_EMOJI.get(f_sev, "🟡")
+        lines.append(f"- {f_emoji} **[{f_sev}]** {f.get('message', '')}")
     return "\n".join(lines)
 
 

@@ -499,6 +499,33 @@ class TestSubmitReview:
         # The main-comment POST failed before any inline anchor was posted.
         mock_inline.assert_not_called()
 
+    def test_empty_body_skips_main_comment(self, client):
+        """An empty body (RAVEN_REVIEW_OUTPUT=inline with everything anchored
+        inline) must NOT post an empty main comment — BB DC rejects empty
+        comment text. Inline anchors and the verdict still post, and the
+        return still carries the aligned inline_comments list."""
+        inline_resp = MagicMock(status_code=201, raise_for_status=MagicMock())
+        inline_resp.json.return_value = {"id": 77}
+        needs_work_resp = MagicMock(status_code=200, raise_for_status=MagicMock())
+
+        with patch.object(client.session, "post", return_value=inline_resp) as mock_post, \
+             patch.object(client.session, "put", return_value=needs_work_resp) as mock_put:
+            result = client.submit_review(
+                "PROJ/repo", 5, "", approve=False,
+                inline_comments=[{"file": "main.py", "line": 10, "body": "fix"}],
+            )
+
+        # Every POST that ran is an inline anchor — the empty main comment
+        # was skipped (no POST with bare text / no anchor).
+        assert mock_post.call_count >= 1
+        for call in mock_post.call_args_list:
+            assert call[1]["json"].get("anchor") is not None
+        # The needs-work verdict is still recorded.
+        assert mock_put.call_args[1]["json"]["status"] == "NEEDS_WORK"
+        # Return contract preserved: aligned inline_comments list.
+        assert len(result["inline_comments"]) == 1
+        assert result["inline_comments"][0]["comment_id"] == 77
+
     def test_happy_path_returns_aligned_inline_comments(self, client):
         """Reorder preserves the return contract: the result is the
         main-comment dict extended with an `inline_comments` list aligned
