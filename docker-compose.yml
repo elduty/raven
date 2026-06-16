@@ -164,15 +164,37 @@ services:
     profiles: ["observability"]
     restart: unless-stopped
     ports:
-      # Bound to localhost by default so the admin-password fallback ("admin")
-      # is never reachable on all interfaces. For off-host access, override
-      # this binding (e.g. via docker-compose.override.yml) behind a reverse
-      # proxy AND set GRAFANA_ADMIN_PASSWORD.
-      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+      # Bound to loopback by default (GRAFANA_BIND) so the admin-password
+      # fallback ("admin") is never reachable off-host. Any non-loopback bind
+      # (0.0.0.0, ::, a routable IP) makes the guard below refuse to start
+      # unless GRAFANA_ADMIN_PASSWORD is set. NOTE: Grafana serves plain HTTP —
+      # a direct non-loopback bind sends the admin password + session cookies
+      # in cleartext, so it's only safe on a trusted network or a localhost
+      # tunnel. For real off-host access, front it with a TLS-terminating
+      # reverse proxy (and still set a strong password).
+      - "${GRAFANA_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_AUTH_ANONYMOUS_ENABLED=false
       - GF_USERS_ALLOW_SIGN_UP=false
+      # Passed in purely so the guard below can read it; the bind address is a
+      # host-side docker mapping the container otherwise can't observe. `$$`
+      # defers expansion to the container shell (same as the prometheus svc).
+      - GRAFANA_BIND=${GRAFANA_BIND:-127.0.0.1}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        case "$${GRAFANA_BIND}" in
+          ""|127.0.0.1|localhost|::1) ;;   # loopback — not network-reachable, default password is fine
+          *)
+            if [ -z "$${GF_SECURITY_ADMIN_PASSWORD}" ] || [ "$${GF_SECURITY_ADMIN_PASSWORD}" = "admin" ]; then
+              echo "FATAL: GRAFANA_BIND=$${GRAFANA_BIND} exposes Grafana on a non-loopback interface, but the admin password is still the default 'admin'. Set GRAFANA_ADMIN_PASSWORD to a strong value (see config.example.env), or keep GRAFANA_BIND on a loopback address (127.0.0.1, the default)." >&2
+              exit 1
+            fi
+          ;;
+        esac
+        exec /run.sh
     volumes:
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro

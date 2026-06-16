@@ -2,6 +2,22 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## v0.4.1 — 2026-06-16
+
+A focused observability release: the Grafana dashboard's host binding is now a `.env` knob with a fail-closed exposure guard, so reaching it from another machine no longer means editing the committed compose file.
+
+### New features
+
+- **`GRAFANA_BIND` — configurable Grafana host binding.** The observability profile's Grafana port mapping is now `${GRAFANA_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000`, so off-host access is a `.env` change instead of a tracked-file edit. The default (`127.0.0.1`, loopback-only) is unchanged. Any non-loopback bind — `0.0.0.0`, the IPv6 wildcard `::`, or a specific routable IP — **requires** a non-default `GRAFANA_ADMIN_PASSWORD`: the Grafana container runs a startup guard that refuses to launch (with an actionable `FATAL` message) if you expose it on a reachable interface while the password is still `admin`. This replaces the previous "edit the compose file behind a reverse proxy" guidance for the common case. Grafana still serves plain HTTP, so a direct non-loopback bind sends the admin password and session cookies in cleartext — fine on a trusted network or via a localhost tunnel; for untrusted networks, front it with a TLS-terminating reverse proxy (and still set a strong password).
+
+### Migration
+
+- Backward compatible — default behavior is unchanged (Grafana stays bound to `127.0.0.1`). To reach Grafana from another machine, set `GRAFANA_BIND=0.0.0.0` (or a specific NIC IP) **and** a strong `GRAFANA_ADMIN_PASSWORD` in `.env`; the guard enforces the password requirement.
+
+### Stats
+
+- 926 tests across 15 test files (unchanged — the guard is a Compose-level shell check, covered by config-render and dry-run verification).
+
 ## v0.4.0 — 2026-06-15
 
 Review-output control plus a security and reliability hardening batch. Highlights: mention-only replies and a per-PR reply circuit breaker, an opt-in require-CI merge gate, the default reviewer moving to Claude Opus 4.8 at max effort, and `inline` output mode dropping its summary comment — alongside a set of fail-closed fixes (truncated diffs, Claude CLI subprocess secret isolation, a webhook body-size cap, and Grafana bound to localhost).

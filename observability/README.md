@@ -13,6 +13,7 @@ Design: [`docs/superpowers/specs/2026-05-29-observability-stack-design.md`](../d
 #   RAVEN_METRICS_TOKEN=<a long random token>   # required — gates /metrics
 #   GRAFANA_ADMIN_PASSWORD=<your password>      # Grafana admin login
 #   GRAFANA_PORT=3000                           # optional, default 3000
+#   GRAFANA_BIND=127.0.0.1                      # optional, default localhost-only
 
 docker compose --profile observability up -d
 ```
@@ -20,6 +21,20 @@ docker compose --profile observability up -d
 Then open Grafana at `http://<host>:3000`, log in as `admin` /
 `$GRAFANA_ADMIN_PASSWORD`, and the **Raven — Review, Reliability & Cost**
 dashboard is already there (folder *Raven*), wired to Prometheus.
+
+By default Grafana binds to `127.0.0.1` (loopback) so the `admin` fallback
+password is never reachable off-host. Any non-loopback bind (`GRAFANA_BIND=0.0.0.0`,
+`::`, or a routable IP like `192.168.1.5`) **requires** a non-default
+`GRAFANA_ADMIN_PASSWORD`: the Grafana container refuses to start (fails fast,
+non-zero exit) otherwise, so an exposed-but-unprotected dashboard can't happen
+by accident.
+
+Note that Grafana serves **plain HTTP**. A direct non-loopback bind therefore
+sends the admin password and session cookies in cleartext — fine on a trusted
+network or over a localhost tunnel, but for real off-host access put Grafana
+behind a **TLS-terminating reverse proxy** (and still set a strong password).
+The `GRAFANA_BIND` knob lowers the friction of exposing the port; it does not
+add transport security.
 
 Plain `docker compose up -d` (no `--profile`) still runs Raven alone — the
 Prometheus and Grafana services do not start without the profile flag.
