@@ -447,57 +447,149 @@ class TestSubmitReview:
         assert put_payload["status"] == "NEEDS_WORK"
         assert "/participants/raven-bot" in mock_put.call_args[0][0]
 
-    def test_main_comment_posted_before_inline(self, client):
-        """The main review comment is posted FIRST, then inline anchors,
-        then approve. Ordering matters: if the main comment POST fails,
-        no inline comments will have been posted (no orphans/dupes on the
-        re-post that the caller drives after a failed submit_review)."""
-        main_resp = MagicMock(status_code=201, raise_for_status=MagicMock())
-        main_resp.json.return_value = {"id": 12}
+    def test_inline_posted_before_summary(self, client):
+        """Inline anchors are posted FIRST, then the summary comment LAST,
+        then approve. Summary-last makes the summary sort on top of the
+        inline comments in BB DC's newest-first activity view. The
+        no-orphan/no-dup invariant that the old summary-first order held by
+        ordering is now held by the rollback path (see
+        test_summary_failure_rolls_back_inline)."""
         inline_resp = MagicMock(status_code=201, raise_for_status=MagicMock())
-        inline_resp.json.return_value = {"id": 77}
+        inline_resp.json.return_value = {"id": 77, "version": 0}
+        summary_resp = MagicMock(status_code=201, raise_for_status=MagicMock())
+        summary_resp.json.return_value = {"id": 12}
         approve_resp = MagicMock(status_code=200, raise_for_status=MagicMock())
 
-        with patch.object(client.session, "post", side_effect=[main_resp, inline_resp, approve_resp]) as mock_post:
-            client.submit_review(
+        with patch.object(client.session, "post", side_effect=[inline_resp, summary_resp, approve_resp]) as mock_post:
+            result = client.submit_review(
                 "PROJ/repo", 5, "Review body", approve=True,
                 inline_comments=[{"file": "main.py", "line": 10, "body": "fix this"}],
             )
 
         calls = mock_post.call_args_list
-        # First call: the main review comment (no anchor).
-        first_payload = calls[0][1]["json"]
-        assert first_payload["text"] == "Review body"
-        assert "anchor" not in first_payload
-        # Second call: the inline anchor comment.
-        inline_payload = calls[1][1]["json"]
+        # First call: the inline anchor comment.
+        inline_payload = calls[0][1]["json"]
         assert inline_payload["text"] == "fix this"
         assert inline_payload["anchor"]["path"] == "main.py"
         assert inline_payload["anchor"]["line"] == 10
         assert inline_payload["anchor"]["lineType"] == "ADDED"
+        # Second call: the summary review comment (no anchor) — posted LAST.
+        summary_payload = calls[1][1]["json"]
+        assert summary_payload["text"] == "Review body"
+        assert "anchor" not in summary_payload
         # Third call: approve.
         assert "/approve" in calls[2][0][0]
+        # Return contract: summary dict + aligned inline_comments.
+        assert result["id"] == 12
+        assert result["inline_comments"] == [
+            {"file": "main.py", "line": 10, "comment_id": 77}
+        ]
 
-    def test_main_comment_failure_posts_no_inline(self, client):
-        """If the MAIN review-comment POST raises, no inline anchors are
-        posted — _post_inline_comments is never reached. This guards the
-        orphaned/duplicated-comment window (audit #14): the caller treats
-        the whole submit_review as failed and re-posts on the next pass,
-        so any already-posted inline comments would be duplicated."""
+    def test_summary_failure_rolls_back_inline(self, client):
+        """If the SUMMARY comment POST raises after inline anchors posted,
+        every posted inline comment is DELETEd (rollback) and the original
+        error re-raises. This preserves the audit-#14 invariant — a
+        summary failure leaves no orphaned inline comments for the caller
+        to duplicate on its next-pass re-post — now via rollback instead
+        of summary-first ordering."""
         import requests
-        main_resp = MagicMock(status_code=500)
-        main_resp.raise_for_status.side_effect = requests.HTTPError("boom")
+        # Two inline anchors post successfully (ids 77, 78; version 0).
+        inline_resp_1 = MagicMock(status_code=201, raise_for_status=MagicMock())
+        inline_resp_1.json.return_value = {"id": 77, "version": 0}
+        inline_resp_2 = MagicMock(status_code=201, raise_for_status=MagicMock())
+        inline_resp_2.json.return_value = {"id": 78, "version": 0}
+        # The summary POST fails.
+        summary_resp = MagicMock(status_code=500)
+        summary_resp.raise_for_status.side_effect = requests.HTTPError("boom")
+        delete_resp = MagicMock(status_code=204, raise_for_status=MagicMock())
 
-        with patch.object(client.session, "post", return_value=main_resp), \
-             patch.object(client, "_post_inline_comments") as mock_inline:
+        with patch.object(client.session, "post",
+                          side_effect=[inline_resp_1, inline_resp_2, summary_resp]), \
+             patch.object(client.session, "delete", return_value=delete_resp) as mock_delete:
             with pytest.raises(requests.HTTPError):
                 client.submit_review(
                     "PROJ/repo", 5, "Review body", approve=True,
-                    inline_comments=[{"file": "main.py", "line": 10, "body": "fix this"}],
+                    inline_comments=[
+                        {"file": "a.py", "line": 10, "body": "fix a"},
+                        {"file": "b.py", "line": 20, "body": "fix b"},
+                    ],
                 )
 
-        # The main-comment POST failed before any inline anchor was posted.
-        mock_inline.assert_not_called()
+        # Both posted inline comments were deleted (rollback), with the
+        # captured version as a query param.
+        delete_calls = mock_delete.call_args_list
+        assert len(delete_calls) == 2
+        deleted_ids = {c[0][0].rsplit("/", 1)[-1] for c in delete_calls}
+        assert deleted_ids == {"77", "78"}
+        for c in delete_calls:
+            assert "/pull-requests/5/comments/" in c[0][0]
+            assert c[1]["params"] == {"version": 0}
+
+    def test_rollback_delete_failure_continues_and_raises(self, client):
+        """If a rollback DELETE itself fails for one comment, the rest are
+        still attempted (a warning is logged) and the original summary-POST
+        error still re-raises — a rollback failure never masks it."""
+        import requests
+        inline_resp_1 = MagicMock(status_code=201, raise_for_status=MagicMock())
+        inline_resp_1.json.return_value = {"id": 77, "version": 0}
+        inline_resp_2 = MagicMock(status_code=201, raise_for_status=MagicMock())
+        inline_resp_2.json.return_value = {"id": 78, "version": 0}
+        summary_resp = MagicMock(status_code=500)
+        summary_resp.raise_for_status.side_effect = requests.HTTPError("summary boom")
+        # First delete fails, second succeeds.
+        delete_fail = MagicMock(status_code=409)
+        delete_fail.raise_for_status.side_effect = requests.HTTPError("delete boom")
+        delete_ok = MagicMock(status_code=204, raise_for_status=MagicMock())
+
+        with patch.object(client.session, "post",
+                          side_effect=[inline_resp_1, inline_resp_2, summary_resp]), \
+             patch.object(client.session, "delete",
+                          side_effect=[delete_fail, delete_ok]) as mock_delete:
+            with pytest.raises(requests.HTTPError, match="summary boom"):
+                client.submit_review(
+                    "PROJ/repo", 5, "Review body", approve=True,
+                    inline_comments=[
+                        {"file": "a.py", "line": 10, "body": "fix a"},
+                        {"file": "b.py", "line": 20, "body": "fix b"},
+                    ],
+                )
+
+        # Both deletes were attempted despite the first failing.
+        assert mock_delete.call_count == 2
+
+    def test_partial_inline_failure_no_rollback(self, client):
+        """One inline anchor fails to post (comment_id=None) but the summary
+        succeeds → no rollback, return carries the None entry aligned to
+        input. Rollback only fires on a summary-POST failure."""
+        import requests
+        # First anchor posts (id 77), second anchor POST fails, summary ok.
+        inline_ok = MagicMock(status_code=201, raise_for_status=MagicMock())
+        inline_ok.json.return_value = {"id": 77, "version": 0}
+        inline_fail = MagicMock(status_code=500)
+        inline_fail.raise_for_status.side_effect = requests.HTTPError("anchor boom")
+        summary_resp = MagicMock(status_code=201, raise_for_status=MagicMock())
+        summary_resp.json.return_value = {"id": 12}
+        needs_work_resp = MagicMock(status_code=200, raise_for_status=MagicMock())
+
+        with patch.object(client.session, "post",
+                          side_effect=[inline_ok, inline_fail, summary_resp]), \
+             patch.object(client.session, "put", return_value=needs_work_resp), \
+             patch.object(client.session, "delete") as mock_delete:
+            result = client.submit_review(
+                "PROJ/repo", 5, "Review body", approve=False,
+                inline_comments=[
+                    {"file": "a.py", "line": 10, "body": "fix a"},
+                    {"file": "b.py", "line": 20, "body": "fix b"},
+                ],
+            )
+
+        # No rollback on a partial inline failure when the summary lands.
+        mock_delete.assert_not_called()
+        assert result["id"] == 12
+        ic = result["inline_comments"]
+        assert len(ic) == 2
+        assert ic[0] == {"file": "a.py", "line": 10, "comment_id": 77}
+        assert ic[1] == {"file": "b.py", "line": 20, "comment_id": None}
 
     def test_empty_body_skips_main_comment(self, client):
         """An empty body (RAVEN_REVIEW_OUTPUT=inline with everything anchored

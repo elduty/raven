@@ -270,6 +270,8 @@ Raven submits formal reviews (APPROVED or REQUEST_CHANGES on Gitea, approve/need
 
 Each finding with a file and line number is also posted as an inline comment on the exact diff line.
 
+On **Bitbucket DC** — which has no single-call review API — the summary comment is posted **after** the inline anchors so it sorts on top of them in the PR activity. If the summary post fails, the inline anchors that already posted are rolled back (deleted) so a retry can't duplicate them. Gitea posts the whole review in one call, so ordering there is whatever the platform renders.
+
 ## Customising the review prompt
 
 Edit `prompts/review.md` to tune review quality. The prompt is loaded at container startup — restart the container to pick up changes, no rebuild needed.

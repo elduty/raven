@@ -688,31 +688,55 @@ class BitbucketDCProvider(GitProvider):
         """
         project, repo = _split_repo(repo_full_name)
 
-        # Post the main review comment FIRST. BB DC has no single-POST
-        # review API (unlike Gitea), so the main comment and the inline
-        # anchors are separate POSTs. If we posted the anchors first and
-        # the main-comment POST then raised, the caller treats the whole
-        # submit_review as failed and re-posts everything on the next
-        # pass — duplicating every (already-posted) inline comment. By
-        # posting the main comment first, a main-comment failure leaves
-        # zero inline anchors on the PR: no orphans, no dupes (audit #14).
+        # Post the inline anchors FIRST, then the summary comment LAST. BB
+        # DC has no single-POST review API (unlike Gitea) and its activity
+        # view sorts newest-first, so posting the summary last makes it
+        # sort on TOP of the inline comments — what reviewers expect.
+        #
+        # The catch: separate POSTs mean a summary failure could leave the
+        # already-posted inline anchors orphaned. The caller treats the
+        # whole submit_review as failed and re-posts on the next pass,
+        # which would DUPLICATE those orphans (audit #14). So a summary
+        # failure triggers a best-effort rollback that DELETEs every inline
+        # anchor that did post, then re-raises — leaving zero inline
+        # anchors on the PR: no orphans, no dupes. (The old fix held this
+        # invariant by posting the summary first; summary-last + rollback
+        # preserves it while putting the summary on top.)
         comment_url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/comments"
-        # Skip the main comment entirely when the body is empty
-        # (RAVEN_REVIEW_OUTPUT=inline with everything anchored inline). BB DC
-        # rejects an empty comment `text`, and an inline-only review needs no
-        # standalone summary. The inline anchors + verdict below still post.
-        result: dict = {}
-        if body and body.strip():
-            resp = self.session.post(comment_url, json={"text": body}, timeout=15)
-            resp.raise_for_status()
-            result = resp.json()
 
-        # Then post inline comments; capture per-anchor returned IDs.
+        # Post inline comments; capture per-anchor returned IDs + versions
+        # (the version is required for the rollback DELETE below).
         posted_inline = (
             self._post_inline_comments(project, repo, pr_number, inline_comments)
             if inline_comments else []
         )
-        result["inline_comments"] = posted_inline
+
+        # Post the summary comment LAST. Skip it entirely when the body is
+        # empty (RAVEN_REVIEW_OUTPUT=inline with everything anchored
+        # inline). BB DC rejects an empty comment `text`, and an inline-only
+        # review needs no standalone summary — nothing to post, nothing to
+        # roll back. The inline anchors + verdict still post.
+        result: dict = {}
+        if body and body.strip():
+            try:
+                resp = self.session.post(comment_url, json={"text": body}, timeout=15)
+                resp.raise_for_status()
+                result = resp.json()
+            except Exception:
+                # Summary failed after inline anchors landed — roll them
+                # back so the caller's next-pass re-post can't duplicate
+                # them, then re-raise the original error.
+                self._rollback_inline_comments(project, repo, pr_number, posted_inline)
+                raise
+
+        # Return the cross-provider contract shape `{file, line,
+        # comment_id}` — the internal `version` (rollback-only) is stripped
+        # so the return matches Gitea's and the server consumer's
+        # expectations.
+        result["inline_comments"] = [
+            {"file": e["file"], "line": e["line"], "comment_id": e["comment_id"]}
+            for e in posted_inline
+        ]
 
         # Approve / needs-work — skipped in comment_only mode so the
         # review remains advisory.
@@ -747,11 +771,15 @@ class BitbucketDCProvider(GitProvider):
         but those don't apply to review findings.
 
         Returns a list aligned by index with the input ``comments`` list.
-        Each entry is ``{file, line, comment_id}``; ``comment_id`` is None
-        when the anchor was filtered (missing/invalid file/line) or the
-        post failed. Same-length-as-input is the invariant the
-        ``_process_pr`` cache-write step relies on to zip submitted
-        findings with returned IDs.
+        Each entry is ``{file, line, comment_id, version}``; ``comment_id``
+        is None when the anchor was filtered (missing/invalid file/line) or
+        the post failed, and ``version`` is the created comment's version
+        (0 for a freshly-posted comment, None when nothing was posted) —
+        used by ``submit_review``'s rollback DELETE. Same-length-as-input
+        is the invariant the ``_process_pr`` cache-write step relies on to
+        zip submitted findings with returned IDs. (The ``version`` field is
+        additive; existing consumers read only ``file``/``line``/
+        ``comment_id``.)
         """
         url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/comments"
         posted: list[dict] = []
@@ -759,7 +787,7 @@ class BitbucketDCProvider(GitProvider):
             file_path = c.get("file", "")
             line = c.get("line", 0)
             body = c.get("body", "")
-            entry = {"file": file_path, "line": line, "comment_id": None}
+            entry = {"file": file_path, "line": line, "comment_id": None, "version": None}
             if file_path and isinstance(line, int) and line > 0:
                 payload = {
                     "text": body,
@@ -773,11 +801,49 @@ class BitbucketDCProvider(GitProvider):
                 try:
                     resp = self.session.post(url, json=payload, timeout=10)
                     resp.raise_for_status()
-                    entry["comment_id"] = resp.json().get("id")
+                    created = resp.json()
+                    entry["comment_id"] = created.get("id")
+                    entry["version"] = created.get("version", 0)
                 except Exception as e:
                     logger.warning("Failed to post inline comment on %s:%d: %s", file_path, line, e)
             posted.append(entry)
         return posted
+
+    def _rollback_inline_comments(self, project: str, repo: str, pr_number: int,
+                                  posted_inline: list[dict]) -> None:
+        """Best-effort DELETE of inline anchors posted before a summary
+        failure (audit #14 invariant: no orphaned anchors for the caller to
+        re-post and duplicate).
+
+        Each DELETE that itself fails logs a WARNING and the loop continues
+        — a rollback failure must never mask the original summary-POST error
+        (the caller re-raises it after this returns).
+        """
+        for e in posted_inline:
+            comment_id = e.get("comment_id")
+            if comment_id is None:
+                continue
+            try:
+                self._delete_comment(project, repo, pr_number, comment_id,
+                                     e.get("version", 0))
+            except Exception as ex:
+                logger.warning(
+                    "BB DC rollback: failed to delete inline comment %s on PR #%d "
+                    "after summary-POST failure: %s (continuing rollback)",
+                    comment_id, pr_number, ex,
+                )
+
+    def _delete_comment(self, project: str, repo: str, pr_number: int,
+                        comment_id: int, version: int) -> None:
+        """DELETE a PR comment. BB DC requires the comment ``version`` as a
+        query param (optimistic concurrency); a freshly-created comment is
+        version 0. Raises on non-2xx so the caller can log + continue."""
+        url = (
+            f"{self.api_url}/projects/{project}/repos/{repo}"
+            f"/pull-requests/{pr_number}/comments/{comment_id}"
+        )
+        resp = self.session.delete(url, params={"version": version}, timeout=10)
+        resp.raise_for_status()
 
     def dismiss_previous_reviews(self, repo_full_name: str, pr_number: int, bot_user: str,
                                   exclude_id: int | None = None) -> None:

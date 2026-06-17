@@ -2,6 +2,18 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## v0.4.2 — 2026-06-17
+
+A small Bitbucket DC review-presentation fix: the summary comment now sorts on top of the inline comments.
+
+### Fixes
+
+- **Bitbucket DC review summary now sorts on top of the inline comments.** BB DC has no single-call review API, so Raven posts the summary and each inline anchor as separate requests, and the PR activity sorts newest-first. The summary is now posted **last** (after the inline anchors) so it appears above them. The no-orphan/no-duplicate guarantee from v0.4.0 is preserved by a new mechanism: if the summary post fails after inline anchors have landed, those anchors are rolled back (deleted) before the error propagates, so the caller's next-pass retry can't duplicate them. The empty-body case (`RAVEN_REVIEW_OUTPUT=inline`) is unchanged — no summary is posted, nothing to roll back. Gitea is unaffected (its single-call review API renders its own ordering).
+
+### Stats
+
+- 928 tests across 15 test files.
+
 ## v0.4.1 — 2026-06-16
 
 A focused observability release: the Grafana dashboard's host binding is now a `.env` knob with a fail-closed exposure guard, so reaching it from another machine no longer means editing the committed compose file.
