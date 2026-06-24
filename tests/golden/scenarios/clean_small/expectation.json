@@ -1,0 +1,15 @@
+{
+  "description": "Tiny correct change: slugify made more robust, behaviour preserved. Should read as approvable with no medium/high findings.",
+  "repo_name": "golden/clean-small",
+  "file_contents": {
+    "utils/text.py": "files/text.py"
+  },
+  "expect": {
+    "approvable": true,
+    "max_severity": "low",
+    "negatives": 1,
+    "must_not_contain_patterns": [
+      "\\b(missing|absent|not implemented|never implemented)\\b"
+    ]
+  }
+}

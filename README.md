@@ -63,7 +63,7 @@ Developers can @mention Raven in PR comments to ask questions or dispute finding
 - **Threaded replies** — on platforms that support comment threads (Bitbucket Data Center), Raven replies inside the thread rather than posting a top-level comment.
 - **No re-@mention inside Raven's threads** — any reply in a thread where Raven has already participated triggers a follow-up, so the conversation flows naturally. To require an explicit tag on *every* reply (and never auto-engage on an untagged in-thread reply), set `RAVEN_REPLY_REQUIRE_MENTION`; tags match the bot's account username plus any `RAVEN_MENTION_NAMES`.
 - **Active-thread context** — Raven sees the whole conversation it's replying inside (root + replies), not just the last 20 PR-wide comments. The thread root (usually Raven's own original finding) is always preserved through truncation. Cap via `RAVEN_RESPOND_THREAD_TOTAL_CHARS` (default 8000).
-- **Line-aware context** — inline diff comments get a line-numbered snippet of the file injected into the prompt, so Raven answers about the exact code without having to parse hunk headers.
+- **Full-file context** — when you reply to an inline comment, Raven injects the full modified file (up to `RAVEN_MAX_FILE_LINES`, with larger files disclosed as truncated) alongside a line-numbered snippet around the commented line, so it can answer about code beyond the immediate hunk. A reply deep in a thread carries no anchor of its own — the anchor lives on the thread's root comment — so Raven recovers the file and line from the root, and any failure to fetch the code is disclosed to the model so it flags uncertainty instead of guessing.
 - **Verdict re-evaluation** — when the conversation provides substantive new information (e.g. "this isn't a bug because the path is unreachable", "this pattern is intentional convention"), Raven can submit a NEW formal review revising its prior verdict. Auto-merge gates fire on `needs_work → approve` flips and also on retraction-only paths when the prior verdict was already approve (Bitbucket DC "all comments resolved" unblock). Cap via `RAVEN_RESPOND_VERDICT_BODY_CHARS` (default 4000).
 - **Finding retraction** — when the discussion explicitly invalidates a specific inline finding, Raven retracts it using the provider's native resolve action: Bitbucket Data Center marks the thread root `threadResolved=true` (the same flag the UI's "Resolve thread" button sets); **Gitea ≥1.24** uses `POST /pulls/comments/{id}/resolve`. On older Gitea instances retraction logs a warning and no-ops; verdict revision and thread context still work normally.
 - **Respect user-resolved findings** — when a developer marks one of Raven's inline findings resolved via the UI (Gitea ≥1.24 `/resolve`, BB DC "Resolve thread"), the next incremental re-review drops that finding from carry-forward and from the cache so the consolidated verdict doesn't re-litigate dismissed feedback. Symmetric to AI-driven retraction: that flow is Raven resolving on the AI's behalf; this is Raven respecting the user's direct dismissal. Best-effort: provider API failure falls back to no filtering (review proceeds as before).
@@ -270,6 +270,8 @@ Raven submits formal reviews (APPROVED or REQUEST_CHANGES on Gitea, approve/need
 
 Each finding with a file and line number is also posted as an inline comment on the exact diff line.
 
+**Grounded findings.** Raven reviews in a sandbox with no access to the wider codebase, so every finding must cite evidence actually in the prompt — a specific line or quoted snippet from the diff or the fetched file contents. The reviewer is instructed not to present assumptions as certainty, and the same rule is restated at the end of the prompt where recency makes it stick. A conservative post-review filter then drops any fresh finding that names a file Raven was never shown (counted in `raven_ungrounded_findings_dropped_total`), so confident-but-unfounded findings don't reach the PR. PR-wide observations that legitimately have no single line — a missing test, an absent guard — are still reported.
+
 On **Bitbucket DC** — which has no single-call review API — the summary comment is posted **after** the inline anchors so it sorts on top of them in the PR activity. If the summary post fails, the inline anchors that already posted are rolled back (deleted) so a retry can't duplicate them. Gitea posts the whole review in one call, so ordering there is whatever the platform renders.
 
 ## Customising the review prompt
@@ -397,7 +399,28 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-~926 tests across 15 test files covering webhook handling (BB DC `pr:comment:added`/`:edited` version-aware dedup, `pr:reviewer:approved`/`:changes_requested` parity with Gitea, activities-endpoint pagination cap with WARNING), review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), two-tier prompt trust model (`<repo_policy>` for CLAUDE.md + rules at base ref vs `<untrusted_input>` for diff + comments), chunked-review consolidation pass that re-applies repo policy to aggregated findings, three-mode review engagement (`all` / `gap` / `advisory`), three-way review output channels (`both` / `summary` / `inline`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
+### Golden-review eval harness
+
+`tests/golden/` is an **opt-in** harness that replays recorded PR-review
+scenarios against the **live AI backend** and scores them (precision /
+recall / false-positive rate) — to prove a change cut false positives
+without raising false negatives, to A/B `max` vs `high` reasoning effort,
+and to gate model/effort swaps. It is **skipped in normal CI** (it needs
+a real backend and spends tokens), gated by `RAVEN_LIVE_AI_TESTS=1` and
+the `slow` marker exactly like `tests/test_prompt_injection_live.py`. The
+*scoring logic* and every scenario's match patterns are unit-tested
+offline and run in normal CI. See `tests/golden/README.md` for the
+corpus format, the scoring approach, and how to A/B effort:
+
+```bash
+# A/B reasoning effort (compare the two [golden:…] summary lines)
+RAVEN_AI_EFFORT=high RAVEN_LIVE_AI_TESTS=1 CLAUDE_CODE_OAUTH_TOKEN=<token> \
+    pytest -m slow tests/golden/ -s -q
+RAVEN_AI_EFFORT=max  RAVEN_LIVE_AI_TESTS=1 CLAUDE_CODE_OAUTH_TOKEN=<token> \
+    pytest -m slow tests/golden/ -s -q
+```
+
+~1000 tests across 18 test files (including the offline golden-review scorer/corpus suite above) covering webhook handling (BB DC `pr:comment:added`/`:edited` version-aware dedup, `pr:reviewer:approved`/`:changes_requested` parity with Gitea, activities-endpoint pagination cap with WARNING), review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), two-tier prompt trust model (`<repo_policy>` for CLAUDE.md + rules at base ref vs `<untrusted_input>` for diff + comments), chunked-review consolidation pass that re-applies repo policy to aggregated findings, three-mode review engagement (`all` / `gap` / `advisory`), three-way review output channels (`both` / `summary` / `inline`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
 
 ## CI
 

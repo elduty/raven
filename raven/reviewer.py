@@ -434,6 +434,83 @@ def _build_incremental_scope_section(unchanged_files: list[str] | None,
     return section
 
 
+# Final grounding reminder for the SINGLE-CHUNK review path, appended
+# AFTER the diff / file-contents / carried-findings sections so it is the
+# LAST thing the model reads before answering. The static template carries
+# the full grounding rule, but the runtime evidence sections (diff, file
+# contents, carried findings) are concatenated after the template, so a
+# reminder placed only in the template is buried mid-prompt. Restating it
+# at the tail — where instruction-following is strongest — is the point.
+# Trusted template text: stays outside both delimiter families, like the
+# other section builders. NB: deliberately NOT used by
+# _consolidate_chunked_review — that pass has no diff/file-contents in its
+# prompt, so "anchor to the evidence shown above" would be false there (see
+# the comment at its prompt assembly).
+# The grounding rule + escape hatch for legitimately location-less
+# findings. Applies to findings the model RAISES from the evidence in this
+# prompt.
+_GROUNDING_TAIL_GROUND = (
+    "\n\n## Before You Output\n"
+    "Re-check every finding against the evidence above before you "
+    "answer. Each finding must point to a specific line or a quoted "
+    "snippet that is actually present in the diff or file contents "
+    "shown above. If a finding depends on code you were not shown, drop "
+    "it or mark it explicitly as an assumption and lower its "
+    "severity/confidence — do not assert it as fact. (Findings that the "
+    "change legitimately omits something required PR-wide — a missing "
+    "test or guard — are grounded in what the diff does and does not do; "
+    "keep those and omit `file`/`line`.)"
+)
+
+# Carve-out appended ONLY when the prompt carries a "Prior Findings From
+# Unchanged Files" re-validation block (single-chunk incremental path).
+# Without it, the "drop anything you weren't shown" rule above collides
+# with the carried block: carried findings reference UNCHANGED-file code
+# that is intentionally not in the delta, so they read as "ungrounded" and
+# the model could list their carry_ids in `dropped_carried` on the wrong
+# basis ("code not shown") instead of the intended one ("this push
+# resolves it"). Because dropped carried findings leave the verdict + cache
+# and resolve their threads, over-dropping biases toward approve/auto-merge
+# — the same failure mode guarded against in _consolidate_chunked_review.
+_GROUNDING_TAIL_CARRIED_CARVEOUT = (
+    " The 'Prior Findings From Unchanged Files' block is the exception to "
+    "the rule above: those carried findings are already grounded in an "
+    "earlier review pass, so do NOT drop or downgrade them merely because "
+    "their unchanged-file code is not shown here. Drop a carried finding "
+    "only by listing its `carry_id` in `dropped_carried`, and only when "
+    "the diff in this push actually resolves it — when in doubt, keep it."
+)
+
+# The one-line severity reminder always comes LAST so it is the final
+# instruction the model reads.
+_GROUNDING_TAIL_SEVERITY = (
+    " Set the top-level `severity` to the highest finding's severity, or "
+    "`low` when there are none."
+)
+
+
+def _grounding_tail_reminder(has_carried_findings: bool = False) -> str:
+    """Return the tail grounding+severity reminder for the single-chunk
+    review path (see the module constants).
+
+    When ``has_carried_findings`` is True the prompt also holds the
+    carry-forward re-validation block, so a carve-out is inserted that
+    exempts carried findings from the "drop what you weren't shown" rule —
+    otherwise the maximally-obeyed tail could push the model to over-drop
+    carried findings on the wrong basis and bias the verdict toward
+    approve. The severity reminder always stays last.
+
+    A thin builder so callers read intent at the assembly site and the
+    text stays defined once; tests assert it lands after the diff marker
+    in the fully assembled prompt.
+    """
+    parts = [_GROUNDING_TAIL_GROUND]
+    if has_carried_findings:
+        parts.append(_GROUNDING_TAIL_CARRIED_CARVEOUT)
+    parts.append(_GROUNDING_TAIL_SEVERITY)
+    return "".join(parts)
+
+
 def _build_pr_context_section(pr_title: str, pr_description: str,
                                pr_comments: list[dict] | None, tag_id: str,
                                bot_user: str = "") -> str:
@@ -917,10 +994,35 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
         unchanged_files=unchanged_files,
     )
     if consolidated is not None:
+        # Re-filter the consolidation output. The consolidation pass is a
+        # SEPARATE AI call whose findings no per-chunk filter has seen, so
+        # a consolidation-introduced finding naming a file in no chunk
+        # would otherwise bypass the grounding guarantee. Filter against
+        # the UNION of every chunk's provided files (all diff files ∪ all
+        # file_contents ∪ omitted ∪ unchanged) — a finding grounded in ANY
+        # chunk (or disclosed as existing) is legitimate at the whole-PR
+        # level. ``error_findings`` (gap markers) are appended AFTER the
+        # filter so the coverage-gap signal is never touched.
+        union_provided = _provided_file_set(
+            clean_diff, file_contents, omitted_files, unchanged_files
+        )
+        consolidated_before = len(consolidated["findings"])
+        consolidated_findings = _drop_ungrounded_findings(
+            consolidated["findings"], union_provided, repo_name
+        )
+        # Recompute severity ONLY when the re-filter actually dropped a
+        # finding — matching the single-chunk guard and prior behavior.
+        # When nothing is dropped, keep the consolidation AI's stated
+        # severity (still floored), rather than silently replacing it.
+        consolidated_severity = (
+            _recompute_severity(consolidated_findings)
+            if len(consolidated_findings) != consolidated_before
+            else consolidated["severity"]
+        )
         return {
-            "severity": _floor_severity(consolidated["severity"]),
+            "severity": _floor_severity(consolidated_severity),
             "summary": consolidated.get("summary") or merged_summary or "Multi-file review consolidated.",
-            "findings": consolidated["findings"] + error_findings,
+            "findings": consolidated_findings + error_findings,
             "chunked": True,
             "chunks_reviewed": reviewed_count,
             "consolidated": True,
@@ -1037,6 +1139,17 @@ def _consolidate_chunked_review(
         if is_incremental else ""
     )
 
+    # NB: the grounding tail reminder used by _review_single_chunk is
+    # deliberately NOT appended here. That reminder tells the model each
+    # finding must anchor to "the diff or file contents shown above" — but
+    # this pass is fed only the aggregated chunk findings + policy blocks,
+    # never the diff (it was chunked precisely because it's too large for
+    # one call). Appending it here would make the rule's premise false for
+    # every already-validated finding, risking a drop/downgrade that flips
+    # the final verdict toward approve+auto-merge on large PRs. Grounding is
+    # enforced at the chunk level; this pass only ranks/dedups against
+    # whole-PR rules and is already forbidden (in `instructions`) from
+    # adding findings the chunks didn't surface.
     prompt = (
         f"{preamble}\n\n"
         f"## Repository: {repo_name}{repo_context}\n\n"
@@ -1210,6 +1323,17 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
     # guidance the model reads before the diff. Together with the
     # "take precedence" header, this makes rules beat any conflicting
     # general guidance in the prompt template.
+    # Grounding+severity reminder goes LAST — after the diff, file
+    # contents and carried findings — so it is the final framing the
+    # model reads before answering (the static template's copy of the
+    # rule is buried above these runtime sections). When carried findings
+    # are present (single-chunk incremental), the reminder carries a
+    # carve-out so its "drop what you weren't shown" rule doesn't push the
+    # model to over-drop carried findings whose unchanged-file code is
+    # intentionally not in the delta.
+    tail_reminder = _grounding_tail_reminder(
+        has_carried_findings=bool(carried_findings)
+    )
     if effective_template:
         prompt = (
             f"{preamble}\n\n"
@@ -1220,6 +1344,7 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
             f"{diff_section}"
             f"{files_section}"
             f"{carried_section}"
+            f"{tail_reminder}"
         )
     else:
         prompt = (
@@ -1232,6 +1357,7 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
             f"{diff_section}"
             f"{files_section}"
             f"{carried_section}"
+            f"{tail_reminder}"
         )
 
     logger.info(
@@ -1250,7 +1376,180 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
         purpose="review",
     )
     _record_ai_usage(backend.name, RAVEN_AI_MODEL, repo_name, completion)
-    return _parse_response(completion.text)
+    review = _parse_response(completion.text)
+
+    # Evidence-grounding backstop. A FRESH finding whose ``file`` names
+    # code that was never put in front of the model — not in this chunk's
+    # diff, not in the attached file contents, not even disclosed as a
+    # cap-omitted file — is, by definition, about code Raven didn't see:
+    # the "implementation absent" hallucination class. The review prompt
+    # already tells the model to anchor every finding to in-prompt
+    # evidence (the 1a grounding change); this enforces the same rule in
+    # code. Single choke point: both review_diff paths (single-chunk and
+    # each chunk of the chunked path) return through here, so the filter
+    # naturally runs per-chunk against THAT chunk's own provided files,
+    # before the consolidation pass, and never sees carried findings
+    # (those are merged downstream in server.py, not here).
+    provided = _provided_file_set(diff, file_contents, omitted_files, unchanged_files)
+    before = len(review["findings"])
+    review["findings"] = _drop_ungrounded_findings(
+        review["findings"], provided, repo_name
+    )
+    # Keep the top-level severity honest when a drop removed the finding
+    # that set it (e.g. the only high finding was ungrounded). The
+    # chunked path re-derives severity from surviving chunk findings;
+    # the single-chunk path must do the same here.
+    if len(review["findings"]) != before:
+        review["severity"] = _recompute_severity(review["findings"])
+    return review
+
+
+def _provided_file_set(
+    diff: str,
+    file_contents: dict[str, str] | None,
+    omitted_files: list[str] | None,
+    unchanged_files: list[str] | None = None,
+) -> set[str]:
+    """Filenames the model was actually shown evidence for in this call.
+
+    Union of four sources, all genuinely placed in the prompt:
+    - files present in the diff (``split_diff_by_file`` keys — the same
+      keys server.py hashes, so membership lines up downstream),
+    - keys of the attached full-file contents,
+    - filenames named in ``omitted_files``. Those files were DISCLOSED to
+      the model as existing-but-not-shown (over the context caps), so a
+      finding on them is "known to exist", not a hallucination. Each
+      ``omitted_files`` entry is a human-readable note
+      (``"<filename> (<reason>)"`` — see server.py ``_fetch_changed_files``),
+      so the leading filename token is extracted via
+      ``_omitted_note_filename``.
+    - ``unchanged_files`` (incremental reviews). The incremental scope
+      block lists these by name (``_build_incremental_scope_section``),
+      so the model is told they exist — exactly like ``omitted_files``. A
+      legitimate cross-file finding anchored to an unchanged file ("this
+      delta breaks the contract in unchanged.py") is grounded-enough;
+      without this it would be dropped and the verdict would fail open
+      toward auto-merge.
+    """
+    provided = {fn for fn, _ in split_diff_by_file(diff)}
+    provided |= set(file_contents or {})
+    provided |= {_omitted_note_filename(note) for note in (omitted_files or [])}
+    provided |= set(unchanged_files or [])
+    # Normalize so membership survives path drift between the model's
+    # formatting and the diff keys (see ``_normalize_path``). Build the
+    # set normalized; the finding side is normalized the same way before
+    # the membership test in ``_drop_ungrounded_findings``.
+    provided = {_normalize_path(p) for p in provided}
+    provided.discard("")
+    return provided
+
+
+def _normalize_path(path: str) -> str:
+    """Canonicalize a path for grounding membership tests.
+
+    Strips a leading git diff prefix (``a/`` or ``b/``) and a leading
+    ``./`` so a finding written ``b/src/foo.py`` or ``./src/foo.py``
+    matches the ``split_diff_by_file`` key ``src/foo.py``. Applied to
+    BOTH sides (provided set and finding file). Case is deliberately NOT
+    folded — POSIX paths are case-sensitive, so ``Foo.py`` and ``foo.py``
+    are different files and must not be treated as grounded for each
+    other. A false match here would let a hallucinated finding through;
+    a false MISS (the failure this guards) would drop a real finding and
+    lower the surviving severity toward approve/auto-merge.
+    """
+    p = path.strip()
+    if p.startswith(("a/", "b/")):
+        p = p[2:]
+    if p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def _omitted_note_filename(note: str) -> str:
+    """Extract the filename from an ``omitted_files`` note.
+
+    Notes are formatted ``"<filename> (<reason>)"`` (server.py
+    ``_fetch_changed_files``); the filename is everything before the
+    first ``" ("``. Paths may contain spaces, but the note always
+    appends a ``" ("`` delimiter, so splitting on it is reliable. A note
+    without the delimiter (defensive) is returned whole, stripped.
+    """
+    head = note.split(" (", 1)[0]
+    return head.strip()
+
+
+def _drop_ungrounded_findings(
+    findings: list[dict], provided: set[str], repo_name: str
+) -> list[dict]:
+    """Drop FRESH findings that name a file not in ``provided``.
+
+    Conservative, file-level only: a finding is dropped only when it has
+    a non-empty ``file`` that is not in the provided set. Two carve-outs
+    are NEVER dropped:
+    - findings with no ``file`` (or a blank one) — the deliberate
+      PR-wide / file-less escape hatch the grounding prompt allows;
+    - ``gap_marker`` findings — coverage-gap markers whose ``file`` is a
+      gap filename; guarding them explicitly keeps the coverage-gap
+      lifecycle from ever regressing through this filter.
+
+    Each drop is logged and counted in
+    ``raven_ungrounded_findings_dropped_total{repo}``. (Line-within-range
+    grounding is intentionally out of scope — riskier, and a separate
+    future extension.)
+
+    Matching is forgiving by design — **false keeps are the safe
+    direction**. Beyond exact normalized-path membership, a finding also
+    survives if its basename matches the basename of any provided entry
+    (``foo.py`` vs the diff key ``pkg/foo.py``: the model dropped the
+    directory). A hallucinated finding that happens to share a basename
+    with a real file is a tolerable false-keep (it just degrades to
+    pre-filter behavior for that one finding); dropping a REAL finding
+    over a path-format mismatch would lower the surviving severity and
+    fail open toward auto-merge.
+    """
+    provided_basenames = {os.path.basename(p) for p in provided}
+    provided_basenames.discard("")
+    kept: list[dict] = []
+    for f in findings:
+        if f.get("gap_marker"):
+            kept.append(f)
+            continue
+        raw = str(f.get("file") or "").strip()
+        # Normalize the finding path the SAME way as the provided set so
+        # git ``a/``/``b/`` and ``./`` prefixes don't cause a false miss.
+        # The membership test runs on the normalized form; the original
+        # finding dict (and its ``file`` string) is preserved untouched.
+        # Basename fallback catches the remaining path-format drift
+        # (basename-only or extra path components) — false keeps are the
+        # safe direction (see docstring).
+        norm = _normalize_path(raw)
+        if not raw or norm in provided or os.path.basename(norm) in provided_basenames:
+            kept.append(f)
+            continue
+        logger.warning(
+            "Dropping ungrounded finding for %s: file %r not in reviewed set "
+            "(message: %.120s)",
+            repo_name, raw, f.get("message", ""),
+        )
+        metrics.inc("raven_ungrounded_findings_dropped_total", {"repo": repo_name})
+    return kept
+
+
+def _recompute_severity(findings: list[dict]) -> str:
+    """Highest severity among ``findings`` (``low`` if none).
+
+    Used to keep a review's top-level ``severity`` honest after the
+    grounding filter drops findings — otherwise dropping the only high
+    finding would leave ``severity='high'`` with no high finding, which
+    server.py reads for the approve decision and the reviews_total
+    metric. Safe because the filter only drops findings naming files the
+    model was never shown: a real high finding always names a file in the
+    provided set (diff/file_contents/omitted/unchanged, with a basename
+    fallback), so it survives and still drives the recomputed value.
+    """
+    rank = max((SEVERITY_ORDER.get(f.get("severity", "low"), 0)
+                for f in findings), default=0)
+    return _SEVERITY_NAME.get(rank, "low")
 
 
 def _parse_response(output: str) -> dict:
@@ -1533,6 +1832,9 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
                         repo_name: str, claude_md: str = "",
                         file_path: str = "", line: int = 0,
                         code_snippet: str = "",
+                        file_content: str = "",
+                        file_truncated: bool = False,
+                        context_fetch_failed: bool = False,
                         prompt_override: str | None = None,
                         thread: list[dict] | None = None,
                         prior_verdict: str | None = None,
@@ -1548,6 +1850,17 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
     When non-empty, the prompt includes ``## Active Thread`` and
     ``## Your Prior Verdict on This PR`` blocks; when empty, those sections
     are omitted.
+
+    ``code_snippet`` is the narrow ±10-line window pinpointing the line under
+    discussion. ``file_content`` is the FULL modified file (untrusted-wrapped)
+    so a question about code outside that window is answerable — it mirrors
+    the review flow's full-file context. The two disclosure flags keep the
+    model from asserting code it wasn't shown:
+      - ``file_truncated``: the file exceeded the line cap, so its full text
+        was withheld (disclosed in the prompt; the snippet may still appear).
+      - ``context_fetch_failed``: the code-context fetch raised, so neither
+        the file nor the snippet is available (disclosed so the model flags
+        uncertainty instead of guessing).
 
     ``raven_user`` is the bot's username on the platform (e.g. ``"jenkins.builder"``
     on the operator's BB DC). When provided, the AI's own thread entries are
@@ -1582,6 +1895,41 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
         snippet_section = (
             f"\n\n## Code at `{file_path}` around line {line}\n"
             + _wrap_untrusted("repo_file", code_snippet, tag_id)
+        )
+
+    # Full modified file (untrusted-wrapped) — the substantive code context.
+    # A question about code outside the ±10-line snippet window needs the
+    # whole file; the snippet alone left those unanswerable, forcing the
+    # model to guess from hunk headers. Mirrors the review flow's full-file
+    # attachment (``_build_review_prompt``'s ``repo_file`` blocks).
+    file_section = ""
+    if file_content and file_path:
+        file_section = (
+            f"\n\n## Full Contents of `{file_path}` (at PR head)\n"
+            + _wrap_untrusted("repo_file", file_content, tag_id)
+        )
+
+    # Disclosure of missing/incomplete code context so the model never
+    # asserts code it wasn't shown (consistent with the grounding rules).
+    context_gap_section = ""
+    if context_fetch_failed and file_path:
+        context_gap_section = (
+            f"\n\n## Code Context Unavailable\n"
+            f"The contents of `{file_path}` could not be fetched (the file "
+            f"read failed). You have only the diff hunks, not the file at PR "
+            f"head. If the question depends on code you cannot see here, say "
+            f"so and flag the uncertainty rather than guessing."
+        )
+    elif file_truncated and file_path:
+        context_gap_section = (
+            f"\n\n## Code Context Partially Omitted\n"
+            f"The full contents of `{file_path}` are omitted because the file "
+            f"exceeds the line cap (RAVEN_MAX_FILE_LINES). You can see the "
+            f"diff hunks"
+            + (" plus a focused snippet around the commented line"
+               if code_snippet else "")
+            + ", but not the whole file. If the question depends on code "
+            f"outside what's shown, say so rather than assuming."
         )
 
     # Prior verdict block (only when we have a verdict to revise from)
@@ -1627,6 +1975,7 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
     prompt = (
         f"{preamble}\n\n"
         f"## Repository: {repo_name}{repo_context}{location}{snippet_section}"
+        f"{file_section}{context_gap_section}"
         f"{verdict_section}{thread_section}\n\n"
         f"{effective_template}\n"
         f"{_RESPOND_JSON_SUFFIX}\n\n"

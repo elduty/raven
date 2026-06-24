@@ -2,6 +2,20 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## v0.5.0 — 2026-06-24
+
+Review-accuracy release: a coordinated push to cut confident false positives, a measurement harness to keep them down, and a fix for context loss in comment replies.
+
+### Added
+
+- **Evidence-grounding for findings.** The reviewer must now anchor every finding to evidence actually present in the prompt — a specific line or quoted snippet from the diff or the fetched file contents — and is told not to present assumptions as certainty (prefer verifying against the provided materials over recall). The grounding rule is restated at the **end** of the prompt, where recency makes it stick, and the same guidance is mirrored into the comment-reply prompt. PR-wide observations that legitimately have no single line (a missing test, an absent guard) are still reported.
+- **Ungrounded-finding filter.** After the model responds, a conservative server-side filter drops any *fresh* finding that names a file Raven was never shown — checked against the union of the diff, fetched file contents, the omitted-file list, and (on incremental passes) the unchanged-file list, with a basename fallback. File-less PR-wide findings, coverage-gap markers, and carried findings are preserved; the top-level severity is recomputed only when something is actually dropped; single-chunk and chunk-consolidation paths are both covered. New metric `raven_ungrounded_findings_dropped_total{repo}`.
+- **Golden-review eval harness** (`tests/golden/`). An opt-in (`RAVEN_LIVE_AI_TESTS`) corpus of recorded review scenarios — a clean PR, a tests-only push that must not hallucinate "implementation missing", a real bug, and an oversized chunk — replayed against the live backend and scored for precision/recall and false-positive rate, with an effort A/B runner (`max` vs `high`). The scorer is unit-tested offline; the live path is skipped without credentials. This is the instrument that de-risks the grounding work and gates any future reviewer-model change.
+
+### Fixed
+
+- **Comment replies no longer lose the diff/modified-file context.** Replying to an inline comment now injects the full modified file (capped at `RAVEN_MAX_FILE_LINES`, with over-cap files disclosed rather than silently dropped) instead of only a ±10-line snippet. A follow-up reply inside a thread carries no anchor of its own — the anchor lives on the thread root — so Raven now recovers the file and line from the root comment, restoring the snippet and file-targeted diff truncation that were previously skipped for in-thread replies. Failures to fetch the code are disclosed to the model (logged at WARNING, no longer swallowed) so it flags uncertainty instead of answering about code it can't see.
+
 ## v0.4.2 — 2026-06-17
 
 A small Bitbucket DC review-presentation fix: the summary comment now sorts on top of the inline comments.

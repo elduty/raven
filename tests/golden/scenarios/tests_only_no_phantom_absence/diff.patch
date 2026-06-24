@@ -1,0 +1,37 @@
+diff --git a/tests/test_discount.py b/tests/test_discount.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_discount.py
+@@ -0,0 +1,32 @@
++"""Tests for the discount calculator in billing/discount.py."""
++
++import pytest
++
++from billing.discount import apply_discount
++
++
++def test_no_discount_returns_original_price():
++    assert apply_discount(100.0, 0) == 100.0
++
++
++def test_ten_percent_discount():
++    assert apply_discount(100.0, 10) == 90.0
++
++
++def test_full_discount_is_free():
++    assert apply_discount(100.0, 100) == 0.0
++
++
++def test_negative_percent_rejected():
++    with pytest.raises(ValueError):
++        apply_discount(100.0, -5)
++
++
++def test_percent_over_hundred_rejected():
++    with pytest.raises(ValueError):
++        apply_discount(100.0, 150)
++
++
++def test_rounds_to_two_decimals():
++    # 19.99 with 7% off = 18.5907 -> 18.59
++    assert apply_discount(19.99, 7) == 18.59

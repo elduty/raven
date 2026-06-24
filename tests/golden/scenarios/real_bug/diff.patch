@@ -1,0 +1,27 @@
+diff --git a/api/users.py b/api/users.py
+--- a/api/users.py
++++ b/api/users.py
+@@ -12,6 +12,23 @@ def get_db():
+     return _connection
+ 
+ 
++def find_user_by_name(name):
++    """Look up a single user row by their display name."""
++    cur = get_db().cursor()
++    # Build the query by concatenating the caller-supplied name directly
++    # into the SQL string.
++    query = "SELECT id, email FROM users WHERE name = '" + name + "'"
++    cur.execute(query)
++    return cur.fetchone()
++
++
++def delete_user(name):
++    """Delete a user by display name."""
++    cur = get_db().cursor()
++    cur.execute("DELETE FROM users WHERE name = '%s'" % name)
++    return cur.rowcount
++
++
+ def list_active_users():
+     cur = get_db().cursor()
+     cur.execute("SELECT id, email FROM users WHERE active = 1")

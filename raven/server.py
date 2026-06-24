@@ -1883,6 +1883,29 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 logger.warning("Thread fetch failed for PR #%s seed=%s: %s",
                                pr_number, seed_id, e)
 
+        # Root-anchor fallback. A follow-up REPLY inside an inline thread
+        # carries no anchor of its own — the file/line anchor lives on the
+        # thread ROOT comment, not the reply. BB DC sends ``commentParentId``
+        # but no ``anchor`` on the reply; on Gitea a reply can likewise
+        # arrive without a populated path/line. Without this, ``file_path``/
+        # ``line`` stay empty, the code-context fetch is skipped, and the
+        # file-targeted diff truncation degrades to generic head-truncation
+        # (potentially dropping the very file under discussion). Recover the
+        # anchor from the root (``thread[0]``) — both providers populate
+        # ``file_path``/``line`` on every rendered thread comment, including
+        # the root. Degrade gracefully when the root also lacks an anchor.
+        if (not file_path or line <= 0) and thread:
+            root = thread[0]
+            root_path = root.get("file_path") or ""
+            root_line = root.get("line") or 0
+            if root_path and root_line > 0:
+                file_path = root_path
+                line = root_line
+                logger.debug(
+                    "Recovered inline anchor for PR #%s reply from thread root: %s:%s",
+                    pr_number, file_path, line,
+                )
+
         # Fetch Raven's account name once up-front. Used by:
         #   - Non-mention thread verification (below) — only respond when
         #     Raven is already in the thread, so a reply-without-mention
@@ -1982,22 +2005,48 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             prior_verdict = cache_entry.verdict
             prior_body = cache_entry.summary
 
-        # For inline diff comments, pull a line-numbered window of the file
-        # around the commented line and inject it into the prompt so Claude
-        # doesn't have to find the code by parsing hunk headers. Uses the
-        # PR head SHA fetched above; if that fell back to "HEAD", try once
-        # more here in case the earlier call failed transiently.
+        # For inline diff comments, fetch the FULL modified file (capped at
+        # MAX_FILE_LINES, mirroring the review flow's _fetch_changed_files)
+        # and inject it into the prompt so a question about code OUTSIDE the
+        # ±10-line snippet window is answerable. The narrow line-numbered
+        # window is still extracted (it pinpoints the line under discussion),
+        # but the full file is the substantive context.
+        #
+        # Three disclosure signals flow to the prompt so the model never
+        # asserts code it wasn't shown:
+        #   - file_content: full text (only when within the line cap)
+        #   - file_truncated: True when the file exceeds MAX_FILE_LINES
+        #     (full text withheld, omission disclosed)
+        #   - context_fetch_failed: True when the fetch raised (auth/
+        #     transport) — logged at WARNING, disclosed so the model flags
+        #     uncertainty rather than guessing.
         code_snippet = ""
+        file_content = ""
+        file_truncated = False
+        context_fetch_failed = False
         if file_path and line > 0:
             try:
                 snippet_ref = cmd_head_sha
                 if snippet_ref == "HEAD":
                     snippet_ref = provider.get_pr_head_sha(repo_full_name, pr_number)
-                file_content = provider.fetch_file(repo_full_name, file_path, ref=snippet_ref)
-                code_snippet = _extract_code_snippet(file_content, line)
+                fetched = provider.fetch_file(repo_full_name, file_path, ref=snippet_ref)
+                code_snippet = _extract_code_snippet(fetched, line)
+                if fetched:
+                    if fetched.count("\n") <= MAX_FILE_LINES:
+                        file_content = fetched
+                    else:
+                        # Over the line cap — withhold the full text but
+                        # disclose the omission (the snippet still localises
+                        # the discussion).
+                        file_truncated = True
             except Exception as e:
-                logger.debug("Could not fetch code snippet for %s:%s — %s",
-                             file_path, line, e)
+                # WARNING (not debug): a fetch failure here means the model
+                # sees neither the full file nor the focused snippet, so it
+                # must be told to flag uncertainty. The PR-reply still goes
+                # out — degraded, but disclosed.
+                context_fetch_failed = True
+                logger.warning("Could not fetch code context for %s:%s on PR #%s — %s",
+                               file_path, line, pr_number, e)
 
         # Fetch per-repo respond-prompt override from the PR base branch.
         # Reuse the base ref already fetched above for CLAUDE.md when
@@ -2025,6 +2074,9 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 comment_body, conversation, diff, repo_full_name,
                 claude_md=claude_md, file_path=file_path, line=line,
                 code_snippet=code_snippet,
+                file_content=file_content,
+                file_truncated=file_truncated,
+                context_fetch_failed=context_fetch_failed,
                 prompt_override=respond_prompt_override,
                 thread=thread,
                 prior_verdict=prior_verdict,

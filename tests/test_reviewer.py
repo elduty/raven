@@ -1405,3 +1405,902 @@ class TestReviewConfigHashIncludesBackend:
 
         assert hash_a != hash_b
         _reset_backend_cache()
+
+
+# ------------------------------------------------------------------ #
+#  Evidence-grounding filter — drop findings naming a file the model #
+#  was never shown (the "implementation absent" hallucination class). #
+# ------------------------------------------------------------------ #
+
+class TestUngroundedFindingFilter:
+    """``_review_single_chunk`` drops every FRESH finding whose ``file``
+    is not in the set of files actually provided to the model, as a code
+    backstop to the prompt-level grounding rule. The provided set =
+    files in the diff ∪ ``file_contents`` keys ∪ filenames named in
+    ``omitted_files``. File-less findings and ``gap_marker`` findings are
+    never dropped."""
+
+    def _backend(self, monkeypatch, review_json):
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(review_json)
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+        return fake_backend
+
+    def _reset_metrics(self):
+        from raven import metrics
+        with metrics._lock:
+            metrics._counters.clear()
+
+    def _dropped_metric(self, repo="user/repo"):
+        from raven import metrics
+        key = f'raven_ungrounded_findings_dropped_total{{repo="{repo}"}}'
+        with metrics._lock:
+            return metrics._counters.get(key, 0)
+
+    def test_finding_naming_file_in_diff_is_kept(self, monkeypatch):
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [{"severity": "high", "file": "app.py",
+                          "line": 1, "message": "bug here"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        files = [f.get("file") for f in result["findings"]]
+        assert "app.py" in files
+
+    def test_finding_naming_file_only_in_file_contents_is_kept(self, monkeypatch):
+        # The diff touches app.py, but the finding names helper.py which
+        # is only present as attached full-file context. Still grounded.
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "medium", "summary": "s",
+            "findings": [{"severity": "medium", "file": "helper.py",
+                          "message": "context-only file finding"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(
+            diff, "user/repo",
+            file_contents={"app.py": "x = 1\n", "helper.py": "def h(): ...\n"},
+        )
+        files = [f.get("file") for f in result["findings"]]
+        assert "helper.py" in files
+
+    def test_finding_naming_file_only_in_omitted_files_is_kept(self, monkeypatch):
+        # omitted_files entries are human-readable notes
+        # ("<filename> (<reason>)"); the leading filename token still
+        # counts the file as "known to exist", so a finding on it is not
+        # a hallucination.
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "medium", "summary": "s",
+            "findings": [{"severity": "medium", "file": "huge.py",
+                          "message": "finding on a cap-omitted file"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(
+            diff, "user/repo",
+            omitted_files=["huge.py (9001 lines, exceeds the 500-line cap)"],
+        )
+        files = [f.get("file") for f in result["findings"]]
+        assert "huge.py" in files
+
+    def test_finding_naming_unseen_file_is_dropped_and_metric_incremented(self, monkeypatch):
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [
+                {"severity": "high", "file": "app.py", "message": "real"},
+                {"severity": "high", "file": "phantom.py",
+                 "message": "missing validation in code never shown"},
+            ],
+        })
+        self._backend(monkeypatch, review)
+        self._reset_metrics()
+        result = review_diff(diff, "user/repo")
+        files = [f.get("file") for f in result["findings"]]
+        assert "app.py" in files
+        assert "phantom.py" not in files
+        # Exactly the ungrounded one was dropped.
+        assert len(result["findings"]) == 1
+        assert self._dropped_metric() == 1
+
+    def test_fileless_finding_is_never_dropped(self, monkeypatch):
+        # No `file` key at all — the deliberate PR-wide / file-less escape
+        # hatch the grounding prompt allows. Must survive.
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "medium", "summary": "s",
+            "findings": [{"severity": "medium",
+                          "message": "PR-wide concern, no specific file"}],
+        })
+        self._backend(monkeypatch, review)
+        self._reset_metrics()
+        result = review_diff(diff, "user/repo")
+        assert len(result["findings"]) == 1
+        assert "file" not in result["findings"][0]
+        assert self._dropped_metric() == 0
+
+    def test_gap_marker_finding_is_never_dropped(self, monkeypatch):
+        # A gap_marker's `file` is a coverage-gap filename; it must never
+        # be dropped by this filter (guards the coverage-gap lifecycle).
+        # Patch _parse_response so a gap_marker-shaped finding reaches the
+        # filter — _validate_review doesn't pass the flag through from raw
+        # model output, so this exercises the guard directly.
+        import raven.reviewer as rev
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        self._backend(monkeypatch, json.dumps(
+            {"severity": "low", "summary": "s", "findings": []}))
+
+        def _fake_parse(_text):
+            return {
+                "severity": "high", "summary": "s",
+                "findings": [{"severity": "high", "file": "unseen_gap.py",
+                              "gap_marker": True, "message": "⚠️ skipped"}],
+            }
+
+        monkeypatch.setattr(rev, "_parse_response", _fake_parse)
+        self._reset_metrics()
+        result = review_diff(diff, "user/repo")
+        files = [f.get("file") for f in result["findings"]]
+        assert "unseen_gap.py" in files
+        assert self._dropped_metric() == 0
+
+    def test_empty_file_value_is_treated_as_fileless_and_kept(self, monkeypatch):
+        # A finding with file == "" goes through _validate_review's
+        # truthiness check and never gets a `file` key — but guard the
+        # filter directly: an empty/whitespace file is not a hallucinated
+        # filename, it's the file-less bucket. Keep it.
+        import raven.reviewer as rev
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        self._backend(monkeypatch, json.dumps(
+            {"severity": "low", "summary": "s", "findings": []}))
+
+        def _fake_parse(_text):
+            return {
+                "severity": "medium", "summary": "s",
+                "findings": [{"severity": "medium", "file": "   ",
+                              "message": "blank file value"}],
+            }
+
+        monkeypatch.setattr(rev, "_parse_response", _fake_parse)
+        self._reset_metrics()
+        result = review_diff(diff, "user/repo")
+        assert len(result["findings"]) == 1
+        assert self._dropped_metric() == 0
+
+    def test_metric_help_entry_registered(self):
+        from raven import metrics
+        assert "raven_ungrounded_findings_dropped_total" in metrics._METRIC_HELP
+
+    def test_metric_label_uses_repo_name(self, monkeypatch):
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [{"severity": "high", "file": "ghost.py",
+                          "message": "ungrounded"}],
+        })
+        self._backend(monkeypatch, review)
+        self._reset_metrics()
+        review_diff(diff, "acme/widgets")
+        assert self._dropped_metric("acme/widgets") == 1
+
+
+class TestUngroundedFilterChunkedPath:
+    """Each chunk of a chunked review is filtered against THAT chunk's own
+    provided files (its single-file diff + that file's contents), and the
+    consolidation pass still runs on the survivors."""
+
+    def test_each_chunk_filtered_against_its_own_file(self, monkeypatch):
+        # Two files → two chunks. Each chunk's model output names a file
+        # NOT in that chunk (cross-file hallucination) plus its own file.
+        # The cross-file finding must be dropped per-chunk, BEFORE any
+        # consolidation/merge.
+        import raven.reviewer as rev
+        big_diff = (
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + "+l\n" * 200 +
+            "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n" + "+l\n" * 200
+        )
+
+        def _chunk_review_json(fn):
+            other = "b.py" if fn == "a.py" else "a.py"
+            return json.dumps({
+                "severity": "high", "summary": f"rev {fn}",
+                "findings": [
+                    {"severity": "high", "file": fn, "message": f"own {fn}"},
+                    {"severity": "high", "file": other,
+                     "message": f"cross-file phantom about {other}"},
+                ],
+            })
+
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = lambda prompt, **kw: _cr(
+            _chunk_review_json("a.py" if "a/a.py" in prompt else "b.py")
+        )
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["chunked"] is True
+        files = sorted(f.get("file") for f in result["findings"])
+        # Each chunk kept only its own file; both phantoms dropped.
+        assert files == ["a.py", "b.py"]
+
+    def test_consolidation_runs_on_survivors(self, monkeypatch):
+        # With a policy present, the chunked path runs the consolidation
+        # pass. The grounding filter (per-chunk) must run BEFORE it, so the
+        # consolidation input is already free of phantoms.
+        import raven.reviewer as rev
+        captured = {}
+        big_diff = (
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + "+l\n" * 200 +
+            "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n" + "+l\n" * 200
+        )
+
+        # Drive the real _review_single_chunk via a mocked backend so the
+        # grounding filter actually runs, then assert consolidation input.
+        def _chunk_review_json(fn):
+            return json.dumps({
+                "severity": "high", "summary": f"rev {fn}",
+                "findings": [
+                    {"severity": "high", "file": fn, "message": f"own {fn}"},
+                    {"severity": "high", "file": "PHANTOM.py",
+                     "message": "never shown"},
+                ],
+            })
+
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = lambda prompt, **kw: _cr(
+            _chunk_review_json("a.py" if "a/a.py" in prompt else "b.py")
+        )
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        def _fake_consolidate(findings, *args, **kwargs):
+            captured["input"] = list(findings)
+            return {"severity": "high", "summary": "consolidated",
+                    "findings": findings}
+
+        monkeypatch.setattr(rev, "_consolidate_chunked_review", _fake_consolidate)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo",
+                                 claude_md="some policy")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        # Consolidation ran, and its input had NO phantom finding.
+        assert "input" in captured
+        phantom_in_consolidation = [
+            f for f in captured["input"] if f.get("file") == "PHANTOM.py"
+        ]
+        assert phantom_in_consolidation == []
+        assert result.get("consolidated") is True
+
+
+# ------------------------------------------------------------------ #
+#  Grounding filter — path normalization (fail-open from path drift). #
+# ------------------------------------------------------------------ #
+
+class TestUngroundedFilterPathNormalization:
+    """The membership test normalizes BOTH the finding's ``file`` and
+    every ``provided`` entry before comparing — strip a leading git
+    ``a/``/``b/`` prefix and a leading ``./``. Path drift between the
+    model's formatting and the ``split_diff_by_file`` key must NOT cause
+    a REAL finding to be dropped (a false drop lowers surviving-findings
+    severity → can flip toward approve/auto-merge). Case is NOT folded —
+    Linux paths are case-sensitive."""
+
+    def _backend(self, monkeypatch, review_json):
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(review_json)
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+        return fake_backend
+
+    @pytest.fixture(autouse=True)
+    def _clear_metrics(self):
+        from raven import metrics
+        with metrics._lock:
+            metrics._counters.clear()
+        yield
+
+    def _dropped_metric(self, repo="user/repo"):
+        from raven import metrics
+        key = f'raven_ungrounded_findings_dropped_total{{repo="{repo}"}}'
+        with metrics._lock:
+            return metrics._counters.get(key, 0)
+
+    def test_b_prefixed_finding_path_is_kept(self, monkeypatch):
+        # split_diff_by_file yields "src/foo.py" (it strips b/); the model
+        # names the SAME file as "b/src/foo.py". Must be grounded.
+        diff = "diff --git a/src/foo.py b/src/foo.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [{"severity": "high", "file": "b/src/foo.py",
+                          "message": "real bug, git-prefixed path"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        assert len(result["findings"]) == 1
+        assert self._dropped_metric() == 0
+
+    def test_a_prefixed_finding_path_is_kept(self, monkeypatch):
+        diff = "diff --git a/src/foo.py b/src/foo.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [{"severity": "high", "file": "a/src/foo.py",
+                          "message": "real bug, a/ prefix"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        assert len(result["findings"]) == 1
+        assert self._dropped_metric() == 0
+
+    def test_dot_slash_prefixed_finding_path_is_kept(self, monkeypatch):
+        diff = "diff --git a/src/foo.py b/src/foo.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "medium", "summary": "s",
+            "findings": [{"severity": "medium", "file": "./src/foo.py",
+                          "message": "real bug, ./ prefix"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        assert len(result["findings"]) == 1
+        assert self._dropped_metric() == 0
+
+    def test_file_contents_key_with_prefix_normalizes_too(self, monkeypatch):
+        # Normalization is symmetric: a provided file_contents key carrying
+        # a ./ prefix still matches a bare finding path.
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "medium", "summary": "s",
+            "findings": [{"severity": "medium", "file": "lib/util.py",
+                          "message": "finding on a context file"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(
+            diff, "user/repo",
+            file_contents={"app.py": "x\n", "./lib/util.py": "y\n"},
+        )
+        files = [f.get("file") for f in result["findings"]]
+        assert "lib/util.py" in files
+        assert self._dropped_metric() == 0
+
+    def test_genuinely_absent_file_still_dropped_after_normalization(self, monkeypatch):
+        # Normalization must not make the filter toothless: a file that is
+        # absent even after stripping prefixes is still dropped.
+        diff = "diff --git a/src/foo.py b/src/foo.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [
+                {"severity": "high", "file": "b/src/foo.py", "message": "real"},
+                {"severity": "high", "file": "b/src/ghost.py",
+                 "message": "hallucinated, no such file"},
+            ],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        files = [f.get("file") for f in result["findings"]]
+        assert files == ["b/src/foo.py"]   # original string preserved
+        assert self._dropped_metric() == 1
+
+    def test_case_is_not_folded(self, monkeypatch):
+        # Linux paths are case-sensitive: Foo.py != foo.py. A finding
+        # naming a differently-cased file is a genuine miss → dropped.
+        diff = "diff --git a/foo.py b/foo.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [{"severity": "high", "file": "Foo.py",
+                          "message": "case mismatch"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        assert result["findings"] == []
+        assert self._dropped_metric() == 1
+
+
+# ------------------------------------------------------------------ #
+#  Grounding filter — top-level severity recompute after a drop.      #
+# ------------------------------------------------------------------ #
+
+class TestSeverityRecomputeAfterDrop:
+    """Dropping a finding must keep the top-level ``severity`` honest:
+    it is the highest SURVIVING finding's severity (``low`` if none).
+    Otherwise dropping the only high finding leaves ``severity='high'``
+    with no high finding — violating the contract server.py reads for the
+    approve decision and the reviews_total metric."""
+
+    def _backend(self, monkeypatch, review_json):
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(review_json)
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+        return fake_backend
+
+    def test_dropping_only_high_recomputes_to_next_surviving(self, monkeypatch):
+        # high finding is ungrounded (phantom.py), medium finding is real.
+        # After the drop, top-level severity must be 'medium', not 'high'.
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [
+                {"severity": "high", "file": "phantom.py",
+                 "message": "ungrounded high"},
+                {"severity": "medium", "file": "app.py",
+                 "message": "real medium"},
+            ],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        assert result["severity"] == "medium"
+
+    def test_dropping_all_findings_recomputes_to_low(self, monkeypatch):
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [{"severity": "high", "file": "phantom.py",
+                          "message": "the only finding, ungrounded"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        assert result["findings"] == []
+        assert result["severity"] == "low"
+
+    def test_no_drop_leaves_severity_unchanged(self, monkeypatch):
+        # When nothing is dropped, the model's stated severity is honored
+        # as-is (recompute is from surviving findings, which are all of
+        # them) — a 'high' top-level with a single 'high' finding stays.
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [{"severity": "high", "file": "app.py",
+                          "message": "real high"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        assert result["severity"] == "high"
+
+    def test_fileless_finding_preserves_its_severity_in_recompute(self, monkeypatch):
+        # A file-less high finding is never dropped and must still drive
+        # the recomputed top-level severity.
+        diff = "diff --git a/app.py b/app.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [
+                {"severity": "high", "message": "PR-wide, no file"},
+                {"severity": "low", "file": "phantom.py",
+                 "message": "ungrounded low"},
+            ],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        # phantom.py dropped; file-less high kept; severity stays high.
+        assert len(result["findings"]) == 1
+        assert result["severity"] == "high"
+
+
+# ------------------------------------------------------------------ #
+#  Grounding filter — consolidation output re-filtered (chunked).     #
+# ------------------------------------------------------------------ #
+
+class TestConsolidationOutputFiltered:
+    """The consolidation pass makes a SEPARATE AI call whose output is
+    not seen by any per-chunk filter. A consolidation-introduced finding
+    naming a file in NO chunk must be dropped against the UNION of all
+    chunks' provided files; markers and file-less findings are preserved;
+    the consolidated severity is recomputed after."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_metrics(self):
+        from raven import metrics
+        with metrics._lock:
+            metrics._counters.clear()
+        yield
+
+    def _dropped_metric(self, repo="user/repo"):
+        from raven import metrics
+        key = f'raven_ungrounded_findings_dropped_total{{repo="{repo}"}}'
+        with metrics._lock:
+            return metrics._counters.get(key, 0)
+
+    def test_consolidation_phantom_dropped_against_union(self, monkeypatch):
+        import raven.reviewer as rev
+        big_diff = (
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + "+l\n" * 200 +
+            "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n" + "+l\n" * 200
+        )
+
+        # Each chunk reviews clean (no fresh findings); the CONSOLIDATION
+        # call is where the phantom is introduced. b/a.py and b/b.py are
+        # in the union (after normalization); INVENTED.py is in neither.
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(
+            json.dumps({"severity": "low", "summary": "clean", "findings": []}))
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        def _fake_consolidate(findings, *args, **kwargs):
+            return {
+                "severity": "high", "summary": "consolidated",
+                "findings": [
+                    {"severity": "high", "file": "b/a.py",
+                     "message": "real, git-prefixed, in union"},
+                    {"severity": "high", "file": "INVENTED.py",
+                     "message": "consolidation hallucination"},
+                ],
+            }
+
+        monkeypatch.setattr(rev, "_consolidate_chunked_review", _fake_consolidate)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo", claude_md="policy")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        files = [f.get("file") for f in result["findings"]]
+        assert "INVENTED.py" not in files
+        # The grounded (git-prefixed) finding survives.
+        assert "b/a.py" in files
+        assert self._dropped_metric() == 1
+
+    def test_consolidation_severity_recomputed_after_drop(self, monkeypatch):
+        import raven.reviewer as rev
+        big_diff = (
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + "+l\n" * 200 +
+            "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n" + "+l\n" * 200
+        )
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(
+            json.dumps({"severity": "low", "summary": "clean", "findings": []}))
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        def _fake_consolidate(findings, *args, **kwargs):
+            # Consolidation claims 'high', but its only high finding names
+            # an unseen file → dropped → severity must fall to 'medium'.
+            return {
+                "severity": "high", "summary": "consolidated",
+                "findings": [
+                    {"severity": "high", "file": "INVENTED.py",
+                     "message": "phantom high"},
+                    {"severity": "medium", "file": "a.py",
+                     "message": "real medium"},
+                ],
+            }
+
+        monkeypatch.setattr(rev, "_consolidate_chunked_review", _fake_consolidate)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo", claude_md="policy")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["severity"] == "medium"
+        files = [f.get("file") for f in result["findings"]]
+        assert "INVENTED.py" not in files
+
+    def test_consolidation_preserves_markers_and_fileless(self, monkeypatch):
+        # A coverage-gap marker (re-appended after consolidation) and a
+        # file-less consolidation finding must both survive the re-filter.
+        import raven.reviewer as rev
+        big_diff = (
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + "+l\n" * 50 +
+            "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n" + "+l\n" * 400  # oversized → gap
+        )
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(
+            json.dumps({"severity": "low", "summary": "clean", "findings": []}))
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        def _fake_consolidate(findings, *args, **kwargs):
+            return {
+                "severity": "high", "summary": "consolidated",
+                "findings": [
+                    {"severity": "high", "message": "PR-wide, no file"},
+                ],
+            }
+
+        monkeypatch.setattr(rev, "_consolidate_chunked_review", _fake_consolidate)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo", claude_md="policy")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        # The coverage-gap marker for b.py survives (it's re-appended after
+        # consolidation, and its file IS in the diff anyway).
+        markers = [f for f in result["findings"] if f.get("gap_marker")]
+        assert len(markers) == 1
+        assert markers[0]["file"] == "b.py"
+        # The file-less consolidation finding survives.
+        fileless = [f for f in result["findings"]
+                    if "file" not in f and not f.get("gap_marker")]
+        assert len(fileless) == 1
+        assert result.get("coverage_gap") is True
+
+
+# ------------------------------------------------------------------ #
+#  Grounding filter — incremental unchanged_files are grounded.       #
+# ------------------------------------------------------------------ #
+
+class TestUngroundedFilterUnchangedFiles:
+    """In an incremental review the prompt DISCLOSES the unchanged files
+    by name (the scope block lists ``unchanged_files``), exactly like
+    ``omitted_files``. A legitimate cross-file finding anchored to an
+    unchanged-but-disclosed file ("this delta breaks the contract in
+    unchanged.py") must NOT be dropped — dropping it would lower the
+    surviving severity and fail open toward auto-merge."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_metrics(self):
+        from raven import metrics
+        with metrics._lock:
+            metrics._counters.clear()
+        yield
+
+    def _backend(self, monkeypatch, review_json):
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(review_json)
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+        return fake_backend
+
+    def _dropped_metric(self, repo="user/repo"):
+        from raven import metrics
+        key = f'raven_ungrounded_findings_dropped_total{{repo="{repo}"}}'
+        with metrics._lock:
+            return metrics._counters.get(key, 0)
+
+    def test_finding_on_unchanged_disclosed_file_is_kept(self, monkeypatch):
+        # Delta touches a.py; the finding is anchored to b.py, which is
+        # named in unchanged_files (disclosed as existing). Kept.
+        diff = "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [{"severity": "high", "file": "b.py",
+                          "message": "this delta breaks the contract in b.py"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(
+            diff, "user/repo",
+            is_incremental=True, unchanged_files=["b.py"],
+        )
+        files = [f.get("file") for f in result["findings"]]
+        assert "b.py" in files
+        assert self._dropped_metric() == 0
+
+    def test_finding_on_undisclosed_file_still_dropped_in_incremental(self, monkeypatch):
+        # b.py is disclosed (unchanged); ghost.py is in neither the delta
+        # nor unchanged_files → still a hallucination → dropped.
+        diff = "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [
+                {"severity": "high", "file": "b.py", "message": "real cross-file"},
+                {"severity": "high", "file": "ghost.py", "message": "hallucinated"},
+            ],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(
+            diff, "user/repo",
+            is_incremental=True, unchanged_files=["b.py"],
+        )
+        files = [f.get("file") for f in result["findings"]]
+        assert files == ["b.py"]
+        assert self._dropped_metric() == 1
+
+    def test_consolidation_union_includes_unchanged_files(self, monkeypatch):
+        # Chunked incremental: the consolidation re-filter union must also
+        # include unchanged_files, so a consolidation finding on an
+        # unchanged disclosed file survives.
+        import raven.reviewer as rev
+        big_diff = (
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + "+l\n" * 200 +
+            "diff --git a/c.py b/c.py\n@@ -1 +1 @@\n" + "+l\n" * 200
+        )
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(
+            json.dumps({"severity": "low", "summary": "clean", "findings": []}))
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        def _fake_consolidate(findings, *args, **kwargs):
+            return {
+                "severity": "high", "summary": "consolidated",
+                "findings": [
+                    {"severity": "high", "file": "unchanged.py",
+                     "message": "delta breaks unchanged.py"},
+                    {"severity": "high", "file": "INVENTED.py",
+                     "message": "true hallucination"},
+                ],
+            }
+
+        monkeypatch.setattr(rev, "_consolidate_chunked_review", _fake_consolidate)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(
+                big_diff, "user/repo", claude_md="policy",
+                is_incremental=True, unchanged_files=["unchanged.py"],
+            )
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        files = [f.get("file") for f in result["findings"]]
+        assert "unchanged.py" in files       # disclosed → kept
+        assert "INVENTED.py" not in files     # truly absent → dropped
+
+
+# ------------------------------------------------------------------ #
+#  Grounding filter — basename fallback (path-format false-drop).     #
+# ------------------------------------------------------------------ #
+
+class TestUngroundedFilterBasenameFallback:
+    """Normalization only strips ``a/``/``b/``/``./``; a basename-only
+    finding (``foo.py`` vs diff key ``pkg/foo.py``) or extra path
+    components still drift. A finding survives if its normalized path OR
+    its basename matches any provided entry's basename — false keeps are
+    the safe direction (a hallucinated finding sharing a basename with a
+    real file is tolerable; dropping a real finding is not)."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_metrics(self):
+        from raven import metrics
+        with metrics._lock:
+            metrics._counters.clear()
+        yield
+
+    def _backend(self, monkeypatch, review_json):
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(review_json)
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+        return fake_backend
+
+    def _dropped_metric(self, repo="user/repo"):
+        from raven import metrics
+        key = f'raven_ungrounded_findings_dropped_total{{repo="{repo}"}}'
+        with metrics._lock:
+            return metrics._counters.get(key, 0)
+
+    def test_basename_only_finding_is_kept(self, monkeypatch):
+        # diff key is pkg/foo.py; the model names just "foo.py".
+        diff = "diff --git a/pkg/foo.py b/pkg/foo.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [{"severity": "high", "file": "foo.py",
+                          "message": "real bug, basename only"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        assert len(result["findings"]) == 1
+        assert self._dropped_metric() == 0
+
+    def test_extra_path_components_finding_is_kept(self, monkeypatch):
+        # diff key is foo.py; model writes a longer path ending in foo.py.
+        diff = "diff --git a/foo.py b/foo.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "medium", "summary": "s",
+            "findings": [{"severity": "medium", "file": "deep/nested/foo.py",
+                          "message": "same basename, deeper path"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        assert len(result["findings"]) == 1
+        assert self._dropped_metric() == 0
+
+    def test_no_basename_match_anywhere_still_dropped(self, monkeypatch):
+        diff = "diff --git a/pkg/foo.py b/pkg/foo.py\n@@ -1 +1 @@\n+x = 1\n"
+        review = json.dumps({
+            "severity": "high", "summary": "s",
+            "findings": [{"severity": "high", "file": "nonexistent.py",
+                          "message": "no basename match anywhere"}],
+        })
+        self._backend(monkeypatch, review)
+        result = review_diff(diff, "user/repo")
+        assert result["findings"] == []
+        assert self._dropped_metric() == 1
+
+
+# ------------------------------------------------------------------ #
+#  Consolidation severity recompute is conditional on a drop.         #
+# ------------------------------------------------------------------ #
+
+class TestConsolidationSeverityConditional:
+    """The consolidation return recomputes severity ONLY when the
+    re-filter actually dropped a finding — matching the single-chunk
+    guard. When nothing is dropped, the consolidation AI's stated
+    severity is preserved (still floored), not silently replaced."""
+
+    def test_no_drop_preserves_consolidation_severity(self, monkeypatch):
+        # Consolidation returns severity 'high' but its single finding is
+        # severity 'low' and grounded → nothing dropped → top-level stays
+        # 'high' (the consolidation AI's stated value), NOT recomputed to
+        # 'low'. (Severity floor doesn't lower, so 'high' passes through.)
+        import raven.reviewer as rev
+        big_diff = (
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + "+l\n" * 200 +
+            "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n" + "+l\n" * 200
+        )
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(
+            json.dumps({"severity": "low", "summary": "clean", "findings": []}))
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        def _fake_consolidate(findings, *args, **kwargs):
+            return {
+                "severity": "high", "summary": "consolidated",
+                "findings": [
+                    {"severity": "low", "file": "a.py",
+                     "message": "grounded low finding"},
+                ],
+            }
+
+        monkeypatch.setattr(rev, "_consolidate_chunked_review", _fake_consolidate)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo", claude_md="policy")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        # Nothing dropped → consolidation's stated 'high' preserved.
+        assert result["severity"] == "high"
+        assert len(result["findings"]) == 1
+
+    def test_drop_recomputes_consolidation_severity(self, monkeypatch):
+        # Sanity: when a drop DOES happen, severity is recomputed (the
+        # round-1 behavior the coordinator says to keep). Dropping the
+        # only high finding leaves a medium → 'medium'.
+        import raven.reviewer as rev
+        big_diff = (
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + "+l\n" * 200 +
+            "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n" + "+l\n" * 200
+        )
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(
+            json.dumps({"severity": "low", "summary": "clean", "findings": []}))
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        def _fake_consolidate(findings, *args, **kwargs):
+            return {
+                "severity": "high", "summary": "consolidated",
+                "findings": [
+                    {"severity": "high", "file": "INVENTED.py",
+                     "message": "phantom high"},
+                    {"severity": "medium", "file": "a.py",
+                     "message": "real medium"},
+                ],
+            }
+
+        monkeypatch.setattr(rev, "_consolidate_chunked_review", _fake_consolidate)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(big_diff, "user/repo", claude_md="policy")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["severity"] == "medium"

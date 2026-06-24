@@ -71,6 +71,7 @@ _METRIC_HELP: dict[str, str] = {
     "raven_revision_submit_errors_total": "Verdict-revision submit failures.",
     "raven_user_resolved_findings_dropped_total": "User-resolved findings dropped from carry-forward.",
     "raven_carried_findings_dropped_total": "Carried findings dropped by re-validation (model-reported as resolved by the push).",
+    "raven_ungrounded_findings_dropped_total": "Fresh findings dropped for naming a file the model was never shown (evidence-grounding backstop).",
     "raven_cache_save_failures_total": "Findings-cache disk-write failures, by exception type.",
     "raven_review_duration_seconds": "Wall-clock duration of a PR review.",
     "raven_ai_tokens_total": "AI tokens consumed, by kind (input/output).",

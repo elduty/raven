@@ -1,0 +1,23 @@
+{
+  "description": "Diff with an injected SQL-injection defect: a query built by string concatenation / %-formatting of a caller-supplied name. The model must raise at least one finding on api/users.py naming the SQL-injection / unparameterised-query defect class, at medium+ severity.",
+  "repo_name": "golden/real-bug-sql-injection",
+  "expect": {
+    "approvable": false,
+    "must_contain": [
+      {
+        "label": "sql-injection-on-users.py",
+        "file_pattern": "api/users\\.py",
+        "message_patterns": [
+          "sql\\s*injection",
+          "sqli",
+          "parameteri[sz]",
+          "unparameteri[sz]ed",
+          "string\\s+concat",
+          "injection",
+          "untrusted.*quer",
+          "format.*quer|quer.*format"
+        ]
+      }
+    ]
+  }
+}

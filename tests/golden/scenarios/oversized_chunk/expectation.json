@@ -1,0 +1,9 @@
+{
+  "description": "A single-file diff far over the chunk cap. The scenario PINS MAX_DIFF_LINES=50 (the runner monkeypatches reviewer.MAX_DIFF_LINES for this scenario only), so the ~400-line chunk is deterministically > MAX_DIFF_LINES*3 (150) regardless of ambient config. review_diff enters the chunked path, skips the oversized chunk as unreviewable BEFORE any backend dispatch, and must flag a coverage gap so server.py never approves/merges code the model never saw. The pin guarantees this spends no tokens; it asserts review_diff's coverage-gap bookkeeping, not model judgement.",
+  "repo_name": "golden/oversized-chunk",
+  "max_diff_lines": 50,
+  "expect": {
+    "approvable": false,
+    "coverage_gap": true
+  }
+}

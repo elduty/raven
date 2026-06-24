@@ -2408,6 +2408,63 @@ class TestIncrementalReview:
         # Verdict should be REQUEST_CHANGES because carried finding is high
         assert mc.submit_review.call_args.kwargs["approve"] is False
 
+    def test_carried_finding_survives_grounding_filter(self, monkeypatch):
+        """Regression for the evidence-grounding filter: carried findings
+        are merged in server.py from the CACHE, not from review_diff's
+        output, so the grounding filter (which lives inside review_diff
+        and drops fresh findings naming an unseen file) must never touch
+        them. Here the incremental delta contains ONLY a.py, so the
+        review's provided-set is {a.py}; the carried finding names the
+        unchanged b.py — not in the delta. If the filter wrongly reached
+        carried findings, b.py would look 'ungrounded' and be dropped.
+
+        Uses the REAL review_diff (backend mocked) so the actual filter
+        runs, not a hand-mock that bypasses it."""
+        from raven.ai.base import CompletionResult
+        import hashlib, time as _time
+
+        old_hash_a = hashlib.sha256("diff --git a/a.py b/a.py\n+old\n".encode()).hexdigest()
+        hash_b = hashlib.sha256("diff --git a/b.py b/b.py\n+stable\n".encode()).hexdigest()
+        carried = {"severity": "high", "file": "b.py", "line": 10, "message": "carried bug in b"}
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(
+            timestamp=_time.time(),
+            hashes={"a.py": old_hash_a, "b.py": hash_b},
+            findings={"a.py": [], "b.py": [carried]},
+        )
+        # a.py changed, b.py unchanged → incremental delta is a.py only.
+        new_diff = "diff --git a/a.py b/a.py\n+new\ndiff --git a/b.py b/b.py\n+stable\n"
+
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        # Clean fresh review, no dropped_carried → keep everything carried.
+        fake_backend.complete.return_value = CompletionResult(
+            text='{"severity": "low", "summary": "a ok", "findings": []}',
+            input_tokens=0, output_tokens=0, cost_usd=None,
+        )
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        mc = self._make_provider()
+        mc.fetch_pr_diff.return_value = new_diff
+        mc.fetch_file.return_value = ""
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.get_resolved_comment_ids.return_value = set()
+        mc.submit_review.return_value = {"id": 1}
+        mc.add_label_to_pr.return_value = None
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.side_effect = [
+            [],                                                        # auto-add check
+            [{"user": {"login": "Raven"}, "state": "APPROVED"}],      # gate check
+        ]
+        with patch("raven.server.notify"):
+            _process_pr(mc, self._normalized_payload())
+
+        submitted_body = mc.submit_review.call_args[0][2]
+        # The carried b.py finding survived the real grounding filter.
+        assert "carried bug in b" in submitted_body
+        # And it still pins the verdict (high) → not approved.
+        assert mc.submit_review.call_args.kwargs["approve"] is False
+
     def test_incremental_verdict_max_across_all(self):
         """Verdict is max severity across new + carried findings."""
         import hashlib, time as _time
@@ -4088,6 +4145,160 @@ class TestIssueComment:
             mock_respond.return_value = {"response": "the answer", "revise": None, "retract_findings": []}
             _process_comment(mc, self._normalized_comment_payload(is_mention=True))
         mc.get_comment_thread.assert_not_called()
+        mc.post_pr_comment.assert_called_once()
+
+    # ── Comment-reply context recovery (root-anchor fallback + full file) ── #
+
+    def test_reply_recovers_anchor_from_thread_root(self):
+        """A threaded reply carries no anchor of its own (the anchor is on
+        the thread ROOT). When the trigger's file_path/line are empty, the
+        worker must derive them from the root comment so the diff
+        truncation + code context are biased to the right file.
+
+        Regression: replies inside an inline thread used to lose all
+        file/line context (BB DC sends commentParentId but no anchor on
+        the reply; the root carries the anchor)."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "bitbucket-dc"
+        mc.get_authenticated_user.return_value = "Raven"
+        # Root comment (id 700) carries the inline anchor; the reply does not.
+        mc.get_comment_thread.return_value = [
+            {"id": 700, "parent_id": None, "user": {"login": "Raven"},
+             "body": "potential bug here", "file_path": "src/app.py", "line": 42,
+             "resolved": False},
+            {"id": 999, "parent_id": 700, "user": {"login": "alice"},
+             "body": "why?", "file_path": None, "line": None, "resolved": False},
+        ]
+        mc.fetch_pr_diff.return_value = (
+            "diff --git a/src/app.py b/src/app.py\n"
+            "--- a/src/app.py\n+++ b/src/app.py\n"
+            "@@ -40,4 +40,4 @@\n line\n-old\n+new\n line\n"
+        )
+        mc.fetch_file.return_value = "\n".join(f"line {i}" for i in range(1, 60))
+        mc.get_pr_comments.return_value = []
+        payload = self._normalized_comment_payload(is_mention=False)
+        payload["parent_comment_id"] = 700  # reply seeds from root id
+        payload["file_path"] = ""  # reply has no anchor
+        payload["line"] = 0
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {"response": "because X", "revise": None, "retract_findings": []}
+            _process_comment(mc, payload)
+        mock_respond.assert_called_once()
+        kwargs = mock_respond.call_args[1]
+        # The recovered anchor flows to respond_to_comment.
+        assert kwargs["file_path"] == "src/app.py"
+        assert kwargs["line"] == 42
+        # And the recovered path biases the diff truncation so the file
+        # under discussion survives (positional diff arg, index 2).
+        passed_diff = mock_respond.call_args[0][2]
+        assert "src/app.py" in passed_diff
+
+    def test_reply_recovers_anchor_fetches_full_file(self):
+        """After recovering the anchor, the worker fetches the FULL modified
+        file (not just a ±10-line snippet) so a question about code outside
+        the snippet window is answerable."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "bitbucket-dc"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_comment_thread.return_value = [
+            {"id": 700, "parent_id": None, "user": {"login": "Raven"},
+             "body": "finding", "file_path": "src/app.py", "line": 42,
+             "resolved": False},
+            {"id": 999, "parent_id": 700, "user": {"login": "alice"},
+             "body": "why?", "file_path": None, "line": None, "resolved": False},
+        ]
+        mc.fetch_pr_diff.return_value = "diff --git a/src/app.py b/src/app.py\n+x\n"
+        full_file = "\n".join(f"line {i}" for i in range(1, 60))
+        mc.fetch_file.return_value = full_file
+        mc.get_pr_comments.return_value = []
+        payload = self._normalized_comment_payload(is_mention=False)
+        payload["parent_comment_id"] = 700
+        payload["file_path"] = ""
+        payload["line"] = 0
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {"response": "r", "revise": None, "retract_findings": []}
+            _process_comment(mc, payload)
+        kwargs = mock_respond.call_args[1]
+        # The full file content is passed through (new param), not only the
+        # narrow snippet.
+        assert kwargs.get("file_content") == full_file
+
+    def test_reply_over_cap_file_disclosed_not_passed(self):
+        """A modified file exceeding MAX_FILE_LINES is not attached in full;
+        instead the omission is disclosed to the model (file_truncated)."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.fetch_pr_diff.return_value = "diff --git a/big.py b/big.py\n+x\n"
+        # Build a file well over the 500-line cap.
+        big = "\n".join(f"line {i}" for i in range(1, 2000))
+        mc.fetch_file.return_value = big
+        mc.get_pr_comments.return_value = []
+        payload = self._normalized_comment_payload(is_mention=True)
+        payload["file_path"] = "big.py"
+        payload["line"] = 100
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {"response": "r", "revise": None, "retract_findings": []}
+            _process_comment(mc, payload)
+        kwargs = mock_respond.call_args[1]
+        # Over-cap: full content NOT attached, but the truncation is disclosed.
+        assert not kwargs.get("file_content")
+        assert kwargs.get("file_truncated") is True
+
+    def test_reply_fetch_failure_disclosed(self):
+        """When the file fetch raises, the worker tells the model the code
+        context couldn't be fetched (context_fetch_failed) so it flags
+        uncertainty instead of guessing."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.fetch_pr_diff.return_value = "diff --git a/a.py b/a.py\n+x\n"
+
+        def fetch_file(repo, path, ref="HEAD"):
+            if path == "CLAUDE.md":
+                return ""  # CLAUDE.md absent — not the failure under test
+            raise RuntimeError("500 fetching file")
+
+        mc.fetch_file.side_effect = fetch_file
+        mc.get_pr_comments.return_value = []
+        payload = self._normalized_comment_payload(is_mention=True)
+        payload["file_path"] = "a.py"
+        payload["line"] = 10
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {"response": "r", "revise": None, "retract_findings": []}
+            _process_comment(mc, payload)
+        kwargs = mock_respond.call_args[1]
+        assert kwargs.get("context_fetch_failed") is True
+
+    def test_reply_no_anchor_and_root_anchorless_degrades(self):
+        """A flat (non-inline) reply where the thread root ALSO has no
+        anchor must degrade gracefully — no anchor recovered, no file
+        content fetched, the reply still posts."""
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "bitbucket-dc"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_comment_thread.return_value = [
+            {"id": 700, "parent_id": None, "user": {"login": "Raven"},
+             "body": "general note", "file_path": None, "line": None,
+             "resolved": False},
+            {"id": 999, "parent_id": 700, "user": {"login": "alice"},
+             "body": "follow up", "file_path": None, "line": None, "resolved": False},
+        ]
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.get_pr_comments.return_value = []
+        payload = self._normalized_comment_payload(is_mention=False)
+        payload["parent_comment_id"] = 700
+        payload["file_path"] = ""
+        payload["line"] = 0
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            mock_respond.return_value = {"response": "r", "revise": None, "retract_findings": []}
+            _process_comment(mc, payload)
+        kwargs = mock_respond.call_args[1]
+        assert kwargs["file_path"] == ""
+        assert not kwargs.get("file_content")
+        assert not kwargs.get("file_truncated")
+        assert not kwargs.get("context_fetch_failed")
         mc.post_pr_comment.assert_called_once()
 
     def test_respond_threads_prompt_override_from_base_branch(self):

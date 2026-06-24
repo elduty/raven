@@ -1,0 +1,18 @@
+diff --git a/utils/text.py b/utils/text.py
+--- a/utils/text.py
++++ b/utils/text.py
+@@ -2,8 +2,12 @@
+ 
+ 
+ def slugify(value: str) -> str:
+-    """Lowercase a string and replace spaces with hyphens."""
+-    return value.lower().replace(" ", "-")
++    """Lowercase a string and replace runs of whitespace with single hyphens.
++
++    Leading/trailing whitespace is stripped first so the result never
++    starts or ends with a hyphen.
++    """
++    return "-".join(value.lower().split())
+ 
+ 
+ def truncate(value: str, limit: int) -> str:

@@ -1,0 +1,16 @@
+{
+  "description": "Tests-only diff (PR #157/#160 trap). The implementation under test already exists in billing/discount.py (supplied as an unchanged-file body) and the pass is declared incremental. The model must NOT raise a confident false finding that the implementation is missing/absent/not-implemented.",
+  "repo_name": "golden/tests-only-no-phantom-absence",
+  "is_incremental": true,
+  "unchanged_files": ["billing/discount.py"],
+  "file_contents": {
+    "billing/discount.py": "files/discount.py"
+  },
+  "expect": {
+    "negatives": 1,
+    "must_not_contain_patterns": [
+      "\\b(implementation|function|module|code|apply_discount)\\b[^.\\n]{0,40}\\b(is\\s+)?(missing|absent|not\\s+implemented|never\\s+implemented|does\\s+not\\s+exist|undefined|not\\s+defined)\\b",
+      "\\b(missing|absent|not\\s+implemented|never\\s+implemented|does\\s+not\\s+exist)\\b[^.\\n]{0,40}\\b(implementation|apply_discount|the\\s+function|the\\s+module)\\b"
+    ]
+  }
+}

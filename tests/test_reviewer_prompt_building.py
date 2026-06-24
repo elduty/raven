@@ -1466,6 +1466,72 @@ class TestRespondPromptBuilding:
         assert "**alice [id=2]:** Reply" in prompt
         assert "earlier replies truncated" not in prompt
 
+    # ── Full-file code context (replaces / augments the ±10-line snippet) ── #
+
+    def test_full_file_content_rendered_untrusted(self, monkeypatch):
+        """The full modified file is rendered in an untrusted-wrapped
+        repo_file block so a question about code outside the ±10-line
+        snippet window is answerable."""
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        file_body = "def foo():\n    return 1\n\ndef bar():\n    return 2\n"
+        respond_to_comment(
+            comment_body="what does bar do?", conversation=[], diff="",
+            repo_name="u/r", file_path="a.py", line=2,
+            file_content=file_body,
+        )
+        prompt = captured["prompt"]
+        # Full file appears, inside an untrusted repo_file block.
+        assert "def bar():" in prompt
+        assert 'type="repo_file"' in prompt
+        # The file path is named so the model knows what it's looking at.
+        assert "a.py" in prompt
+
+    def test_over_cap_file_disclosed_not_rendered(self, monkeypatch):
+        """When file_truncated=True (file exceeds MAX_FILE_LINES), the
+        prompt discloses the omission rather than silently dropping it,
+        and does not attach the (absent) full content."""
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        respond_to_comment(
+            comment_body="?", conversation=[], diff="", repo_name="u/r",
+            file_path="big.py", line=100,
+            file_content="", file_truncated=True,
+        )
+        prompt = captured["prompt"]
+        # Disclosure mentions the file and the cap so the model knows its
+        # evidence is incomplete.
+        assert "big.py" in prompt
+        assert "MAX_FILE_LINES" in prompt
+        assert "couldn't be fetched" not in prompt.lower()
+
+    def test_fetch_failure_disclosed_in_prompt(self, monkeypatch):
+        """When context_fetch_failed=True, the prompt tells the model the
+        code context couldn't be fetched so it flags uncertainty instead
+        of asserting code it never saw."""
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        respond_to_comment(
+            comment_body="?", conversation=[], diff="", repo_name="u/r",
+            file_path="a.py", line=10,
+            file_content="", context_fetch_failed=True,
+        )
+        prompt = captured["prompt"].lower()
+        assert "could not be fetched" in prompt or "couldn't be fetched" in prompt
+
+    def test_no_file_context_blocks_when_nothing_to_show(self, monkeypatch):
+        """No file_content, no truncation, no failure → no file-context
+        block at all (back-compat with flat-comment replies)."""
+        captured = self._capture_prompt(monkeypatch)
+        from raven.reviewer import respond_to_comment
+        respond_to_comment(
+            comment_body="hi", conversation=[], diff="", repo_name="u/r",
+        )
+        prompt = captured["prompt"]
+        assert 'type="repo_file"' not in prompt
+        assert "MAX_FILE_LINES" not in prompt
+        assert "could not be fetched" not in prompt.lower()
+
 
 class TestRespondJsonContract:
     """Verify _parse_respond_output's enforcement of the JSON schema."""
@@ -1587,3 +1653,189 @@ class TestRespondJsonContract:
         assert "## Output format (required)" in captured["prompt"]
         assert "JSON object" in captured["prompt"]
         assert free_form_override in captured["prompt"]
+
+
+class TestGroundingTailReminder:
+    """Evidence-grounding (TODO item 1a, prompt half): every finding must
+    cite code actually present in the prompt, and that rule is restated at
+    the very tail of the assembled prompt — after the diff / file-contents
+    / carried-findings sections — so it is the LAST framing the model reads
+    before answering.
+
+    The static review template (prompts/review.md → _REVIEW_PROMPT_TEMPLATE)
+    is concatenated BEFORE the runtime evidence sections in
+    _review_single_chunk, so a reminder living only in the template is
+    buried mid-prompt. These tests prove the reminder lands after the
+    ``## Diff to Review`` marker in the fully assembled prompt string, which
+    is the property that actually changes model behaviour. The diff-anchored
+    reminder is scoped to the single-chunk path only — the chunked
+    consolidation pass has no diff in its prompt, so it deliberately omits it.
+    """
+
+    def _capture(self, monkeypatch, **kwargs):
+        """Run review_diff with a prompt-capturing stub backend and return
+        the single-chunk prompt it sent."""
+        from raven.reviewer import review_diff
+        captured = {}
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+
+        def fake_complete(prompt, **_kw):
+            captured["prompt"] = prompt
+            return _cr('{"severity":"low","summary":"ok","findings":[]}')
+
+        fake_backend.complete.side_effect = fake_complete
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+        review_diff("diff --git a/x.py b/x.py\n+line\n", "owner/repo", **kwargs)
+        return captured["prompt"]
+
+    def test_review_template_carries_grounding_rule(self):
+        """(a) The strengthened grounding rule lives in the review prompt
+        template: every finding must cite a line/snippet actually present,
+        and a claim about code not shown must be dropped or downgraded."""
+        from raven.reviewer import _REVIEW_PROMPT_TEMPLATE
+        lowered = _REVIEW_PROMPT_TEMPLATE.lower()
+        assert "actually present" in lowered
+        # Folded into the existing "assumptions as certainty" bullet, not
+        # a second redundant bullet.
+        assert lowered.count("do not present assumptions as certainty") == 1
+        # The drop-or-downgrade escape hatch for unshown code.
+        assert "do not assert it as a finding" in lowered
+        # The PR-wide / file-less escape hatch is preserved — a legitimately
+        # location-less finding (missing test/guard) is still allowed.
+        assert "required pr-wide" in lowered
+
+    def test_tail_reminder_present(self, monkeypatch):
+        """The 'Before You Output' grounding reminder is appended to the
+        assembled single-chunk prompt."""
+        prompt = self._capture(monkeypatch)
+        assert "## Before You Output" in prompt
+        assert "actually present" in prompt.lower()
+        # One-line severity reminder rides along at the tail.
+        assert "top-level `severity`" in prompt
+
+    def test_tail_reminder_follows_diff_marker(self, monkeypatch):
+        """(b) Recency: the reminder must appear AFTER ``## Diff to Review``
+        in the final assembled prompt. The diff section is concatenated at
+        runtime (after the template), so a reminder placed only in the
+        template would precede the diff — this guards that the reminder is
+        genuinely last."""
+        prompt = self._capture(monkeypatch)
+        idx_diff = prompt.find("## Diff to Review")
+        idx_reminder = prompt.find("## Before You Output")
+        assert idx_diff != -1 and idx_reminder != -1
+        assert idx_diff < idx_reminder
+
+    def test_tail_reminder_after_file_and_carried_sections(self, monkeypatch):
+        """The reminder is the absolute tail — it follows the full file
+        contents and the carried-findings block too, not just the diff.
+        Those sections are appended after the diff, so a reminder wedged
+        between diff and files would not be last."""
+        prompt = self._capture(
+            monkeypatch,
+            file_contents={"x.py": "UNIQUE-FILE-CONTENT-MARKER"},
+            carried_findings=[{"severity": "high", "file": "y.py", "line": 3,
+                               "message": "UNIQUE-CARRIED-MARKER"}],
+        )
+        idx_files = prompt.find("UNIQUE-FILE-CONTENT-MARKER")
+        idx_carried = prompt.find("UNIQUE-CARRIED-MARKER")
+        idx_reminder = prompt.find("## Before You Output")
+        assert idx_files != -1 and idx_carried != -1 and idx_reminder != -1
+        assert idx_files < idx_reminder
+        assert idx_carried < idx_reminder
+
+    def test_no_carried_carveout_without_carried_findings(self, monkeypatch):
+        """A plain (non-incremental, no carried) single-chunk review gets the
+        bare grounding+severity reminder with NO carried-findings carve-out —
+        there is nothing to carve out."""
+        prompt = self._capture(monkeypatch)
+        assert "## Before You Output" in prompt
+        assert "Prior Findings From Unchanged Files' block is the exception" not in prompt
+        # Severity sentence is still the tail.
+        assert prompt.rstrip().endswith("`low` when there are none.")
+
+    def test_carried_carveout_present_on_incremental_single_chunk(self, monkeypatch):
+        """The single-chunk incremental path (carried findings present) is
+        exactly where the 'drop what you weren't shown' rule would collide
+        with the carry-forward re-validation block: carried findings cite
+        UNCHANGED-file code not in the delta, so under the bare rule they read
+        as ungrounded and the maximally-obeyed tail could push the model to
+        list their carry_ids in `dropped_carried` on the wrong basis. The
+        carve-out exempts carried findings and pins the only valid drop basis
+        to 'this push resolves it' + `dropped_carried`."""
+        prompt = self._capture(
+            monkeypatch,
+            is_incremental=True,
+            unchanged_files=["other.py"],
+            carried_findings=[{"severity": "high", "file": "other.py", "line": 9,
+                               "message": "carried issue"}],
+        )
+        assert "## Before You Output" in prompt
+        # The carve-out names the carried block and the correct drop mechanism.
+        assert "'Prior Findings From Unchanged Files' block is the exception" in prompt
+        assert "do NOT drop or downgrade them merely because" in prompt
+        assert "`dropped_carried`" in prompt
+        # Carve-out sits AFTER the bare grounding rule but BEFORE the severity
+        # sentence, which must remain the final instruction.
+        idx_ground = prompt.find("If a finding depends on code you were not shown")
+        idx_carve = prompt.find("'Prior Findings From Unchanged Files' block is the exception")
+        idx_sev = prompt.find("Set the top-level `severity`")
+        assert idx_ground != -1 and idx_carve != -1 and idx_sev != -1
+        assert idx_ground < idx_carve < idx_sev
+        # And the whole reminder is still the tail of the prompt.
+        assert prompt.rstrip().endswith("`low` when there are none.")
+
+    def test_consolidation_prompt_omits_diff_anchored_tail_reminder(self, monkeypatch):
+        """(c) The chunked-consolidation pass must NOT carry the diff-anchored
+        tail reminder. That reminder requires each finding to anchor to "the
+        diff or file contents shown above", but consolidation is fed only the
+        aggregated chunk findings + policy blocks — never the diff (the diff
+        was chunked precisely because it's too large for one call). Appending
+        it would make the rule's premise false for every already-validated
+        finding and risk a drop/downgrade that flips the final verdict toward
+        approve+auto-merge on large PRs. Grounding is enforced at the chunk
+        level; this pass only ranks/dedups and is already forbidden from
+        adding ungrounded findings."""
+        import json
+        from raven.reviewer import _consolidate_chunked_review
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(json.dumps(
+            {"severity": "low", "summary": "ok", "findings": []}
+        ))
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+        _consolidate_chunked_review(
+            findings=[{"severity": "high", "message": "UNIQUE-CHUNK-FINDING"}],
+            base_severity="high",
+            summary="merged",
+            rules={".claude/rules/policy.md": "Max 2 findings."},
+            claude_md="Project uses Python 3.12.",
+            repo_name="user/repo",
+        )
+        prompt = fake_backend.complete.call_args.args[0]
+        assert "UNIQUE-CHUNK-FINDING" in prompt
+        # The diff-anchored reminder belongs only to the single-chunk path.
+        assert "## Before You Output" not in prompt
+        assert "actually present in the diff or file contents" not in prompt
+
+    def test_respond_prompt_mirrors_grounding_line(self, monkeypatch):
+        """(d) The respond prompt mirrors the grounding rule: ground replies
+        in the provided evidence, don't assert code you weren't shown —
+        consistent with the review-side strengthening (PR #190 spirit)."""
+        captured = {}
+        from raven.ai.base import AIBackend
+
+        class _Stub(AIBackend):
+            name = "stub"
+
+            def complete(self, prompt, **kwargs):
+                captured["prompt"] = prompt
+                return _cr('{"response": "ok", "revise": null, "retract_findings": []}')
+
+        monkeypatch.setattr("raven.reviewer.get_backend", lambda: _Stub())
+        from raven.reviewer import respond_to_comment
+        respond_to_comment(comment_body="?", conversation=[], diff="",
+                           repo_name="u/r")
+        lowered = captured["prompt"].lower()
+        assert "ground your reply in the provided evidence" in lowered
+        assert "don't assert code or behavior you weren't shown" in lowered
