@@ -20,11 +20,12 @@ from pathlib import Path
 
 from flask import Flask, abort, jsonify, request
 
-from .providers import GitProvider, DiffTruncatedError, get_provider, register_provider, registered_providers
+from .providers import GitProvider, DiffTruncatedError, DiffUnverifiableError, get_provider, register_provider, registered_providers
 from .providers.gitea import GiteaProvider
 from .metrics import add, inc, Timer, format_prometheus
 from .notifier import notify
 from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, MAX_DIFF_LINES, terminate_active_processes, RespondParseError, RAVEN_AI_MODEL, RAVEN_AI_EFFORT, RAVEN_AI_TIMEOUT, RAVEN_AI_RETRY
+from .ai import get_backend
 from .ai.base import AIError
 
 _SEVERITY_NAME = {v: k for k, v in SEVERITY_ORDER.items()}
@@ -38,9 +39,17 @@ def _review_failure_reason(exc: Exception) -> str:
     truncated/partial diff — too large for the platform's diff limit) maps
     to ``"diff_truncated"``. Anything else (a non-AI bug in the flow, an
     out-of-tree backend raising plain ``RuntimeError``) is ``"unknown"``.
+
+    ``DiffUnverifiableError`` is checked FIRST because it subclasses
+    ``DiffTruncatedError`` — the two need different operator advice
+    ("split the PR" is wrong when the problem is a response format we
+    can't inspect), and an isinstance test against the parent would
+    swallow the subclass.
     """
     if isinstance(exc, AIError):
         return exc.reason
+    if isinstance(exc, DiffUnverifiableError):
+        return "diff_unverifiable"
     if isinstance(exc, DiffTruncatedError):
         return "diff_truncated"
     return "unknown"
@@ -88,6 +97,17 @@ _FAILURE_MESSAGES = {
         "into smaller changes, or raise the server's diff size limit "
         "(`diff.max.lines` / related `*.diff.*` properties), then push a commit "
         "to re-trigger."
+    ),
+    "diff_unverifiable": (
+        "🔍 Raven could not verify that it received the **complete** diff. "
+        "Bitbucket returned it in a format that carries no truncation "
+        "information, so a diff cut off at the server's size limit would be "
+        "indistinguishable from a whole one — and Raven won't review a diff it "
+        "can't confirm is complete (it could otherwise approve or merge code it "
+        "never saw). This is a server-side configuration issue, not a problem "
+        "with the PR: the Bitbucket instance needs to serve "
+        "`/pull-requests/{id}/diff` as `application/json`. Splitting the PR "
+        "will not help."
     ),
     "unknown": (
         "⚠️ Internal error — review could not be completed. Check the service "
@@ -530,6 +550,58 @@ def _comment_tags_raven(body: str, names: list[str]) -> bool:
     return bool(re.search(pattern, cleaned, re.IGNORECASE))
 
 
+# ── Startup config validation ─────────────────────────────────────── #
+_KNOWN_AI_EFFORTS = {"none", "low", "medium", "high", "max"}
+# Match ``--workers N`` or ``-w N`` (space or =) inside GUNICORN_CMD_ARGS.
+_WORKER_ARG_RE = re.compile(r"(?:--workers|-w)[=\s]+(\d+)")
+
+
+def _warn_unknown_ai_effort() -> None:
+    """WARN (not fail) on an unrecognized ``RAVEN_AI_EFFORT`` /
+    ``RAVEN_AI_EFFORT_COMMENT``. An unknown effort is a silent footgun on the
+    openai_compatible backend — ``_EFFORT_TO_REASONING`` maps it to ``None``,
+    disabling reasoning entirely, indistinguishable from a deliberate
+    ``none``. Only an explicitly-set unknown value warns; unset (the default)
+    is fine. (audit 07-02 #4)"""
+    for var in ("RAVEN_AI_EFFORT", "RAVEN_AI_EFFORT_COMMENT"):
+        raw = os.environ.get(var, "")
+        if raw.strip() and raw.strip().lower() not in _KNOWN_AI_EFFORTS:
+            logger.warning(
+                "%s=%r is not a recognized effort %s — the openai_compatible "
+                "backend maps unknown values to no reasoning (silently "
+                "disabling it); claude_cli passes it through to the CLI.",
+                var, raw, sorted(_KNOWN_AI_EFFORTS),
+            )
+
+
+def _assert_single_worker() -> None:
+    """Fail fast on a multi-worker gunicorn deploy. Raven's dedup /
+    in-progress / findings-cache state is all process-local, so >1 worker
+    silently disables the double-review and double-merge guards (each worker
+    keeps its own copy). Detect the common signals — ``WEB_CONCURRENCY`` and a
+    ``--workers``/``-w`` flag in ``GUNICORN_CMD_ARGS`` — and raise.
+
+    NOTE: a ``--workers N`` flag baked directly into the gunicorn CMD is argv
+    on the master process and NOT visible in the worker's environment, so this
+    is best-effort; the README documents the single-worker requirement.
+    (audit-06-13 #9)"""
+    def _too_many(n: str) -> bool:
+        return n.isdigit() and int(n) > 1
+
+    msg = (
+        "Raven requires a single gunicorn worker but {n} are configured "
+        "({src}). All dedup / in-progress / findings-cache state is "
+        "process-local, so >1 worker silently disables the double-review and "
+        "double-merge guards. Set WEB_CONCURRENCY=1 and use --workers 1."
+    )
+    wc = os.environ.get("WEB_CONCURRENCY", "").strip()
+    if _too_many(wc):
+        raise RuntimeError(msg.format(n=wc, src="WEB_CONCURRENCY"))
+    m = _WORKER_ARG_RE.search(os.environ.get("GUNICORN_CMD_ARGS", ""))
+    if m and _too_many(m.group(1)):
+        raise RuntimeError(msg.format(n=m.group(1), src="GUNICORN_CMD_ARGS"))
+
+
 # ------------------------------------------------------------------ #
 #  App factory                                                         #
 # ------------------------------------------------------------------ #
@@ -547,7 +619,23 @@ def create_app() -> Flask:
     bb_dc_secret = os.environ.get("BITBUCKET_DC_WEBHOOK_SECRET")
     if bb_dc_url and bb_dc_token and bb_dc_secret:
         from .providers.bitbucket_dc import BitbucketDCProvider
-        bb_dc_username = os.environ.get("BITBUCKET_DC_USERNAME", "")
+        bb_dc_username = os.environ.get("BITBUCKET_DC_USERNAME", "").strip()
+        # Fail fast rather than at submit time. BB DC tokens have no whoami
+        # endpoint, so get_authenticated_user() raises without this value —
+        # and it is called ONLY on submit_review's needs-work path. The
+        # resulting failure is asymmetric and confusing: approvals post
+        # normally while every review WITH findings raises and the author
+        # sees a generic internal-error comment instead of the findings.
+        # The "no providers configured" message below already lists this
+        # variable as required; this makes the code agree. (audit 07-30)
+        if not bb_dc_username:
+            raise RuntimeError(
+                "BITBUCKET_DC_USERNAME is required when Bitbucket DC is "
+                "configured. BB DC tokens expose no whoami endpoint, so Raven "
+                "cannot resolve its own account without it — reviews that "
+                "request changes would fail at submit time while approvals "
+                "succeeded. Set it to the service account's BB DC slug."
+            )
         register_provider("bitbucket-dc", BitbucketDCProvider(
             bb_dc_url, bb_dc_token, bb_dc_secret, username=bb_dc_username,
         ))
@@ -560,6 +648,10 @@ def create_app() -> Flask:
             "No git providers configured. Set GITEA_URL + GITEA_TOKEN + GITEA_WEBHOOK_SECRET, "
             "or BITBUCKET_DC_URL + BITBUCKET_DC_TOKEN + BITBUCKET_DC_WEBHOOK_SECRET + BITBUCKET_DC_USERNAME."
         )
+
+    # Enforce the single-worker invariant before anything else (all safety
+    # state is process-local).
+    _assert_single_worker()
 
     app = Flask(__name__)
 
@@ -574,6 +666,13 @@ def create_app() -> Flask:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
+
+    # Validate the AI backend at startup (fail fast, like the provider check
+    # above) rather than surfacing an opaque per-PR error while /healthz still
+    # reads healthy. get_backend() raises on missing creds / unknown backend
+    # and caches the instance; the effort warning is advisory. (audit 07-02 #4)
+    get_backend()
+    _warn_unknown_ai_effort()
 
     _load_cache()
 
@@ -1532,7 +1631,11 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # Submit formal review — must succeed before dismissing old reviews.
         # Verdict + inline comments are computed first; the inline-mode body
         # (below) needs to know whether anything was posted inline.
-        approve_sev = os.environ.get("REVIEW_APPROVE_MAX_SEVERITY", "low")
+        # Normalized (strip + lower) so a capitalized/padded value can't read
+        # as an unknown severity → 0 → the strictest 'low' threshold. Mirrors
+        # reviewer._coverage_gap_floor's .lower() so both readers of this env
+        # var agree (audit 07-02 #3).
+        approve_sev = os.environ.get("REVIEW_APPROVE_MAX_SEVERITY", "low").strip().lower()
         approve = severity_gte(approve_sev, review["severity"])
         # Coverage gap forces needs_work: a formal APPROVE is externally
         # visible (branch protection counts bot approvals; humans trust

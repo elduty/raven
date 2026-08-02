@@ -194,7 +194,7 @@ All configuration is via environment variables. See `config.example.env` for the
 | `BITBUCKET_DC_URL` | BB DC | — | Bitbucket Data Center base URL. Enables BB DC provider when set with token + secret + username. |
 | `BITBUCKET_DC_TOKEN` | BB DC | — | BB DC personal access token (Repository Write + Pull Request Write). |
 | `BITBUCKET_DC_WEBHOOK_SECRET` | BB DC | — | HMAC-SHA256 secret for BB DC webhooks. |
-| `BITBUCKET_DC_USERNAME` | BB DC | — | BB DC service account username (slug). Required for identity checks. |
+| `BITBUCKET_DC_USERNAME` | BB DC | — | BB DC service account username (slug). **Required whenever Bitbucket DC is configured — startup fails without it.** BB DC tokens expose no whoami endpoint, so Raven cannot resolve its own identity any other way, and identity drives the sole-reviewer merge gate, self-comment filtering, and the needs-work verdict call. |
 
 ### AI backend
 
@@ -333,8 +333,9 @@ entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start
 
 ### Safety gates
 
-- **Startup assertion**: refuses to start without at least one complete provider config (Gitea or Bitbucket DC)
-- **Empty diff guard**: diffs empty after stripping lockfiles/binaries are not sent to Claude
+- **Startup assertion**: refuses to start without at least one complete provider config (Gitea or Bitbucket DC), without a usable AI backend (missing/unknown credentials fail fast at boot rather than as an opaque per-PR error), or with more than one gunicorn worker configured via `WEB_CONCURRENCY` / `GUNICORN_CMD_ARGS` — all dedup/in-progress/cache state is process-local, so Raven must run a **single worker** (the Docker `CMD` pins `--workers 1`)
+- **Empty diff guard**: diffs empty after stripping lockfiles/binaries are not sent to the model
+- **Diff-completeness gate** (Bitbucket DC): Raven refuses to review a diff it cannot confirm is whole. BB DC caps diff size and flags truncation at every level (overall / per-file / hunk / segment / line) — any flag set and the review is refused rather than run on a partial change. Those flags exist **only** in the JSON representation, so Raven requests JSON explicitly and refuses a non-JSON response too: a plain-text diff sitting at the server's `diff.max.lines` cap is indistinguishable from a complete one. Both cases fail closed across the review, comment-reply, and cached-merge paths, so code the model never saw can't be approved or merged
 - **Parse error guard**: unparseable review output blocks merge and sends notification
 - **Review-before-merge**: if submitting the review fails, the PR is not merged
 - **Sole reviewer gate**: only merges when Raven is the only reviewer (no human reviews or requests)
@@ -344,26 +345,43 @@ entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start
 - **Consolidated incremental reviews**: findings from unchanged files are re-validated by the model (explicit-drop contract — a malformed answer keeps everything) and included in the verdict; drops apply to the cache only after the review posts, and resolve their inline threads
 - **Coverage-gap guard**: oversized or failed review chunks set a sticky per-file gap — the verdict is forced to `needs_work` and both merge paths refuse auto-merge until the gap files are re-reviewed cleanly (or leave the PR)
 - **Stale review dismissal**: previous Raven reviews dismissed after new review is posted
-- **Cache invalidation**: findings cache wiped automatically on model or prompt change
-- **Classified failure handling**: AI failures are classified (`timeout` / `rate_limit` / `backend_5xx` / `usage_limit` / `auth` / `unknown`); transient classes retry once (`RAVEN_AI_RETRY`) and the posted comment names the cause and the actionable next step (e.g. "raise `RAVEN_AI_TIMEOUT`", "resets on the next push") instead of an opaque "internal error". Counted in `raven_review_failures_total{reason,repo}`. Comment text is static per-reason — no exception detail is interpolated, so credential-bearing error strings can't leak. Dedup entry is cleared so a webhook retry can re-attempt.
+- **Cache invalidation**: findings cache wiped automatically when the review config changes — AI backend, model, effort, prompt, **or the verdict-gating settings** (`REVIEW_APPROVE_MAX_SEVERITY`, `RAVEN_REVIEW_MODE`) — so a cached approve can't outlive the policy that produced it and auto-merge under a stricter one
+- **Classified failure handling**: failures are classified (`timeout` / `rate_limit` / `backend_5xx` / `usage_limit` / `auth` / `diff_truncated` / `diff_unverifiable` / `unknown`); transient classes retry once (`RAVEN_AI_RETRY`) and the posted comment names the cause and the actionable next step (e.g. "raise `RAVEN_AI_TIMEOUT`", "resets on the next push") instead of an opaque "internal error". Counted in `raven_review_failures_total{reason,repo}`. Comment text is static per-reason — no exception detail is interpolated, so credential-bearing error strings can't leak. Dedup entry is cleared so a webhook retry can re-attempt.
 - **Always 200**: all webhook responses return HTTP 200 to prevent retry loops
 - **Graceful shutdown**: on SIGTERM, queued reviews and CI-wait tasks are cancelled and in-flight Claude CLI subprocesses are SIGTERMed so gunicorn's graceful-shutdown window isn't consumed by discarded work
 
 ### Metrics
 
 `/metrics` endpoint exposes Prometheus-format counters:
+**Reviews & merges**
 - `raven_reviews_total{severity,repo}` — review count
-- `raven_review_duration_seconds{repo}` — Claude CLI call duration
+- `raven_review_duration_seconds{repo}` — wall-clock duration of a review
 - `raven_merges_total{repo}` — successful auto-merges
-- `raven_errors_total{type,repo}` — errors by type
-- `raven_review_failures_total{reason,repo}` — classified review failures (`reason` = `timeout`/`rate_limit`/`backend_5xx`/`usage_limit`/`auth`/`unknown`)
+- `raven_cached_merge_dispatch_total{outcome,repo}` — auto-merges dispatched from a cached approve verdict without a fresh review pass (`outcome` = `dispatched` or `declined_<reason>`)
+- `raven_auto_merge_queued_total{repo}` — merges queued via Gitea's native merge-when-checks-succeed
 - `raven_ci_failures_total{repo}` — CI failures
-- `raven_responses_total{repo}` — comment responses
 - `raven_reviews_skipped_total{reason,repo}` — skipped reviews
-- `raven_verdict_revisions_total{repo,from,to}` — comment-driven verdict revisions
-- `raven_retractions_total{repo,result}` — comment-driven finding retractions
+
+**Failures**
+- `raven_errors_total{type,repo}` — errors by type
+- `raven_review_failures_total{reason,repo}` — classified review failures (`reason` = `timeout`/`rate_limit`/`backend_5xx`/`usage_limit`/`auth`/`diff_truncated`/`diff_unverifiable`/`unknown`)
 - `raven_response_parse_errors_total{repo}` — AI JSON parse failures
 - `raven_revision_submit_errors_total{repo}` — verdict-revision `submit_review` failures
+- `raven_cache_save_failures_total{reason}` — findings-cache disk-write failures
+
+**Finding lifecycle**
+- `raven_ungrounded_findings_dropped_total{repo}` — fresh findings dropped for naming a file the model was never shown
+- `raven_findings_capped_total{repo}` — findings dropped by the per-PR cap on chunked reviews in repos with no rules/`CLAUDE.md`
+- `raven_user_resolved_findings_dropped_total{repo}` — findings dropped because the developer resolved them in the platform UI
+- `raven_carried_findings_dropped_total{repo}` — carried findings the model reported as resolved by the latest push
+- `raven_retractions_total{repo,result}` — comment-driven finding retractions
+- `raven_verdict_revisions_total{repo,from,to}` — comment-driven verdict revisions
+
+**Comment replies**
+- `raven_responses_total{repo}` — comment responses
+- `raven_responses_skipped_total{reason,repo}` — replies skipped before dispatch (`reason` = `no_mention`/`rate_limit`)
+
+**AI usage**
 - `raven_ai_calls_total{backend,model,repo}` — AI completion calls
 - `raven_ai_tokens_total{backend,model,repo,kind}` — tokens consumed (`kind` = `input`/`output`)
 - `raven_ai_cost_usd_total{backend,model,repo}` — AI cost in USD
@@ -420,7 +438,7 @@ RAVEN_AI_EFFORT=max  RAVEN_LIVE_AI_TESTS=1 CLAUDE_CODE_OAUTH_TOKEN=<token> \
     pytest -m slow tests/golden/ -s -q
 ```
 
-~1000 tests across 18 test files (including the offline golden-review scorer/corpus suite above) covering webhook handling (BB DC `pr:comment:added`/`:edited` version-aware dedup, `pr:reviewer:approved`/`:changes_requested` parity with Gitea, activities-endpoint pagination cap with WARNING), review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), two-tier prompt trust model (`<repo_policy>` for CLAUDE.md + rules at base ref vs `<untrusted_input>` for diff + comments), chunked-review consolidation pass that re-applies repo policy to aggregated findings, three-mode review engagement (`all` / `gap` / `advisory`), three-way review output channels (`both` / `summary` / `inline`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
+~1125 tests across 23 test files (including the offline golden-review scorer/corpus suite above) covering webhook handling (BB DC `pr:comment:added`/`:edited` version-aware dedup, `pr:reviewer:approved`/`:changes_requested` parity with Gitea, activities-endpoint pagination cap with WARNING), review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), two-tier prompt trust model (`<repo_policy>` for CLAUDE.md + rules at base ref vs `<untrusted_input>` for diff + comments), chunked-review consolidation pass that re-applies repo policy to aggregated findings, three-mode review engagement (`all` / `gap` / `advisory`), three-way review output channels (`both` / `summary` / `inline`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
 
 ## CI
 

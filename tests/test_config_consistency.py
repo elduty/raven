@@ -17,6 +17,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 _COMPOSE = (_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 _REVIEWER = (_ROOT / "raven" / "reviewer.py").read_text(encoding="utf-8")
 _DOCKERFILE = (_ROOT / "Dockerfile").read_text(encoding="utf-8")
+_REVIEW_PROMPT = (_ROOT / "prompts" / "review.md").read_text(encoding="utf-8")
 
 
 def _compose_default(var: str) -> str | None:
@@ -62,3 +63,21 @@ def test_dockerfile_does_not_set_model_or_effort_env():
         "Dockerfile must not set a RAVEN_AI_MODEL ENV default (audit #7)"
     assert "RAVEN_AI_EFFORT=" not in _DOCKERFILE, \
         "Dockerfile must not set a RAVEN_AI_EFFORT ENV default (audit #7)"
+
+
+def test_max_findings_matches_review_prompt_cap():
+    """``reviewer.MAX_FINDINGS`` mirrors the cap stated in prompts/review.md.
+
+    The prompt states the cap for the model; the constant enforces it
+    deterministically on the policy-less chunked path (audit 07-02 #9).
+    If the two drift, Raven either truncates below what it promised the
+    model or posts above its own stated maximum.
+    """
+    prompt = re.search(r"Maximum\s+(\d+)\s+findings", _REVIEW_PROMPT)
+    assert prompt is not None, \
+        "prompts/review.md no longer states 'Maximum N findings' — update this guard"
+    code = re.search(r"^MAX_FINDINGS\s*=\s*(\d+)", _REVIEWER, re.M)
+    assert code is not None, "raven/reviewer.py no longer defines MAX_FINDINGS"
+    assert int(code.group(1)) == int(prompt.group(1)), (
+        f"prompts/review.md cap {prompt.group(1)} != reviewer.py MAX_FINDINGS "
+        f"{code.group(1)} — keep the two in sync")

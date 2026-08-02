@@ -2,13 +2,19 @@
 
 import json
 import os
+import warnings
+
 import pytest
 from unittest.mock import MagicMock, patch
 
 from raven.ai.base import AIError, CompletionResult
 from raven.reviewer import (
+    _cap_findings,
+    _parse_diff_header_path,
     _parse_response,
     _strip_lockfiles_and_binaries,
+    _unquote_git_path,
+    MAX_FINDINGS,
     respond_to_comment,
     review_diff,
     severity_gte,
@@ -1064,6 +1070,197 @@ class TestChunkedReviewConsolidation:
         assert len(result["findings"]) == 2  # raw merge
 
 
+class TestChunkedFindingCap:
+    """Chunked reviews in repos with no policy must respect the template cap."""
+
+    def _chunk_response(self, n_files=15, default_severity="medium", severities=None):
+        """Every response names ALL ``n_files`` diff filenames
+        (``f0.py``..``f{n_files-1}.py``), not just the single file THIS
+        chunk actually covers. The per-chunk grounding backstop
+        (``_drop_ungrounded_findings``, invoked from
+        ``_review_single_chunk``) keeps only the finding whose ``file``
+        matches this chunk's own diff and silently drops the rest — so
+        one canned response, returned identically for every chunk, still
+        yields exactly one grounded finding per chunk, deterministically,
+        regardless of the order the parallel per-file chunks complete in.
+        Do NOT "simplify" this back to per-chunk-specific dummy
+        filenames: those never match any chunk's own file, grounding
+        drops every one of them, and the fixture stops exercising the
+        cap entirely (see audit note in Task 2's implementation report).
+        """
+        severities = severities or {}
+        findings = [
+            {"severity": severities.get(i, default_severity), "file": f"f{i}.py",
+             "line": i + 1, "message": f"finding f{i}"}
+            for i in range(n_files)
+        ]
+        return json.dumps({
+            "severity": default_severity,
+            "summary": "chunk reviewed",
+            "findings": findings,
+        })
+
+    def _big_diff(self, n_files=15, oversized=False):
+        diff = "".join(
+            f"diff --git a/f{i}.py b/f{i}.py\n" + "+line\n" * 200
+            for i in range(n_files)
+        )
+        if oversized:
+            diff += "diff --git a/huge.py b/huge.py\n" + "+line\n" * 400
+        return diff
+
+    def test_policyless_chunked_review_is_capped(self, monkeypatch):
+        """15 files -> 15 chunks, each keeping exactly the one grounded
+        finding naming its own file = 15 merged; no rules + no CLAUDE.md
+        means consolidation is skipped, so the cap must be enforced in
+        code."""
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        fake.complete.return_value = _cr(self._chunk_response())
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(self._big_diff(), "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["chunked"] is True
+        assert result.get("consolidated") is not True
+        assert len(result["findings"]) == rev.MAX_FINDINGS
+
+    def test_cap_discloses_omission_in_summary(self, monkeypatch):
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        fake.complete.return_value = _cr(self._chunk_response())
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(self._big_diff(), "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert "capped" in result["summary"]
+        assert "5 lower-severity omitted" in result["summary"]
+
+    def test_under_cap_summary_untouched(self, monkeypatch):
+        """A chunked review under the cap gets no suffix and no metric."""
+        from raven import metrics
+        metrics._counters.clear()
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        fake.complete.return_value = _cr(self._chunk_response())
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(self._big_diff(n_files=2), "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert "capped" not in result["summary"]
+        assert len(result["findings"]) == 2
+        assert not any("raven_findings_capped_total" in k for k in metrics._counters)
+
+    def test_cap_preserves_top_level_severity(self, monkeypatch):
+        """Severity is computed pre-cap; the cap ranks by severity, so
+        the lone high finding must survive the cap even though its
+        chunk's completion order in the thread pool isn't guaranteed.
+
+        The cap-fired assertion below is load-bearing: the severity
+        claims alone hold pre-cap too (grounding already leaves one
+        finding per file, and ranking keeps a lone high under any
+        limit >= 1), so without it this test would still pass if the
+        ``_cap_findings`` call were deleted outright."""
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        fake.complete.return_value = _cr(
+            self._chunk_response(default_severity="low", severities={0: "high"})
+        )
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(self._big_diff(), "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        # Proves the cap actually fired (15 merged -> 10); without this
+        # the rest of the test cannot fail if the cap is removed.
+        assert len(result["findings"]) == rev.MAX_FINDINGS
+        assert result["severity"] == "high"
+        assert any(f["file"] == "f0.py" and f["severity"] == "high"
+                   for f in result["findings"])
+
+    def test_gap_markers_survive_the_cap(self, monkeypatch):
+        """An oversized file produces a gap marker. Markers are appended
+        AFTER the cap and must never be evicted by it."""
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        fake.complete.return_value = _cr(self._chunk_response())
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100  # oversized threshold = 300 lines
+        try:
+            result = review_diff(self._big_diff(oversized=True), "user/repo")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        markers = [f for f in result["findings"] if f.get("gap_marker")]
+        assert len(markers) == 1
+        assert markers[0]["file"] == "huge.py"
+        assert result["coverage_gap"] is True
+        # Real findings capped, marker on top of the cap.
+        assert len(result["findings"]) == rev.MAX_FINDINGS + 1
+
+    def test_consolidated_path_is_not_capped(self, monkeypatch):
+        """With repo policy present, consolidation runs and repo rules govern
+        the cap — the code-side cap must NOT second-guess it."""
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        consolidated = json.dumps({
+            "severity": "medium",
+            "summary": "Consolidated",
+            "findings": [
+                {"severity": "medium", "file": f"f{i % 2}.py", "line": i,
+                 "message": f"kept {i}"}
+                for i in range(15)
+            ],
+        })
+        fake.complete.side_effect = [
+            _cr(self._chunk_response(n_files=2)),
+            _cr(self._chunk_response(n_files=2)),
+            _cr(consolidated),
+        ]
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+
+        import raven.reviewer as rev
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = review_diff(
+                self._big_diff(n_files=2), "user/repo",
+                claude_md="# Policy\nReport every finding you find.",
+            )
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result.get("consolidated") is True
+        assert len(result["findings"]) == 15
+        assert "capped" not in result["summary"]
+
+
 class TestRecordAiUsage:
     """_record_ai_usage emits the three AI metric families with the right
     labels and resolves cost by priority (provider > table > none)."""
@@ -1405,6 +1602,89 @@ class TestReviewConfigHashIncludesBackend:
 
         assert hash_a != hash_b
         _reset_backend_cache()
+
+    def test_config_hash_changes_when_approve_threshold_changes(self, monkeypatch):
+        """The cache must invalidate when REVIEW_APPROVE_MAX_SEVERITY changes:
+        a cached approve computed under a looser threshold must not survive a
+        tightening (else _maybe_dispatch_cached_merge can auto-merge a PR the
+        current policy would block). Audit 07-02 #3."""
+        from raven import reviewer as rv
+        from raven.ai import _reset_backend_cache
+        fake = MagicMock(); fake.name = "claude_cli"
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+        monkeypatch.setenv("REVIEW_APPROVE_MAX_SEVERITY", "low")
+        low = rv.review_config_hash()
+        monkeypatch.setenv("REVIEW_APPROVE_MAX_SEVERITY", "medium")
+        med = rv.review_config_hash()
+        assert low != med
+        _reset_backend_cache()
+
+    def test_config_hash_changes_when_review_mode_changes(self, monkeypatch):
+        """The cache must invalidate when RAVEN_REVIEW_MODE changes: an
+        advisory-era cached 'approve' (never a formal review) must not become
+        mechanically mergeable after a flip to 'all'. Audit 07-02 #3."""
+        from raven import reviewer as rv
+        from raven.ai import _reset_backend_cache
+        fake = MagicMock(); fake.name = "claude_cli"
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+        monkeypatch.setenv("RAVEN_REVIEW_MODE", "all")
+        a = rv.review_config_hash()
+        monkeypatch.setenv("RAVEN_REVIEW_MODE", "advisory")
+        b = rv.review_config_hash()
+        assert a != b
+        _reset_backend_cache()
+
+    def test_config_hash_normalizes_threshold_case(self, monkeypatch):
+        """Case/whitespace differences in REVIEW_APPROVE_MAX_SEVERITY must NOT
+        spuriously wipe the cache — 'medium' and 'Medium' are the same policy.
+        Guards the implementation against a naive non-normalized include."""
+        from raven import reviewer as rv
+        from raven.ai import _reset_backend_cache
+        fake = MagicMock(); fake.name = "claude_cli"
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+        monkeypatch.setenv("REVIEW_APPROVE_MAX_SEVERITY", "medium")
+        lower = rv.review_config_hash()
+        monkeypatch.setenv("REVIEW_APPROVE_MAX_SEVERITY", "  Medium ")
+        mixed = rv.review_config_hash()
+        assert lower == mixed
+        _reset_backend_cache()
+
+
+class TestRespondNullAuthorHardening:
+    """A deleted/anonymous comment author serializes as ``{"user": null}`` on
+    Gitea's raw comment dicts. ``c.get("user", {})`` returns None (the key is
+    present with a null value, so the default {} is NOT used), and the chained
+    ``.get("login")`` then raises AttributeError — crashing every reply on the
+    PR until the comment scrolls out of the window. Audit 07-02 #2."""
+
+    def _backend(self, monkeypatch):
+        fake = MagicMock(); fake.name = "claude_cli"
+        fake.complete.return_value = _cr(
+            '{"response": "ok", "revise": null, "retract_findings": []}')
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+        return fake
+
+    def test_survives_null_author_in_conversation(self, monkeypatch):
+        fake = self._backend(monkeypatch)
+        result = respond_to_comment(
+            "question",
+            [{"user": None, "body": "prior comment"}],
+            "diff", "owner/repo",
+        )
+        assert result["response"] == "ok"
+        prompt = fake.complete.call_args.args[0]
+        assert "unknown" in prompt  # null author rendered, not crashed
+
+    def test_survives_null_author_in_thread(self, monkeypatch):
+        fake = self._backend(monkeypatch)
+        result = respond_to_comment(
+            "question", [], "diff", "owner/repo",
+            thread=[{"id": 1, "parent_id": None, "user": None,
+                     "body": "root finding", "file_path": None, "line": None}],
+        )
+        assert result["response"] == "ok"
+        prompt = fake.complete.call_args.args[0]
+        assert "unknown" in prompt
 
 
 # ------------------------------------------------------------------ #
@@ -2304,3 +2584,408 @@ class TestConsolidationSeverityConditional:
             rev.MAX_DIFF_LINES = old_max
 
         assert result["severity"] == "medium"
+
+
+# ------------------------------------------------------------------ #
+#  _cap_findings                                                      #
+# ------------------------------------------------------------------ #
+
+class TestCapFindings:
+    """_cap_findings enforces the review template's per-PR finding cap."""
+
+    def _f(self, sev, name):
+        return {"severity": sev, "file": name, "message": f"msg {name}"}
+
+    def test_under_limit_is_untouched(self):
+        findings = [self._f("low", f"f{i}.py") for i in range(3)]
+        kept, dropped = _cap_findings(findings, "user/repo", limit=10)
+        assert kept == findings
+        assert dropped == 0
+
+    def test_exactly_at_limit_is_untouched(self):
+        findings = [self._f("low", f"f{i}.py") for i in range(10)]
+        kept, dropped = _cap_findings(findings, "user/repo", limit=10)
+        assert kept == findings
+        assert dropped == 0
+
+    def test_keeps_highest_severity_first(self):
+        findings = (
+            [self._f("low", f"low{i}.py") for i in range(8)]
+            + [self._f("high", "high.py"), self._f("medium", "med.py")]
+            + [self._f("low", f"low_late{i}.py") for i in range(5)]
+        )
+        kept, dropped = _cap_findings(findings, "user/repo", limit=3)
+        assert dropped == 12
+        assert [f["severity"] for f in kept] == ["high", "medium", "low"]
+        assert kept[0]["file"] == "high.py"
+        assert kept[1]["file"] == "med.py"
+
+    def test_stable_within_a_severity_tier(self):
+        """Equally-severe findings keep their original (per-chunk/file) order."""
+        findings = [self._f("medium", f"m{i}.py") for i in range(6)]
+        kept, _ = _cap_findings(findings, "user/repo", limit=3)
+        assert [f["file"] for f in kept] == ["m0.py", "m1.py", "m2.py"]
+
+    def test_unknown_severity_ranks_lowest_and_does_not_crash(self):
+        findings = [
+            self._f("bogus", "weird.py"),
+            self._f("high", "real.py"),
+        ]
+        kept, dropped = _cap_findings(findings, "user/repo", limit=1)
+        assert dropped == 1
+        assert kept[0]["file"] == "real.py"
+
+    def test_missing_severity_key_does_not_crash(self):
+        findings = [{"file": "a.py", "message": "no severity"},
+                    self._f("high", "real.py")]
+        kept, dropped = _cap_findings(findings, "user/repo", limit=1)
+        assert dropped == 1
+        assert kept[0]["file"] == "real.py"
+
+    def test_increments_metric_by_number_dropped(self):
+        from raven import metrics
+        metrics._counters.clear()
+        findings = [self._f("low", f"f{i}.py") for i in range(15)]
+        _cap_findings(findings, "user/repo", limit=10)
+        key = 'raven_findings_capped_total{repo="user/repo"}'
+        assert metrics._counters.get(key) == 5
+
+    def test_no_metric_when_nothing_dropped(self):
+        from raven import metrics
+        metrics._counters.clear()
+        _cap_findings([self._f("low", "a.py")], "user/repo", limit=10)
+        assert not any("raven_findings_capped_total" in k for k in metrics._counters)
+
+    def test_metric_registered_in_help(self):
+        from raven import metrics
+        assert "raven_findings_capped_total" in metrics._METRIC_HELP
+
+
+# ------------------------------------------------------------------ #
+#  _parse_diff_header_path / _unquote_git_path                       #
+# ------------------------------------------------------------------ #
+
+class TestParseDiffHeaderPath:
+    """diff --git header parsing must survive spaces and git quoting."""
+
+    def test_plain_path(self):
+        assert _parse_diff_header_path(
+            "diff --git a/src/app.py b/src/app.py\n") == "src/app.py"
+
+    def test_path_with_single_space(self):
+        assert _parse_diff_header_path(
+            "diff --git a/my file.py b/my file.py\n") == "my file.py"
+
+    def test_path_with_multiple_spaces(self):
+        assert _parse_diff_header_path(
+            "diff --git a/dir name/my long file.py b/dir name/my long file.py\n"
+        ) == "dir name/my long file.py"
+
+    def test_path_containing_the_split_token(self):
+        """A path containing ' b/' must not split at the first occurrence."""
+        assert _parse_diff_header_path(
+            "diff --git a/x b/y.py b/x b/y.py\n") == "x b/y.py"
+
+    def test_git_quoted_non_ascii_path(self):
+        assert _parse_diff_header_path(
+            'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n') == "café.py"
+
+    def test_rename_falls_back_to_last_token(self):
+        """Differing sides (a rename) keep the historical behaviour."""
+        assert _parse_diff_header_path(
+            "diff --git a/old.py b/new.py\n") == "new.py"
+
+    def test_no_trailing_newline(self):
+        assert _parse_diff_header_path(
+            "diff --git a/my file.py b/my file.py") == "my file.py"
+
+    # --- asymmetric quoting -------------------------------------------
+    # Git quotes each side INDEPENDENTLY, so a rename where only one side
+    # holds non-ASCII produces a half-quoted header. These are captured
+    # from real `git -c core.quotePath=true diff -M` output, not invented.
+
+    def test_rename_with_only_a_side_quoted(self):
+        """`café.py` renamed to `cafe.py` — only the OLD name needs quoting.
+
+        Regression: the parser used to take the last quoted span, which is
+        the a-side when only one side is quoted, and so returned the
+        pre-rename name. The old parts[-1] code got this case right, so
+        this was a regression the fix had to close.
+        """
+        assert _parse_diff_header_path(
+            'diff --git "a/caf\\303\\251.py" b/cafe.py\n') == "cafe.py"
+
+    def test_rename_with_only_b_side_quoted(self):
+        """`cafe.py` renamed to `café.py` — only the NEW name needs quoting.
+
+        Regression: the line does not start with a quote, so the quoted
+        branch was skipped entirely, and the ` b/` scan could not match
+        because the real text is ` "b/`. The result was the literal
+        '"b/caf\\303\\251.py"' — quotes and raw octal escapes attached —
+        which matches no filename the model was ever shown.
+        """
+        assert _parse_diff_header_path(
+            'diff --git a/cafe.py "b/caf\\303\\251.py"\n') == "café.py"
+
+    def test_rename_a_side_quoted_with_spaces_in_new_name(self):
+        """Consuming the quoted a-side leaves the whole remainder as the
+        b-side, so spaces in the new name survive."""
+        assert _parse_diff_header_path(
+            'diff --git "a/caf\\303\\251 x.py" b/cafe x.py\n') == "cafe x.py"
+
+    def test_escaped_quote_inside_quoted_path(self):
+        """A literal `"` in a filename is escaped by git as `\\"`; the
+        quoted-span regex must treat it as content, not a terminator."""
+        assert _parse_diff_header_path(
+            'diff --git "a/fo\\"o.py" "b/fo\\"o.py"\n') == 'fo"o.py'
+
+    def test_malformed_headers_degrade_without_raising(self):
+        """`_strip_lockfiles_and_binaries` calls this inside a streaming
+        loop, so an exception would abort parsing the whole diff. Every
+        malformed shape must return a string instead."""
+        for line in ("", "diff --git ", "diff --git a/", "diff --git a/ b/",
+                     'diff --git "a/unterminated', 'diff --git ""',
+                     'diff --git "" ""', "diff --git a/f.py"):
+            assert isinstance(_parse_diff_header_path(line), str)
+
+    def test_unquote_git_path_decodes_octal_utf8(self):
+        assert _unquote_git_path("caf\\303\\251.py") == "café.py"
+
+    def test_unquote_git_path_passes_plain_text_through(self):
+        assert _unquote_git_path("plain.py") == "plain.py"
+
+    # --- robustness (2026-07-30 audit + PR #201 review) ----------------
+
+    def test_invalid_escape_does_not_raise_under_strict_warnings(self):
+        """`decode("unicode_escape")` emits a DeprecationWarning for an
+        invalid escape (`\\777`, `\\d`). Under `-W error` that BECOMES an
+        exception, which the streaming caller cannot survive — it would
+        abort parsing the whole diff, far worse than a wrong filename.
+        Genuine git output can't produce this (git always escapes `\\`
+        inside a quoted span), so this guards the contract, not a live bug.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            for body in ("a/\\777", "a/\\d", "a/\\x"):
+                assert isinstance(_unquote_git_path(body), str)
+            for line in ('diff --git "a/\\777" "b/\\777"',
+                         'diff --git "a/\\d" "b/\\d"'):
+                assert isinstance(_parse_diff_header_path(line), str)
+
+    def test_unquote_preserves_raw_latin1_in_quoted_span(self):
+        """A raw (unescaped) accented byte inside a quoted span must
+        survive. `errors="replace"` turned `café"x.py` into `caf<FFFD>x.py`
+        — a corrupted name, which is the silent-drop outcome this parser
+        exists to prevent. Reachable with `core.quotePath=false` plus a
+        `"`/`\\`/control char in the name.
+        """
+        assert _unquote_git_path('b/caf\xe9"x.py') == 'b/café"x.py'
+        assert _unquote_git_path("b/x\xe9.py") == "b/xé.py"
+
+    def test_unquote_degrades_on_non_latin1_input(self):
+        """A body carrying characters above U+00FF can't round-trip
+        through latin-1; the decoded form is still the best answer."""
+        assert _unquote_git_path("b/日本.py") == "b/日本.py"
+
+    def test_unquoted_path_containing_a_quote_is_not_split_on_it(self):
+        """Raven's own BB DC synthesizer emits UNQUOTED headers
+        (`bitbucket_dc.py` builds both sides from `dst`), so a filename
+        containing a space AND a quote reaches this parser in a shape git
+        itself never emits. The trailing-quote branch would otherwise
+        match the b-side's *internal* quoted run and return `y`.
+        Same-path detection has to win over quote detection.
+        """
+        assert _parse_diff_header_path('diff --git a/x "y" b/x "y"') == 'x "y"'
+
+    def test_b_side_quoted_only_still_resolves(self):
+        """Regression guard for the branch reorder: an unquoted a-side
+        whose path itself contains `" b/"` must not derail the
+        quoted-b-side resolution."""
+        assert _parse_diff_header_path(
+            'diff --git a/x b/y.py "b/caf\\303\\251.py"') == "café.py"
+
+    def test_crlf_line_endings(self):
+        assert _parse_diff_header_path(
+            "diff --git a/my file.py b/my file.py\r\n") == "my file.py"
+
+    def test_directory_literally_named_b(self):
+        assert _parse_diff_header_path(
+            "diff --git a/b/inB.py b/b/inB.py") == "b/inB.py"
+
+
+class TestRenameTargetResolution:
+    """A rename with spaces is ambiguous from the `diff --git` header alone
+    (`a/my file.py b/other file.py` — no way to know where one path ends).
+    Git resolves it on the very next lines: `rename from` / `rename to`,
+    each a single field to end-of-line with no `a/`/`b/` prefix. All
+    headers below are real `git diff -M` output.
+    """
+
+    RENAME_SPACES = (
+        "diff --git a/my file.py b/other file.py\n"
+        "similarity index 90%\n"
+        "rename from my file.py\n"
+        "rename to other file.py\n"
+        "--- a/my file.py\n"
+        "+++ b/other file.py\n"
+        "@@ -1 +1 @@\n-x = 1\n+x = 2\n"
+    )
+
+    def test_split_diff_resolves_renamed_path_with_spaces(self):
+        chunks = split_diff_by_file(self.RENAME_SPACES)
+        assert [name for name, _ in chunks] == ["other file.py"]
+
+    def test_strip_lockfiles_resolves_renamed_path(self):
+        """The skip/keep decision must key off the real post-rename name:
+        a file renamed INTO a lockfile name has to be stripped."""
+        diff = (
+            "diff --git a/deps txt b/my dir/yarn.lock\n"
+            "similarity index 100%\n"
+            "rename from deps txt\n"
+            "rename to my dir/yarn.lock\n"
+        )
+        assert "yarn.lock" not in _strip_lockfiles_and_binaries(diff)
+
+    def test_quoted_rename_target_is_unquoted(self):
+        diff = (
+            'diff --git a/cafe.py "b/caf\\303\\251.py"\n'
+            "similarity index 100%\n"
+            "rename from cafe.py\n"
+            'rename to "caf\\303\\251.py"\n'
+        )
+        assert [n for n, _ in split_diff_by_file(diff)] == ["café.py"]
+
+    def test_rename_block_does_not_leak_across_file_sections(self):
+        """A `rename to` belonging to the NEXT file must not retro-assign
+        itself to the previous one."""
+        diff = (
+            "diff --git a/plain.py b/plain.py\n"
+            "--- a/plain.py\n+++ b/plain.py\n@@ -1 +1 @@\n-a\n+b\n"
+            "diff --git a/old name.py b/new name.py\n"
+            "similarity index 95%\n"
+            "rename from old name.py\n"
+            "rename to new name.py\n"
+        )
+        assert [n for n, _ in split_diff_by_file(diff)] == ["plain.py", "new name.py"]
+
+    def test_non_rename_diff_is_unaffected(self):
+        diff = (
+            "diff --git a/my file.py b/my file.py\n"
+            "--- a/my file.py\n+++ b/my file.py\n@@ -1 +1 @@\n-a\n+b\n"
+        )
+        assert [n for n, _ in split_diff_by_file(diff)] == ["my file.py"]
+
+    def test_renamed_file_finding_survives_grounding_filter(self, monkeypatch):
+        """End-to-end: the whole point. Pre-fix the header yielded
+        `file.py`, so a finding on `other file.py` was absent from the
+        provided set and `_drop_ungrounded_findings` discarded it."""
+        from raven import metrics
+        metrics._counters.clear()
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        fake.complete.return_value = _cr(json.dumps({
+            "severity": "high",
+            "summary": "bug in the renamed file",
+            "findings": [{"severity": "high", "file": "other file.py",
+                          "line": 1, "message": "real defect"}],
+        }))
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+
+        result = review_diff(self.RENAME_SPACES, "user/repo")
+
+        assert [f["file"] for f in result["findings"]] == ["other file.py"]
+        assert not any(
+            "raven_ungrounded_findings_dropped_total" in k
+            for k in metrics._counters
+        )
+
+
+class TestDiffParsersHandleSpacedPaths:
+    """Both diff parsers must derive the real filename, spaces included."""
+
+    def test_split_diff_by_file_keeps_spaced_name(self):
+        diff = (
+            "diff --git a/my file.py b/my file.py\n"
+            "--- a/my file.py\n+++ b/my file.py\n@@ -1 +1 @@\n+x = 1\n"
+        )
+        chunks = split_diff_by_file(diff)
+        assert [name for name, _ in chunks] == ["my file.py"]
+
+    def test_split_diff_by_file_mixed_spaced_and_plain(self):
+        diff = (
+            "diff --git a/plain.py b/plain.py\n+a\n"
+            "diff --git a/my file.py b/my file.py\n+b\n"
+        )
+        chunks = split_diff_by_file(diff)
+        assert [name for name, _ in chunks] == ["plain.py", "my file.py"]
+
+    def test_strip_lockfiles_removes_spaced_lockfile(self):
+        """A lockfile whose directory contains a space is still stripped.
+
+        Passes even pre-fix: classification is basename-driven, and a space
+        in the *directory* portion never reaches the basename either way —
+        see test_strip_lockfiles_removes_quoted_lockfile for a case that
+        actually flips on the fix.
+        """
+        diff = (
+            "diff --git a/my dir/yarn.lock b/my dir/yarn.lock\n+lock junk\n"
+            "diff --git a/app.py b/app.py\n+real = 1\n"
+        )
+        out = _strip_lockfiles_and_binaries(diff)
+        assert "yarn.lock" not in out
+        assert "real = 1" in out
+
+    def test_strip_lockfiles_keeps_spaced_source_file(self):
+        """Passes even pre-fix: a non-lockfile name is never stripped either
+        way, so this pins behaviour rather than characterizing the fix."""
+        diff = "diff --git a/my file.py b/my file.py\n+real = 1\n"
+        out = _strip_lockfiles_and_binaries(diff)
+        assert "real = 1" in out
+
+    def test_strip_lockfiles_removes_quoted_lockfile(self):
+        """A git-quoted non-ASCII lockfile name must still be stripped.
+
+        Unlike the spaced-path cases above, this one genuinely flips:
+        pre-fix the mis-parsed name is '"b/caf\\303\\251.lock"' (quotes and
+        escapes intact), which doesn't end in '.lock' as a plain string, so
+        the lockfile suffix check misses it and the content is retained.
+        """
+        diff = (
+            'diff --git "a/caf\\303\\251.lock" "b/caf\\303\\251.lock"\n'
+            "+lock junk\n"
+            "diff --git a/app.py b/app.py\n+real = 1\n"
+        )
+        out = _strip_lockfiles_and_binaries(diff)
+        assert "lock junk" not in out
+        assert "real = 1" in out
+
+    def test_spaced_path_finding_survives_grounding_filter(self, monkeypatch):
+        """End-to-end regression for audit 06-13 #11.
+
+        Before the fix, 'my file.py' parsed as 'file.py', so the provided-file
+        set never contained the real name and _drop_ungrounded_findings
+        discarded a legitimate finding on it.
+        """
+        from raven import metrics
+        metrics._counters.clear()
+        diff = (
+            "diff --git a/my file.py b/my file.py\n"
+            "--- a/my file.py\n+++ b/my file.py\n@@ -1 +1 @@\n+x = 1\n"
+        )
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        fake.complete.return_value = _cr(json.dumps({
+            "severity": "high",
+            "summary": "bug found",
+            "findings": [{"severity": "high", "file": "my file.py", "line": 1,
+                          "message": "real defect"}],
+        }))
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+
+        result = review_diff(diff, "user/repo")
+
+        assert [f["file"] for f in result["findings"]] == ["my file.py"]
+        assert not any(
+            "raven_ungrounded_findings_dropped_total" in k
+            for k in metrics._counters
+        )

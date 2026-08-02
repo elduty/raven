@@ -88,7 +88,7 @@ Respond with ONLY valid JSON. No preamble, no explanation outside the JSON block
       "severity": "high|medium|low",
       "file": "path/to/file.py",
       "line": 42,
-      "message": "Specific, actionable description. Explain WHY it's a problem and what the impact is."
+      "message": "Specific, actionable description with code identifiers in backticks — e.g. \"`load_config()` swallows `FileNotFoundError`, so a corrupt config silently falls back to defaults\". Explain WHY it's a problem and what the impact is."
     }
   ]
 }
@@ -100,5 +100,6 @@ Rules:
 - Each finding must include `file` (the path from the diff header, e.g. `src/server.py`) and `line` (the line number in the NEW version of the file, from the `+` side of the diff). Use the line numbers shown in the `@@` hunk headers.
 - If you cannot determine the exact line, omit `file` and `line` and put the location in the `message` instead.
 - Each finding message must be self-contained — include enough context that the developer knows exactly what to fix.
+- Wrap code identifiers — file, function, class, method, and variable names — in backticks in `message` and `summary` (e.g. `submit_review()`, `server.py`) so they render as code in the PR comment. Use single-backtick code spans, not fenced code blocks, inside messages.
 - Order findings by severity: high → medium → low.
 - Maximum 10 findings. If there are more, report the most impactful ones.

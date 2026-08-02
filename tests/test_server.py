@@ -106,6 +106,93 @@ class TestStartupAssertion:
             with pytest.raises(RuntimeError, match="No git providers configured"):
                 create_app()
 
+    # ── BB DC username is required, not optional (audit 2026-07-30) ───── #
+    # BB DC tokens expose no whoami endpoint, so get_authenticated_user()
+    # raises without it — and it is called ONLY on submit_review's
+    # needs-work path. Unset, the failure is asymmetric and confusing:
+    # approvals post fine while every review WITH findings raises at submit
+    # time and the author sees a generic internal-error comment. The
+    # "no providers configured" message already listed it as required.
+
+    def test_bb_dc_fails_fast_without_username(self):
+        env = {
+            "GITEA_WEBHOOK_SECRET": "", "GITEA_URL": "", "GITEA_TOKEN": "",
+            "BITBUCKET_DC_URL": "https://bb.example.com",
+            "BITBUCKET_DC_TOKEN": "tok",
+            "BITBUCKET_DC_WEBHOOK_SECRET": "sec",
+            "BITBUCKET_DC_USERNAME": "",
+        }
+        with patch.dict(os.environ, env):
+            with pytest.raises(RuntimeError, match="BITBUCKET_DC_USERNAME is required"):
+                create_app()
+
+    def test_bb_dc_username_whitespace_only_is_rejected(self):
+        env = {
+            "GITEA_WEBHOOK_SECRET": "", "GITEA_URL": "", "GITEA_TOKEN": "",
+            "BITBUCKET_DC_URL": "https://bb.example.com",
+            "BITBUCKET_DC_TOKEN": "tok",
+            "BITBUCKET_DC_WEBHOOK_SECRET": "sec",
+            "BITBUCKET_DC_USERNAME": "   ",
+        }
+        with patch.dict(os.environ, env):
+            with pytest.raises(RuntimeError, match="BITBUCKET_DC_USERNAME is required"):
+                create_app()
+
+
+class TestAIAndWorkerStartupValidation:
+    """create_app validates the AI backend + the single-worker invariant at
+    boot (audit 07-02 #4 + audit-06-13 #9), so a misconfiguration fails fast
+    here instead of surfacing as an opaque per-PR error (or silently racing
+    across workers) while /healthz still reads healthy. Provider creds come
+    from conftest, so the no-providers gate passes and these later checks run."""
+
+    def setup_method(self):
+        from raven.ai import _reset_backend_cache
+        _providers.clear()
+        _reset_backend_cache()
+
+    def teardown_method(self):
+        from raven.ai import _reset_backend_cache
+        _providers.clear()
+        _reset_backend_cache()
+
+    def test_backend_misconfig_fails_startup(self, monkeypatch):
+        # No backend creds at all → get_backend() must raise at startup, not
+        # defer an opaque failure to the first review.
+        for var in ("RAVEN_AI_BACKEND", "CLAUDE_CODE_OAUTH_TOKEN",
+                    "RAVEN_AI_API_BASE", "RAVEN_AI_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+        with pytest.raises(RuntimeError, match="(?i)AI backend"):
+            create_app()
+
+    def test_unknown_effort_logs_warning_at_startup(self, monkeypatch, caplog):
+        monkeypatch.setenv("RAVEN_AI_EFFORT", "xhigh")
+        monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+        monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+        with caplog.at_level("WARNING", logger="raven.server"):
+            create_app()
+        assert any("xhigh" in r.message and "effort" in r.message.lower()
+                   for r in caplog.records)
+
+    def test_multi_worker_web_concurrency_fails_startup(self, monkeypatch):
+        monkeypatch.setenv("WEB_CONCURRENCY", "2")
+        with pytest.raises(RuntimeError, match="(?i)worker"):
+            create_app()
+
+    def test_multi_worker_gunicorn_cmd_args_fails_startup(self, monkeypatch):
+        monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+        monkeypatch.setenv("GUNICORN_CMD_ARGS", "--workers 3 --timeout 300")
+        with pytest.raises(RuntimeError, match="(?i)worker"):
+            create_app()
+
+    def test_single_worker_web_concurrency_ok(self, monkeypatch):
+        # WEB_CONCURRENCY=1 is the required value — must NOT false-positive.
+        monkeypatch.setenv("WEB_CONCURRENCY", "1")
+        monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+        app = create_app()
+        assert app is not None
+
 
 class TestMetricsAuth:
     def _build_client(self, monkeypatch, token: str | None):
@@ -3170,6 +3257,16 @@ class TestReviewEvent:
             mc = self._run_with_severity("high")
         mc.submit_review.assert_called_once()
         assert mc.submit_review.call_args.kwargs["approve"] is False
+
+    def test_medium_approved_when_threshold_is_capitalized(self):
+        # REVIEW_APPROVE_MAX_SEVERITY is compared case-insensitively (matching
+        # reviewer._coverage_gap_floor's .lower()); a capitalized value must
+        # still approve a medium review rather than silently reading as 'low'
+        # (SEVERITY_ORDER.get("Medium") -> default 0). Audit 07-02 #3.
+        with patch.dict(os.environ, {"REVIEW_APPROVE_MAX_SEVERITY": "Medium"}):
+            mc = self._run_with_severity("medium")
+        mc.submit_review.assert_called_once()
+        assert mc.submit_review.call_args.kwargs["approve"] is True
 
 
 class TestParseErrorBlocksMerge:

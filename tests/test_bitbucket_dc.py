@@ -1,5 +1,6 @@
 """Tests for providers/bitbucket_dc.py — BitbucketDCProvider API client."""
 
+import contextlib
 import hashlib
 import hmac as hmac_mod
 import json
@@ -8,7 +9,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 
-from raven.providers import DiffTruncatedError
+from raven.providers import DiffTruncatedError, DiffUnverifiableError
 from raven.providers.bitbucket_dc import BitbucketDCProvider, _split_repo
 
 BB_DC_BASE = "https://bitbucket.example.com"
@@ -881,22 +882,64 @@ class TestAddLabelToPr:
 # ------------------------------------------------------------------ #
 
 class TestFetchPrDiff:
-    def test_success(self, client):
-        diff_text = "diff --git a/bar b/bar\n+added line\n"
-        with _mock_get(client, text=diff_text):
-            result = client.fetch_pr_diff("PROJ/repo", 7)
-        assert "diff --git" in result
-
     def test_empty_diff_raises(self, client):
         with _mock_get(client, text=""):
             with pytest.raises(RuntimeError, match="empty diff"):
                 client.fetch_pr_diff("PROJ/repo", 7)
 
     def test_url_structure(self, client):
-        with _mock_get(client, text="diff") as mock_get:
-            client.fetch_pr_diff("PROJ/repo", 42)
+        data = {"diffs": [{"source": {"toString": "a.py"},
+                           "destination": {"toString": "a.py"}, "hunks": []}]}
+        with _mock_get(client, json_data=data,
+                       content_type="application/json") as mock_get:
+            with contextlib.suppress(RuntimeError):
+                client.fetch_pr_diff("PROJ/repo", 42)
         url = mock_get.call_args[0][0]
         assert "/projects/PROJ/repos/repo/pull-requests/42/diff" in url
+
+    # ── Unverifiable (non-JSON) diff fail-closed (audit 2026-07-30) ───── #
+    # Truncation flags exist ONLY in BB DC's JSON representation. A
+    # plain-text diff cut off at diff.max.lines is indistinguishable from a
+    # complete one, so the old `else: diff_text = resp.text` branch left the
+    # very hole the JSON guard closes — reviewing (and potentially approving
+    # + auto-merging) code the model never saw.
+
+    def test_requests_json_explicitly(self, client):
+        """JSON is the only verifiable format, so ask for it by name."""
+        data = {"diffs": [{"source": {"toString": "a.py"},
+                           "destination": {"toString": "a.py"}, "hunks": []}]}
+        with _mock_get(client, json_data=data,
+                       content_type="application/json") as mock_get:
+            with contextlib.suppress(RuntimeError):
+                client.fetch_pr_diff("PROJ/repo", 7)
+        headers = mock_get.call_args.kwargs.get("headers") or {}
+        assert headers.get("Accept") == "application/json"
+
+    def test_plain_text_diff_is_refused(self, client):
+        """A text/plain diff carries no truncation flags — refuse it
+        rather than review a change we cannot confirm is whole."""
+        diff_text = "diff --git a/bar b/bar\n+added line\n"
+        with _mock_get(client, text=diff_text, content_type="text/plain"):
+            with pytest.raises(DiffUnverifiableError, match="completeness"):
+                client.fetch_pr_diff("PROJ/repo", 7)
+
+    def test_unverifiable_is_caught_as_truncated(self, client):
+        """Subclassing DiffTruncatedError is what makes every existing
+        fail-closed handler (review, comment-reply, cached-merge) already
+        refuse an unverifiable diff. Pin the relationship."""
+        assert issubclass(DiffUnverifiableError, DiffTruncatedError)
+        with _mock_get(client, text="diff --git a/x b/x\n",
+                       content_type="text/plain"):
+            with pytest.raises(DiffTruncatedError):
+                client.fetch_pr_diff("PROJ/repo", 7)
+
+    def test_empty_non_json_body_still_reports_empty_diff(self, client):
+        """An empty body is 'no diff', a more specific signal than
+        'unverifiable' — don't regress it into the new error."""
+        with _mock_get(client, text="   ", content_type="text/plain"):
+            with pytest.raises(RuntimeError, match="empty diff") as exc:
+                client.fetch_pr_diff("PROJ/repo", 7)
+        assert not isinstance(exc.value, DiffTruncatedError)
 
     # ── Truncated-diff fail-closed (audit 2026-06-13 finding #1) ──────── #
     # BB DC caps diff size and flags truncation on the overall response and

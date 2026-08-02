@@ -2,6 +2,40 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## v0.5.1 — 2026-08-03
+
+Correctness and safety release. Two of these fixes close paths where Raven could approve or merge code the model never fully saw; two more close paths where real findings were silently discarded before reaching the PR. No new features.
+
+### Breaking
+
+- **`BITBUCKET_DC_USERNAME` is now required whenever Bitbucket Data Center is configured.** Raven previously started without it and half-worked: approvals posted normally, but every review *with findings* failed at submit time and the author saw a generic internal-error comment instead of the findings. Bitbucket DC tokens expose no whoami endpoint, so Raven cannot resolve its own identity any other way — and identity drives the sole-reviewer merge gate, self-comment filtering, and the needs-work verdict call. Startup now fails fast with a message naming the variable. Gitea-only deployments are unaffected.
+
+### Fixed
+
+- **Bitbucket DC: diffs whose completeness can't be verified are now refused.** Truncation was checked only when the server returned JSON; a plain-text response was reviewed unchecked. BB DC's truncation flags exist *only* in the JSON representation, so a plain-text diff sitting at the server's `diff.max.lines` cap was indistinguishable from a complete one — Raven could review, approve, and auto-merge a partial change. Raven now requests JSON explicitly and refuses any non-JSON response, with an operator comment that names the cause (a server-side content-type issue, not an oversized PR). Fails closed across the review, comment-reply, and cached-merge paths.
+- **Findings on files with spaces or non-ASCII names are no longer silently dropped.** Both diff parsers derived the filename from the `diff --git` header by taking the last space-separated token, so `a/my file.py` parsed as `file.py`. Since v0.5.0 that is not a cosmetic mislabel: the evidence-grounding filter matches findings against the filenames Raven was shown, so a legitimate finding on such a path was discarded before reaching the PR. The mis-parse also corrupted per-file diff hashes, causing the affected file to re-review on every push. Both parsers now share a header parser that resolves the post-image path by position — git quotes each side of the header independently, so all four quoting combinations occur in real output — and consults git's `rename to` line, which is unambiguous where the header is not. Also fixes a Bitbucket DC case where a lockfile or binary with a non-ASCII name was never stripped from the review.
+- **Chunked reviews on repos without `CLAUDE.md` or rules now respect the finding cap.** Large diffs are split per file and reviewed in parallel, and each chunk applied the "maximum 10 findings" rule within its own single-file scope. The consolidation pass that normally re-applies whole-PR policy is skipped when a repo has no policy of its own, so the cap didn't compose: a 30-file PR could post up to 300 comments. The cap is now enforced deterministically on that path, ranked by severity, with the omission disclosed in the summary. Repos that state their own cap in a rule are unaffected — their policy still governs.
+- **A deleted or anonymous comment author no longer breaks every reply on a PR.** A comment whose `user` field is null raised an `AttributeError` in three places in the reply path.
+- **A stale cached approval can no longer auto-merge under a tightened policy.** The findings-cache invalidation hash now folds in `REVIEW_APPROVE_MAX_SEVERITY` and `RAVEN_REVIEW_MODE`, so lowering the approve threshold (or switching out of advisory mode) discards approvals computed under the looser setting instead of letting them merge.
+- **Misconfiguration now fails at boot rather than per-PR.** Missing or unknown AI credentials, an unrecognised reasoning-effort value, a non-numeric `RAVEN_AI_MAX_TOKENS`, and a multi-worker gunicorn configuration are all detected at startup — previously the first two surfaced as opaque per-PR errors while `/healthz` still reported healthy.
+
+### Added
+
+- `raven_findings_capped_total{repo}` — findings dropped by the per-PR cap above.
+- Prometheus `# HELP` text for `raven_cached_merge_dispatch_total` and `raven_responses_skipped_total`, which were exported without it.
+
+### Upgrading
+
+Bitbucket DC users: set `BITBUCKET_DC_USERNAME` to the service account's slug before deploying, or startup will fail. Gitea-only deployments need no changes.
+
+If a Bitbucket DC server cannot serve `application/json` for the pull-request diff endpoint, Raven will now refuse those reviews rather than run them on a diff it cannot verify. The posted comment explains the cause.
+
+The findings cache is invalidated automatically on first start after upgrade (the config hash covers the review prompt, which changed). Expect one full re-review per open PR; no action required.
+
+### Stats
+
+1119 tests across 23 test files (up from 1065).
+
 ## v0.5.0 — 2026-06-24
 
 Review-accuracy release: a coordinated push to cut confident false positives, a measurement harness to keep them down, and a fix for context loss in comment replies.

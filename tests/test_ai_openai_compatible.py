@@ -422,3 +422,22 @@ class TestOpenAICompatibleBackendMaxTokens:
             )
         _, kwargs = mock_create.call_args
         assert kwargs["max_tokens"] == 32768
+
+    def test_non_numeric_max_tokens_raises_clear_error(self, monkeypatch):
+        # A typo'd RAVEN_AI_MAX_TOKENS previously surfaced as a cryptic
+        # int() ValueError at instantiation; it must be a clear, named
+        # RuntimeError at startup instead (audit 07-02 #4).
+        monkeypatch.setenv("RAVEN_AI_API_BASE", "http://proxy.example:4000")
+        monkeypatch.setenv("RAVEN_AI_API_KEY", "sk-test")
+        monkeypatch.setenv("RAVEN_AI_MAX_TOKENS", "not-a-number")
+        from raven.ai.openai_compatible import OpenAICompatibleBackend
+        with pytest.raises(RuntimeError, match="RAVEN_AI_MAX_TOKENS"):
+            OpenAICompatibleBackend()
+
+    def test_nonpositive_max_tokens_raises(self, monkeypatch):
+        monkeypatch.setenv("RAVEN_AI_API_BASE", "http://proxy.example:4000")
+        monkeypatch.setenv("RAVEN_AI_API_KEY", "sk-test")
+        monkeypatch.setenv("RAVEN_AI_MAX_TOKENS", "0")
+        from raven.ai.openai_compatible import OpenAICompatibleBackend
+        with pytest.raises(RuntimeError, match="RAVEN_AI_MAX_TOKENS"):
+            OpenAICompatibleBackend()

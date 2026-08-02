@@ -127,6 +127,16 @@ _RESPOND_PROMPT_TEMPLATE = _load_respond_prompt()
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 _SEVERITY_NAME = {rank: name for name, rank in SEVERITY_ORDER.items()}
 
+# Per-PR finding cap. MIRRORS prompts/review.md ("Maximum 10 findings") —
+# tests/test_config_consistency.py pins the two together. Enforced in code
+# only on the chunked raw-merge path, where no repo policy exists and the
+# review template is therefore the sole governing document; see
+# _cap_findings and review_diff's raw-merge return. Deliberately NOT an env
+# var: the number is a property of the prompt, not a deployment knob, and a
+# repo wanting a different cap states it as a rule (which routes the review
+# through the consolidation pass, where repo policy governs).
+MAX_FINDINGS = 10
+
 
 def _coverage_gap_floor() -> str:
     """Severity floor applied when chunks went unreviewed: one level
@@ -634,8 +644,24 @@ def _build_pr_context_section(pr_title: str, pr_description: str,
 
 
 def review_config_hash() -> str:
-    """SHA256 of backend + model + effort + prompt — changes when review config changes."""
-    content = f"{get_backend().name}:{RAVEN_AI_MODEL}:{RAVEN_AI_EFFORT}:{_REVIEW_PROMPT_TEMPLATE}"
+    """SHA256 of backend + model + effort + verdict-gating config + prompt.
+
+    Includes ``REVIEW_APPROVE_MAX_SEVERITY`` and ``RAVEN_REVIEW_MODE`` (read
+    fresh, normalized) because a cached ``approve`` is now merge-actionable
+    via ``server._maybe_dispatch_cached_merge``: omitting them let a stale
+    approve — computed under a looser approve threshold, or in advisory mode
+    before a flip to ``all`` — survive the config change in the disk cache and
+    auto-merge a PR the current policy would block (audit 07-02 #3). Normalized
+    (strip + lower; empty mode → ``"all"``, mirroring
+    ``server._resolve_review_mode``) so cosmetic differences don't spuriously
+    wipe the cache.
+    """
+    approve_max = os.environ.get("REVIEW_APPROVE_MAX_SEVERITY", "low").strip().lower()
+    review_mode = os.environ.get("RAVEN_REVIEW_MODE", "").strip().lower() or "all"
+    content = (
+        f"{get_backend().name}:{RAVEN_AI_MODEL}:{RAVEN_AI_EFFORT}:"
+        f"{approve_max}:{review_mode}:{_REVIEW_PROMPT_TEMPLATE}"
+    )
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 # Binary / lock file extensions and names to strip from diffs
@@ -658,6 +684,171 @@ SKIP_FILENAMES = {
 }
 SKIP_SUFFIX_PATTERNS = [".lock"]
 
+_DIFF_HEADER_PREFIX = "diff --git "
+
+
+def _unquote_git_path(body: str) -> str:
+    """Decode git's C-style path quoting (``core.quotePath``, on by default).
+
+    Git renders a path with non-ASCII or control bytes as
+    ``"caf\\303\\251.py"`` — octal escapes per BYTE of the UTF-8 encoding,
+    not per character. So decode the escapes into latin-1 bytes first, then
+    read those bytes back as UTF-8. Malformed input degrades rather than
+    raising: a mangled filename is recoverable, an exception mid-diff-parse
+    is not — the streaming caller would abort the whole diff.
+
+    Two failure paths, both degrading to the best answer available:
+
+    * ``unicode_escape`` rejects the body (or, under ``-W error``, merely
+      warns about an invalid escape like ``\\777`` — a DeprecationWarning
+      that BECOMES an exception there). Caught broadly on purpose: the
+      docstring's own argument is that nothing here may raise, and naming
+      exception types invites exactly the gap a warning-turned-error walks
+      through. Genuine git output can't reach this (git always escapes
+      ``\\`` inside a quoted span).
+    * The unescaped text isn't a latin-1-encodable UTF-8 byte string —
+      a raw accented char inside the span (``core.quotePath=false``) or
+      characters above U+00FF. Return the UNESCAPED form, not the raw
+      ``body``: escapes have already been resolved, and the old
+      ``errors="replace"`` turned ``café"x.py`` into ``caf�"x.py``,
+      a corrupted name that fails grounding and silently drops the finding.
+    """
+    try:
+        unescaped = body.encode("latin-1", "backslashreplace").decode("unicode_escape")
+    except Exception:
+        return body
+    try:
+        return unescaped.encode("latin-1").decode("utf-8")
+    except Exception:
+        return unescaped
+
+
+def _strip_side_prefix(path: str) -> str:
+    """Drop a leading ``a/`` or ``b/`` diff-side prefix, if present."""
+    return path[2:] if path.startswith(("a/", "b/")) else path
+
+
+def _parse_diff_header_path(line: str) -> str:
+    """Extract the post-image (``b/``) path from a ``diff --git`` header.
+
+    The naive ``line.split(" ")[-1]`` breaks on any path containing a
+    space, yielding a suffix of the real name ("file.py" for "my file.py").
+    Since v0.5.0 that is not cosmetic: ``_drop_ungrounded_findings`` matches
+    each finding's ``file`` against the set of filenames the model was
+    shown, so a mis-parsed name is absent from that set and a legitimate
+    finding is silently discarded. It also corrupts the per-file diff
+    hashes, so the affected file re-reviews on every push (audit 06-13 #11).
+
+    Git quotes each side INDEPENDENTLY, so all four combinations occur.
+    A rename where only one side has non-ASCII emits asymmetric quoting —
+    ``diff --git "a/caf\\303\\251.py" b/cafe.py`` is real git output, not a
+    hypothetical. Handling only the both-quoted case returns the *old*
+    name there (or, mirrored, a literal ``"b/caf\\303\\251.py"`` with
+    quotes and raw escapes attached), which is precisely the silent-loss
+    failure above.
+
+    Strategy, in order:
+      1. Neither side quoted: scan EVERY ``" b/"`` for the split where both
+         sides name the same path. All occurrences matter, not just the
+         first: a path may itself contain ``" b/"``
+         (``a/x b/y.py b/x b/y.py``). Runs FIRST because same-path
+         detection is unambiguous where quote detection is not — Raven's
+         own BB DC synthesizer emits unquoted headers
+         (``bitbucket_dc.py::_json_diff_to_unified`` builds both sides from
+         ``dst``), so a filename containing a space AND a quote arrives in
+         a shape git itself never produces, and step 2 would otherwise
+         match the b-side's *internal* quoted run. Safe to front-run: the
+         ``a/`` guard skips both-quoted and a-only-quoted headers (both
+         start with ``"``), and a b-only-quoted header contains ``" b/``
+         rather than ``" b/"``'s unquoted form, so the scan can't match
+         across a quoting boundary.
+      2. A quoted token at END of line is the b-side — covers both-quoted
+         and b-side-only-quoted. A quoted span cannot contain an unescaped
+         quote, so the trailing span is unambiguous.
+      3. Otherwise, a quoted token at the START is the a-side; consume it
+         and whatever remains is an unquoted b-side (a-side-only-quoted).
+      4. No such split means the sides differ — an unquoted rename. Fall
+         back to the historical last-token behaviour. A renamed path
+         containing spaces is genuinely ambiguous *from the header alone*,
+         which is why both callers first consult ``_rename_target``: git's
+         ``rename to`` line resolves it unambiguously, and this branch is
+         only reached when no rename block is present.
+
+    Returns the path WITHOUT its ``b/`` prefix.
+    """
+    rest = line[len(_DIFF_HEADER_PREFIX):] if line.startswith(_DIFF_HEADER_PREFIX) else line
+    rest = rest.strip()
+
+    # 1. Neither side quoted — same-path split point (see docstring for
+    #    why this precedes the quoted branches).
+    if rest.startswith("a/"):
+        idx = rest.find(" b/")
+        while idx != -1:
+            if rest[2:idx] == rest[idx + 3:]:
+                return rest[idx + 3:]
+            idx = rest.find(" b/", idx + 1)
+
+    # 2. b-side quoted (both-quoted, or b-side only).
+    trailing = re.search(r'\s"((?:[^"\\]|\\.)*)"$', rest)
+    if trailing:
+        return _strip_side_prefix(_unquote_git_path(trailing.group(1)))
+
+    # 3. a-side quoted only — consume it; the remainder IS the b-side.
+    if rest.startswith('"'):
+        leading = re.match(r'"(?:[^"\\]|\\.)*"', rest)
+        if leading:
+            remainder = rest[leading.end():].strip()
+            if remainder:
+                return _strip_side_prefix(remainder)
+
+    # 4. Unquoted rename (or malformed) — historical behaviour.
+    return _strip_side_prefix(rest.split(" ")[-1].strip())
+
+
+_RENAME_TO_PREFIX = "rename to "
+
+
+def _rename_target(lines: list[str], header_index: int,
+                   lookahead: int = 6) -> str | None:
+    """Resolve a rename's post-image path from git's ``rename to`` line.
+
+    The ``diff --git`` header is genuinely ambiguous for a rename whose
+    paths contain spaces — ``a/my file.py b/other file.py`` gives no way to
+    find the boundary between the two, and
+    ``_parse_diff_header_path``'s last-token fallback yields ``file.py``.
+    Since v0.5.0 that is not a cosmetic mislabel: the grounding filter
+    matches findings against the filenames Raven was shown, so a finding on
+    the real name is silently discarded (audit 07-30 / PR #201 review).
+
+    Git resolves it immediately after the header, in the extended-header
+    block::
+
+        diff --git a/my file.py b/other file.py
+        similarity index 90%
+        rename from my file.py
+        rename to other file.py
+
+    ``rename to`` carries a single field to end-of-line with no ``a/``/``b/``
+    prefix, so it is unambiguous where the header is not. It is quoted by
+    the same ``core.quotePath`` rules, hence the unquote.
+
+    Returns ``None`` when this section has no rename block — the caller
+    then keeps the header-derived path, so non-rename diffs are untouched.
+    Scanning stops at the next file section, the ``---`` marker, or the
+    first hunk so a following file's rename block can never be
+    retro-assigned to this one.
+    """
+    for line in lines[header_index + 1: header_index + 1 + lookahead]:
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith((_DIFF_HEADER_PREFIX, "--- ", "@@ ")):
+            break
+        if stripped.startswith(_RENAME_TO_PREFIX):
+            path = stripped[len(_RENAME_TO_PREFIX):].strip()
+            if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
+                path = _unquote_git_path(path[1:-1])
+            return path or None
+    return None
+
 
 def _strip_lockfiles_and_binaries(diff: str) -> str:
     """Remove binary and lockfile sections from a unified diff."""
@@ -665,15 +856,15 @@ def _strip_lockfiles_and_binaries(diff: str) -> str:
     output: list[str] = []
     skip = False
 
-    for line in lines:
-        if line.startswith("diff --git "):
+    for i, line in enumerate(lines):
+        if line.startswith(_DIFF_HEADER_PREFIX):
             # Determine if this file section should be skipped
-            # e.g. "diff --git a/yarn.lock b/yarn.lock"
-            parts = line.split(" ")
-            filename = parts[-1].strip()
-            # remove b/ prefix
-            if filename.startswith("b/"):
-                filename = filename[2:]
+            # e.g. "diff --git a/yarn.lock b/yarn.lock". The helper handles
+            # spaces in the path and git's core.quotePath escaping, and
+            # strips the b/ prefix. A rename's ``rename to`` line wins when
+            # present — the skip/keep decision must key off the real
+            # post-rename name.
+            filename = _rename_target(lines, i) or _parse_diff_header_path(line)
             basename = os.path.basename(filename)
             _, ext = os.path.splitext(basename)
             skip = (
@@ -708,15 +899,16 @@ def split_diff_by_file(diff: str) -> list[tuple[str, str]]:
     current_file = None
     current_lines: list[str] = []
 
-    for line in diff.splitlines(keepends=True):
-        if line.startswith("diff --git "):
+    lines = diff.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.startswith(_DIFF_HEADER_PREFIX):
             if current_file and current_lines:
                 chunks.append((current_file, "".join(current_lines)))
-            parts = line.split(" ")
-            filename = parts[-1].strip()
-            if filename.startswith("b/"):
-                filename = filename[2:]
-            current_file = filename
+            # ``rename to`` wins when present: the header alone can't
+            # disambiguate a rename whose paths contain spaces, and these
+            # keys are what the grounding filter and the per-file diff
+            # hashes match against.
+            current_file = _rename_target(lines, i) or _parse_diff_header_path(line)
             current_lines = [line]
         else:
             current_lines.append(line)
@@ -1030,10 +1222,27 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
             "coverage_gap_files": gap_files,
         }
 
+    # Consolidation was skipped (no rules, no CLAUDE.md), so the review
+    # TEMPLATE is the only governing document — and its "Maximum N findings"
+    # rule is a whole-PR cap that each per-chunk call applied in isolation.
+    # Enforce it here so 30 chunks can't post 300 findings (audit 07-02 #9).
+    # Deliberately not applied on the consolidated path above: there the
+    # repo's own rules govern and may legitimately raise or remove the cap.
+    # Gap markers are appended AFTER the cap — the coverage-gap signal is
+    # operator safety state and never competes with findings for cap space.
+    capped, n_dropped = _cap_findings(all_findings, repo_name)
+    summary = merged_summary or "Multi-file review completed."
+    if n_dropped:
+        # Disclose rather than silently shrink, mirroring the
+        # "Omitted File Contents" convention.
+        summary += (
+            f" — {len(all_findings)} findings capped to {MAX_FINDINGS}, "
+            f"{n_dropped} lower-severity omitted"
+        )
     return {
         "severity": _floor_severity(max_severity),
-        "summary": merged_summary or "Multi-file review completed.",
-        "findings": all_findings + error_findings,
+        "summary": summary,
+        "findings": capped + error_findings,
         "chunked": True,
         "chunks_reviewed": reviewed_count,
         "coverage_gap": bool(errors),
@@ -1535,6 +1744,49 @@ def _drop_ungrounded_findings(
     return kept
 
 
+def _cap_findings(findings: list[dict], repo_name: str,
+                  limit: int = MAX_FINDINGS) -> tuple[list[dict], int]:
+    """Cap ``findings`` at ``limit``, keeping the highest severities.
+
+    Returns ``(kept, dropped_count)``.
+
+    Why this exists (audit 07-02 #9): a chunked review runs one AI call per
+    file, and each call applies the template's "Maximum 10 findings" rule
+    within its own single-file scope. The cap does not compose — 30 chunks x
+    10 findings = 300 findings on one PR. ``_consolidate_chunked_review``
+    normally re-applies whole-PR policy, but it returns ``None`` when the
+    repo has no rules and no CLAUDE.md, leaving the raw merge uncapped.
+
+    Callers apply this ONLY on that raw-merge path. On the consolidated
+    path the repo's own rules govern and may legitimately raise or remove
+    the cap (``prompts/review.md`` states rules take precedence over the
+    template's maximums) — capping there would override repo policy.
+
+    Sorting is stable within a severity tier, so equally-severe findings
+    keep their per-chunk (file) order rather than being reshuffled.
+    Unknown/missing severities rank lowest, so a malformed finding is
+    dropped before a well-formed high one.
+    """
+    if len(findings) <= limit:
+        return findings, 0
+
+    ranked = sorted(
+        findings,
+        key=lambda f: SEVERITY_ORDER.get(
+            str(f.get("severity", "") or "").strip().lower(), 0),
+        reverse=True,
+    )
+    kept = ranked[:limit]
+    dropped = len(findings) - len(kept)
+    logger.warning(
+        "Capping %s review at %d findings (%d dropped) — chunked review with "
+        "no repo policy, so the template cap is enforced server-side",
+        repo_name, limit, dropped,
+    )
+    metrics.add("raven_findings_capped_total", dropped, {"repo": repo_name})
+    return kept, dropped
+
+
 def _recompute_severity(findings: list[dict]) -> str:
     """Highest severity among ``findings`` (``low`` if none).
 
@@ -1685,7 +1937,10 @@ def _truncate_thread(thread: list[dict], total_chars: int | None = None) -> list
         return list(thread)
 
     def _render_size(c: dict) -> int:
-        return len(c.get("user", {}).get("login", "")) + len(c.get("body", "")) + 8
+        # ``or {}`` / ``or ""`` (not .get defaults): a comment with an explicit
+        # null user/body (deleted/anonymous author) has the key present with a
+        # None value, so .get(key, default) returns None, not the default.
+        return len((c.get("user") or {}).get("login") or "") + len(c.get("body") or "") + 8
 
     if sum(_render_size(c) for c in thread) <= cap:
         return list(thread)
@@ -1949,7 +2204,7 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
         raven_lc = (raven_user or "").lower()
         thread_lines = []
         for c in thread_for_prompt:
-            user = c.get('user', {}).get('login', 'unknown')
+            user = (c.get('user') or {}).get('login') or 'unknown'
             cid = c.get('id')
             is_you = bool(raven_lc) and (user or "").lower() == raven_lc
             you_marker = " [YOU]" if is_you else ""
@@ -1966,8 +2221,11 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
 
     conv_lines = []
     for c in conversation:
-        user = c.get("user", {}).get("login", "unknown")
-        body = c.get("body", "")
+        # ``or {}`` / ``or ""`` — a null user/body (deleted/anonymous author on
+        # Gitea's raw comment dicts) is present-but-None, so .get defaults don't
+        # apply and the chained .get would raise AttributeError (audit 07-02 #2).
+        user = (c.get("user") or {}).get("login") or "unknown"
+        body = c.get("body") or ""
         conv_lines.append(f"**{user}:** {body}")
     conv_text = "\n\n".join(conv_lines)
 

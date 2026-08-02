@@ -80,7 +80,21 @@ class OpenAICompatibleBackend(AIBackend):
                 "RAVEN_AI_API_KEY is required for the openai_compatible backend"
             )
 
-        self._max_tokens: int | None = int(raw_max_tokens) if raw_max_tokens else None
+        # Validate RAVEN_AI_MAX_TOKENS at construction so a typo fails with a
+        # clear, named message at startup instead of a cryptic int() ValueError
+        # (audit 07-02 #4).
+        self._max_tokens: int | None = None
+        if raw_max_tokens:
+            try:
+                self._max_tokens = int(raw_max_tokens)
+            except ValueError:
+                raise RuntimeError(
+                    f"RAVEN_AI_MAX_TOKENS must be a positive integer, got {raw_max_tokens!r}"
+                ) from None
+            if self._max_tokens <= 0:
+                raise RuntimeError(
+                    f"RAVEN_AI_MAX_TOKENS must be a positive integer, got {raw_max_tokens!r}"
+                )
         self._client = openai.OpenAI(
             base_url=base_url,
             api_key=api_key,

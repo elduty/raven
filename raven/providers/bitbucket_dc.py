@@ -9,7 +9,7 @@ from urllib.parse import quote
 import requests
 from flask import abort
 
-from raven.providers import GitProvider, DiffTruncatedError
+from raven.providers import GitProvider, DiffTruncatedError, DiffUnverifiableError
 
 logger = logging.getLogger(__name__)
 
@@ -141,40 +141,59 @@ class BitbucketDCProvider(GitProvider):
     def fetch_pr_diff(self, repo_full_name: str, pr_number: int) -> str:
         """Return the raw unified diff for a pull request.
 
-        Some BB Server versions (observed on 9.4.x) return 500 when the
-        request carries ``Accept: text/plain``. Let the server pick its
-        default (JSON in recent versions) and rely on
-        ``_json_diff_to_unified`` to convert.
+        JSON is requested explicitly via ``Accept: application/json``.
+        The truncation flags BB DC uses to signal an over-cap diff exist
+        ONLY in the JSON representation, so JSON is the only format whose
+        completeness can be verified — and a diff we cannot verify must
+        not be reviewed (audit 2026-07-30). ``Accept: text/plain`` is what
+        older servers choked on (500 observed on 9.4.x); asking for the
+        documented JSON content type does not hit that.
 
-        Note: on modern BB DC the JSON branch is the **primary** code
-        path, not a fallback — the session-level Content-Type doesn't
-        send an Accept header and BB DC picks JSON by default. The
-        text-branch is the fallback (kept for older servers that ignore
-        the Content-Type and return plain text).
+        A non-JSON response is refused with :class:`DiffUnverifiableError`
+        rather than reviewed. This is deliberately stricter than before:
+        the old code returned ``resp.text`` unchecked, so a plain-text
+        diff truncated at ``diff.max.lines`` was reviewed as if complete —
+        the same approve/auto-merge-unseen-code hole the JSON guard below
+        closes, left open on the sibling branch.
         """
         project, repo = _split_repo(repo_full_name)
         url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/diff"
-        resp = self.session.get(url, timeout=30)
+        resp = self.session.get(
+            url, headers={"Accept": "application/json"}, timeout=30,
+        )
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
-        if "application/json" in content_type:
-            data = resp.json()
-            # Fail closed on a truncated diff: BB DC caps diff size and
-            # returns only part of the change. Reviewing the partial diff
-            # would let Raven APPROVE + auto-merge code the model never saw
-            # (audit 2026-06-13 finding #1). Refuse instead — the review
-            # flow's error handler posts an actionable comment and blocks
-            # the merge; the comment / cached-merge flows abort safely too.
-            if self._diff_response_truncated(data):
-                raise DiffTruncatedError(
-                    f"Bitbucket DC returned a truncated diff for PR #{pr_number}: "
-                    f"the change exceeds the server's diff size limit, so part of "
-                    f"it is missing from the response. Refusing to review a partial "
-                    f"diff (would risk approving/merging unseen code)."
-                )
-            diff_text = self._json_diff_to_unified(data)
-        else:
-            diff_text = resp.text
+
+        if "application/json" not in content_type:
+            # Empty body is "no diff", not "unverifiable" — keep the
+            # existing, more specific signal for that case.
+            if not resp.text.strip():
+                raise RuntimeError(f"Bitbucket DC returned empty diff for PR #{pr_number}")
+            raise DiffUnverifiableError(
+                f"Bitbucket DC returned the diff for PR #{pr_number} as "
+                f"{content_type or 'an unknown content type'} rather than JSON. "
+                f"Truncation flags exist only in the JSON representation, so a "
+                f"plain-text diff at the server's size limit is indistinguishable "
+                f"from a complete one. Refusing to review a diff whose "
+                f"completeness cannot be verified (would risk approving/merging "
+                f"unseen code)."
+            )
+
+        data = resp.json()
+        # Fail closed on a truncated diff: BB DC caps diff size and
+        # returns only part of the change. Reviewing the partial diff
+        # would let Raven APPROVE + auto-merge code the model never saw
+        # (audit 2026-06-13 finding #1). Refuse instead — the review
+        # flow's error handler posts an actionable comment and blocks
+        # the merge; the comment / cached-merge flows abort safely too.
+        if self._diff_response_truncated(data):
+            raise DiffTruncatedError(
+                f"Bitbucket DC returned a truncated diff for PR #{pr_number}: "
+                f"the change exceeds the server's diff size limit, so part of "
+                f"it is missing from the response. Refusing to review a partial "
+                f"diff (would risk approving/merging unseen code)."
+            )
+        diff_text = self._json_diff_to_unified(data)
         if not diff_text.strip():
             raise RuntimeError(f"Bitbucket DC returned empty diff for PR #{pr_number}")
         return diff_text
@@ -187,7 +206,15 @@ class BitbucketDCProvider(GitProvider):
             dst = (diff_entry.get("destination") or {}).get("toString", "/dev/null")
             src_header = "/dev/null" if src == "/dev/null" else f"a/{src}"
             dst_header = "/dev/null" if dst == "/dev/null" else f"b/{dst}"
-            # Use the real file path for diff --git header
+            # Use the real file path for diff --git header.
+            #
+            # CONTRACT (relied on by reviewer._parse_diff_header_path): both
+            # sides are built from the SAME value and are never quoted. That
+            # keeps every synthesized header — including renames and
+            # non-ASCII paths — on the parser's unambiguous same-path branch,
+            # which is why BB DC is immune to the rename-with-spaces gap that
+            # affects real git output. If this ever emits differing sides or
+            # adds git-style quoting, revisit that parser.
             file_path = dst if dst != "/dev/null" else src
             lines.append(f"diff --git a/{file_path} b/{file_path}")
             lines.append(f"--- {src_header}")

@@ -17,6 +17,27 @@ class DiffTruncatedError(RuntimeError):
     """
 
 
+class DiffUnverifiableError(DiffTruncatedError):
+    """The provider returned a diff whose COMPLETENESS cannot be verified.
+
+    Distinct from :class:`DiffTruncatedError`, which means "we checked and
+    it IS truncated". This means "we could not check at all" — e.g. a
+    Bitbucket DC server that returns the diff as ``text/plain``, a format
+    carrying none of the ``truncated`` flags the JSON representation uses.
+    A plain-text diff sitting at the server's ``diff.max.lines`` cap is
+    indistinguishable from a complete one, so it must be refused for the
+    same reason a known-truncated diff is: reviewing it risks approving
+    and auto-merging code the model never saw.
+
+    Subclasses ``DiffTruncatedError`` deliberately, so every existing
+    ``except DiffTruncatedError`` / ``except RuntimeError`` handler in the
+    review, comment-reply, and cached-merge flows already fails CLOSED on
+    it — the new type only refines the operator-facing message, it never
+    widens what gets reviewed. ``server.py`` must therefore test for this
+    subclass BEFORE its parent when classifying.
+    """
+
+
 class GitProvider(ABC):
     """Abstract interface for git platform operations."""
 
