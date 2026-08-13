@@ -531,6 +531,20 @@ class TestDiffHash:
         marked = self.BEFORE + "\\ No newline at end of file\n"
         assert diff_hash(marked) != diff_hash(self.BEFORE)
 
+    def test_hunkless_chunks_do_not_all_collide(self):
+        # Renames, mode changes and other hunk-less entries carry no '@@'.
+        # Without hunk structure there is no way to separate content from
+        # context, so the whole chunk is hashed — collapsing them all to
+        # one value would hide a real change behind "unchanged".
+        a = "diff --git a/a.py b/a.py\n+old\n"
+        b = "diff --git a/b.py b/b.py\n+stable\n"
+        assert diff_hash(a) != diff_hash(b)
+
+    def test_hunkless_chunk_change_is_detected(self):
+        before = "diff --git a/a.py b/a.py\n+old\n"
+        after = "diff --git a/a.py b/a.py\n+new\n"
+        assert diff_hash(after) != diff_hash(before)
+
     def test_context_only_difference_collapses_to_the_same_hash(self):
         context_only = (
             "diff --git a/a.py b/a.py\n"

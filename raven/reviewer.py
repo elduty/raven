@@ -942,6 +942,12 @@ def diff_hash_content(chunk: str) -> str:
     the hash depend on what the PR actually changes. ``+++``/``---`` file
     headers are excluded structurally: they precede the first ``@@``, and
     nothing before that is kept.
+
+    A chunk carrying no ``@@`` at all — a pure rename, a mode-only change,
+    a binary entry — is returned verbatim. Without hunk structure there is
+    no way to tell content from context, and collapsing every such chunk
+    to the empty string would give them all one hash, hiding a real change
+    behind "unchanged".
     """
     kept: list[str] = []
     in_hunk = False
@@ -951,6 +957,8 @@ def diff_hash_content(chunk: str) -> str:
             continue
         if in_hunk and line[:1] in ("+", "-", "\\"):
             kept.append(line)
+    if not in_hunk:
+        return chunk
     return "\n".join(kept)
 
 
