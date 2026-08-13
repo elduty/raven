@@ -660,7 +660,7 @@ def review_config_hash() -> str:
     review_mode = os.environ.get("RAVEN_REVIEW_MODE", "").strip().lower() or "all"
     content = (
         f"{get_backend().name}:{RAVEN_AI_MODEL}:{RAVEN_AI_EFFORT}:"
-        f"{approve_max}:{review_mode}:{_REVIEW_PROMPT_TEMPLATE}"
+        f"{approve_max}:{review_mode}:{DIFF_HASH_SCHEME}:{_REVIEW_PROMPT_TEMPLATE}"
     )
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
@@ -917,6 +917,46 @@ def split_diff_by_file(diff: str) -> list[tuple[str, str]]:
         chunks.append((current_file, "".join(current_lines)))
 
     return chunks
+
+
+# Bump when the normalization below changes shape — it feeds
+# review_config_hash so a scheme change wipes the findings cache
+# deliberately (one logged full re-review) instead of silently
+# mismatching every cached per-file hash.
+DIFF_HASH_SCHEME = "v2-content-only"
+
+
+def diff_hash_content(chunk: str) -> str:
+    """Reduce a per-file diff chunk to just its added/removed lines.
+
+    The chunk a rebase produces is not the chunk it replaced even when
+    the PR's own edits are byte-identical: ``@@`` hunk headers carry
+    absolute line numbers, ``index`` headers carry blob SHAs, and the
+    surrounding context lines move with the base branch. Hashing the raw
+    chunk therefore marks every touched file as changed after a rebase,
+    which re-reviews it from scratch and re-posts findings the developer
+    already resolved (resolution is tracked per ``comment_id``, and a
+    regenerated finding has none).
+
+    Keeping only ``+``/``-`` bodies and the ``\\ No newline`` marker makes
+    the hash depend on what the PR actually changes. ``+++``/``---`` file
+    headers are excluded structurally: they precede the first ``@@``, and
+    nothing before that is kept.
+    """
+    kept: list[str] = []
+    in_hunk = False
+    for line in chunk.splitlines():
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if in_hunk and line[:1] in ("+", "-", "\\"):
+            kept.append(line)
+    return "\n".join(kept)
+
+
+def diff_hash(chunk: str) -> str:
+    """Rebase-stable SHA256 of a per-file diff chunk."""
+    return hashlib.sha256(diff_hash_content(chunk).encode()).hexdigest()
 
 
 def review_diff(diff: str, repo_name: str, claude_md: str = "",

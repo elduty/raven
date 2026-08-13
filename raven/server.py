@@ -24,7 +24,7 @@ from .providers import GitProvider, DiffTruncatedError, DiffUnverifiableError, g
 from .providers.gitea import GiteaProvider
 from .metrics import add, inc, Timer, format_prometheus
 from .notifier import notify
-from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, MAX_DIFF_LINES, terminate_active_processes, RespondParseError, RAVEN_AI_MODEL, RAVEN_AI_EFFORT, RAVEN_AI_TIMEOUT, RAVEN_AI_RETRY
+from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, diff_hash, MAX_DIFF_LINES, terminate_active_processes, RespondParseError, RAVEN_AI_MODEL, RAVEN_AI_EFFORT, RAVEN_AI_TIMEOUT, RAVEN_AI_RETRY
 from .ai import get_backend
 from .ai.base import AIError
 
@@ -1074,7 +1074,7 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
             clean_diff = _strip_lockfiles_and_binaries(
                 provider.fetch_pr_diff(repo_full_name, pr_number))
             current_hashes = {
-                f: hashlib.sha256(c.encode()).hexdigest()
+                f: diff_hash(c)
                 for f, c in split_diff_by_file(clean_diff)
             }
         except Exception as e:
@@ -1301,7 +1301,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # Incremental review: only review files that changed since last review
         pr_key = f"{provider.name}:{repo_full_name}#{pr_number}"
         file_chunks = {f: c for f, c in split_diff_by_file(clean_diff)}
-        current_hashes = {f: hashlib.sha256(c.encode()).hexdigest() for f, c in file_chunks.items()}
+        current_hashes = {f: diff_hash(c) for f, c in file_chunks.items()}
         now = time.time()
         with _previous_diffs_lock:
             cached = _previous_diffs.get(pr_key)

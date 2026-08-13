@@ -14,6 +14,7 @@ from raven.reviewer import (
     _parse_response,
     _strip_lockfiles_and_binaries,
     _unquote_git_path,
+    diff_hash,
     MAX_FINDINGS,
     respond_to_comment,
     review_diff,
@@ -476,6 +477,68 @@ class TestStripLockfiles:
         result = _strip_lockfiles_and_binaries(diff)
         assert "logo.png" not in result
         assert "main.py" in result
+
+
+# ------------------------------------------------------------------ #
+#  diff_hash                                                          #
+# ------------------------------------------------------------------ #
+
+class TestDiffHash:
+    """A rebase must not mark an unchanged edit as changed — that
+    re-reviews the file and re-posts findings the developer resolved."""
+
+    BEFORE = (
+        "diff --git a/a.py b/a.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/a.py\n"
+        "+++ b/a.py\n"
+        "@@ -10,6 +10,7 @@ def f():\n"
+        "     before_one\n"
+        "     before_two\n"
+        "+    added_line\n"
+        "-    removed_line\n"
+        "     before_three\n"
+    )
+
+    def test_rebase_shifts_do_not_change_the_hash(self):
+        # Same edit after a rebase: new blob SHAs, hunk moved down 40
+        # lines, different surrounding context.
+        after = (
+            "diff --git a/a.py b/a.py\n"
+            "index 3333333..4444444 100644\n"
+            "--- a/a.py\n"
+            "+++ b/a.py\n"
+            "@@ -50,6 +50,7 @@ def f():\n"
+            "     after_one\n"
+            "     after_two\n"
+            "+    added_line\n"
+            "-    removed_line\n"
+            "     after_three\n"
+        )
+        assert diff_hash(after) == diff_hash(self.BEFORE)
+
+    def test_a_real_edit_still_changes_the_hash(self):
+        edited = self.BEFORE.replace("+    added_line", "+    added_line_v2")
+        assert diff_hash(edited) != diff_hash(self.BEFORE)
+
+    def test_file_headers_are_not_mistaken_for_added_lines(self):
+        # '+++ b/…' starts with '+' — renaming the file must not look
+        # like a content change.
+        renamed = self.BEFORE.replace("b/a.py", "b/renamed.py")
+        assert diff_hash(renamed) == diff_hash(self.BEFORE)
+
+    def test_no_newline_marker_counts_as_content(self):
+        marked = self.BEFORE + "\\ No newline at end of file\n"
+        assert diff_hash(marked) != diff_hash(self.BEFORE)
+
+    def test_context_only_difference_collapses_to_the_same_hash(self):
+        context_only = (
+            "diff --git a/a.py b/a.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            "     wholly different context\n"
+        )
+        empty = "diff --git a/a.py b/a.py\n@@ -1,2 +1,2 @@\n"
+        assert diff_hash(context_only) == diff_hash(empty)
 
 
 # ------------------------------------------------------------------ #
