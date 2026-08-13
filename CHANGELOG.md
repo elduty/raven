@@ -2,6 +2,16 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## Unreleased
+
+### Fixed
+
+- **A rebase no longer re-posts findings the developer already resolved.** Incremental review decides what to re-review by hashing each file's raw diff chunk, which carries `@@` hunk headers with absolute line numbers, `index` blob SHAs, and the surrounding context lines. A rebase changes all three for any file whose base moved, so files whose own edits were byte-identical were treated as changed and reviewed from scratch — and a regenerated finding carries no `comment_id`, which is what the user-resolved filter matches on, so every resolution on those files was lost. The per-file hash now covers only the added and removed lines, making it stable across rebases, merges from the base branch, and any other change to surrounding context.
+
+### Upgrading
+
+The findings cache invalidates itself on first start after this upgrade (the hash scheme is folded into `review_config_hash`), so every open PR gets one full re-review. Subsequent pushes are incremental as usual.
+
 ## v0.5.1 — 2026-08-03
 
 Correctness and safety release. Two of these fixes close paths where Raven could approve or merge code the model never fully saw; two more close paths where real findings were silently discarded before reaching the PR. No new features.
