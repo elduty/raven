@@ -6400,7 +6400,8 @@ class TestFetchPromptOverride:
         result = _fetch_prompt_override(provider, "owner/repo", "main", "review")
         assert result is None
 
-    def test_returns_none_when_rules_dir_empty(self, mocker):
+    def test_returns_none_when_both_config_dirs_empty(self, mocker):
+        mocker.patch("raven.server.CONFIG_DIR", "")
         mocker.patch("raven.server.RULES_DIR", "")
         from raven.server import _fetch_prompt_override
         provider = MagicMock()
@@ -6410,7 +6411,7 @@ class TestFetchPromptOverride:
         provider.fetch_file.assert_not_called()
 
     def test_constructs_correct_path_for_review(self, mocker):
-        mocker.patch("raven.server.RULES_DIR", ".claude/rules")
+        mocker.patch("raven.server.CONFIG_DIR", ".raven")
         from raven.server import _fetch_prompt_override
         captured = {}
         def fetch_file(repo, path, ref=None):
@@ -6419,11 +6420,11 @@ class TestFetchPromptOverride:
             return "body"
         provider = self._make_provider(fetch_file)
         _fetch_prompt_override(provider, "owner/repo", "main", "review")
-        assert captured["path"] == ".claude/rules/raven/prompts/review.md"
+        assert captured["path"] == ".raven/prompts/review.md"
         assert captured["ref"] == "main"
 
     def test_constructs_correct_path_for_respond(self, mocker):
-        mocker.patch("raven.server.RULES_DIR", ".claude/rules")
+        mocker.patch("raven.server.CONFIG_DIR", ".raven")
         from raven.server import _fetch_prompt_override
         captured = {}
         def fetch_file(repo, path, ref=None):
@@ -6431,9 +6432,10 @@ class TestFetchPromptOverride:
             return "body"
         provider = self._make_provider(fetch_file)
         _fetch_prompt_override(provider, "owner/repo", "main", "respond")
-        assert captured["path"] == ".claude/rules/raven/prompts/respond.md"
+        assert captured["path"] == ".raven/prompts/respond.md"
 
-    def test_honours_custom_rules_dir(self, mocker):
+    def test_legacy_fallback_honours_custom_rules_dir(self, mocker):
+        mocker.patch("raven.server.CONFIG_DIR", "")
         mocker.patch("raven.server.RULES_DIR", ".custom/dir")
         from raven.server import _fetch_prompt_override
         captured = {}
@@ -6443,6 +6445,469 @@ class TestFetchPromptOverride:
         provider = self._make_provider(fetch_file)
         _fetch_prompt_override(provider, "owner/repo", "main", "review")
         assert captured["path"] == ".custom/dir/raven/prompts/review.md"
+
+
+# ------------------------------------------------------------------ #
+#  .raven/ config dir + legacy .claude/rules/raven/ fallback          #
+# ------------------------------------------------------------------ #
+
+
+class TestRepoConfigDirResolution:
+    """Raven's per-repo config (prompt overrides, severities.json) lives
+    under ``RAVEN_CONFIG_DIR`` (default ``.raven``), NOT under
+    ``.claude/`` — everything below ``.claude/`` is swept into every
+    other agent's context in that repo, and a Raven prompt override is
+    noise to all of them.
+
+    The pre-move ``{RULES_DIR}/raven/`` home is still read as a fallback
+    so existing repos keep working. A hit there is reported back through
+    ``on_legacy_path`` so the review body can nag about it.
+    """
+
+    NEW_REVIEW = ".raven/prompts/review.md"
+    NEW_RESPOND = ".raven/prompts/respond.md"
+    NEW_SCALE = ".raven/severities.json"
+    OLD_REVIEW = ".claude/rules/raven/prompts/review.md"
+    OLD_RESPOND = ".claude/rules/raven/prompts/respond.md"
+    OLD_SCALE = ".claude/rules/raven/severities.json"
+
+    SCALE_BODY = '{"severities": {"nit": 1, "bad": 2}}'
+
+    def _provider(self, files):
+        """Provider whose fetch_file serves ``files`` and returns "" (the
+        providers' real 404 behaviour) for everything else."""
+        mp = MagicMock()
+        mp.fetch_file.side_effect = (
+            lambda repo, path, ref=None: files.get(path, ""))
+        return mp
+
+    def _paths(self, mp):
+        return [c.args[1] for c in mp.fetch_file.call_args_list]
+
+    def _std_dirs(self, mocker, config_dir=".raven", rules_dir=".claude/rules"):
+        import raven.server as server
+        mocker.patch.object(server, "CONFIG_DIR", config_dir)
+        mocker.patch.object(server, "RULES_DIR", rules_dir)
+
+    # ── prompt overrides ─────────────────────────────────────────── #
+
+    def test_review_override_reads_the_new_path_first(self, mocker):
+        self._std_dirs(mocker)
+        from raven.server import _fetch_prompt_override
+        mp = self._provider({self.NEW_REVIEW: "NEW BODY"})
+        assert _fetch_prompt_override(mp, "o/r", "main", "review") == "NEW BODY"
+        assert self._paths(mp)[0] == self.NEW_REVIEW
+
+    def test_respond_override_reads_the_new_path_first(self, mocker):
+        self._std_dirs(mocker)
+        from raven.server import _fetch_prompt_override
+        mp = self._provider({self.NEW_RESPOND: "NEW BODY"})
+        assert _fetch_prompt_override(mp, "o/r", "main", "respond") == "NEW BODY"
+        assert self._paths(mp)[0] == self.NEW_RESPOND
+
+    def test_new_path_hit_never_probes_the_legacy_path(self, mocker):
+        self._std_dirs(mocker)
+        from raven.server import _fetch_prompt_override
+        mp = self._provider({self.NEW_REVIEW: "NEW", self.OLD_REVIEW: "OLD"})
+        seen = []
+        result = _fetch_prompt_override(mp, "o/r", "main", "review",
+                                        on_legacy_path=seen.append)
+        assert result == "NEW"
+        assert self.OLD_REVIEW not in self._paths(mp)
+        assert seen == []
+
+    def test_falls_back_to_the_legacy_path(self, mocker):
+        self._std_dirs(mocker)
+        from raven.server import _fetch_prompt_override
+        mp = self._provider({self.OLD_REVIEW: "OLD BODY"})
+        seen = []
+        result = _fetch_prompt_override(mp, "o/r", "main", "review",
+                                        on_legacy_path=seen.append)
+        assert result == "OLD BODY"
+        assert self._paths(mp) == [self.NEW_REVIEW, self.OLD_REVIEW]
+
+    def test_legacy_hit_reports_the_relative_path(self, mocker):
+        self._std_dirs(mocker)
+        from raven.server import _fetch_prompt_override
+        mp = self._provider({self.OLD_RESPOND: "OLD BODY"})
+        seen = []
+        _fetch_prompt_override(mp, "o/r", "main", "respond",
+                               on_legacy_path=seen.append)
+        assert seen == ["prompts/respond.md"]
+
+    def test_whitespace_only_new_path_falls_through_to_legacy(self, mocker):
+        """An empty override is "no override" on either path — a repo that
+        blanked the new file must not lose its legacy one silently."""
+        self._std_dirs(mocker)
+        from raven.server import _fetch_prompt_override
+        mp = self._provider({self.NEW_REVIEW: "  \n\t ", self.OLD_REVIEW: "OLD"})
+        assert _fetch_prompt_override(mp, "o/r", "main", "review") == "OLD"
+
+    def test_new_path_fetch_error_still_tries_legacy(self, mocker):
+        self._std_dirs(mocker)
+        from raven.server import _fetch_prompt_override
+
+        def fetch(repo, path, ref=None):
+            if path == self.NEW_REVIEW:
+                raise RuntimeError("transport blew up")
+            return "OLD BODY"
+
+        mp = MagicMock()
+        mp.fetch_file.side_effect = fetch
+        assert _fetch_prompt_override(mp, "o/r", "main", "review") == "OLD BODY"
+
+    def test_config_dir_empty_disables_the_new_path_only(self, mocker):
+        self._std_dirs(mocker, config_dir="")
+        from raven.server import _fetch_prompt_override
+        mp = self._provider({self.OLD_REVIEW: "OLD"})
+        assert _fetch_prompt_override(mp, "o/r", "main", "review") == "OLD"
+        assert self._paths(mp) == [self.OLD_REVIEW]
+
+    def test_rules_dir_empty_disables_the_legacy_path_only(self, mocker):
+        self._std_dirs(mocker, rules_dir="")
+        from raven.server import _fetch_prompt_override
+        mp = self._provider({self.OLD_REVIEW: "OLD"})
+        assert _fetch_prompt_override(mp, "o/r", "main", "review") is None
+        assert self._paths(mp) == [self.NEW_REVIEW]
+
+    def test_both_dirs_empty_fetches_nothing(self, mocker):
+        self._std_dirs(mocker, config_dir="", rules_dir="")
+        from raven.server import _fetch_prompt_override
+        mp = self._provider({})
+        assert _fetch_prompt_override(mp, "o/r", "main", "review") is None
+        mp.fetch_file.assert_not_called()
+
+    def test_honours_a_custom_config_dir(self, mocker):
+        self._std_dirs(mocker, config_dir=".ravenconf")
+        from raven.server import _fetch_prompt_override
+        mp = self._provider({".ravenconf/prompts/review.md": "BODY"})
+        assert _fetch_prompt_override(mp, "o/r", "main", "review") == "BODY"
+
+    # ── severity scale ───────────────────────────────────────────── #
+
+    def test_scale_reads_the_new_path_first(self, mocker):
+        self._std_dirs(mocker)
+        import raven.server as server
+        mp = self._provider({self.NEW_SCALE: self.SCALE_BODY})
+        scale = server._fetch_severity_scale(mp, "o/r", "main")
+        assert scale.ordered() == ["bad", "nit"]
+        assert self._paths(mp)[0] == self.NEW_SCALE
+
+    def test_scale_falls_back_to_the_legacy_path_and_reports_it(self, mocker):
+        self._std_dirs(mocker)
+        import raven.server as server
+        mp = self._provider({self.OLD_SCALE: self.SCALE_BODY})
+        seen = []
+        scale = server._fetch_severity_scale(mp, "o/r", "main",
+                                             on_legacy_path=seen.append)
+        assert scale.ordered() == ["bad", "nit"]
+        assert seen == ["severities.json"]
+
+    def test_scale_new_path_wins_over_legacy(self, mocker):
+        self._std_dirs(mocker)
+        import raven.server as server
+        mp = self._provider({
+            self.NEW_SCALE: '{"severities": {"new": 1, "newer": 2}}',
+            self.OLD_SCALE: self.SCALE_BODY,
+        })
+        assert server._fetch_severity_scale(mp, "o/r", "main").ordered() == \
+            ["newer", "new"]
+
+    def test_rules_dir_empty_no_longer_disables_the_scale(self, mocker):
+        """Behaviour change on upgrade: RAVEN_RULES_DIR="" used to be the
+        kill switch for the scale file too. It now only disables the
+        legacy path — RAVEN_CONFIG_DIR="" is the new kill switch."""
+        self._std_dirs(mocker, rules_dir="")
+        import raven.server as server
+        mp = self._provider({self.NEW_SCALE: self.SCALE_BODY})
+        assert server._fetch_severity_scale(mp, "o/r", "main").ordered() == \
+            ["bad", "nit"]
+
+    def test_both_dirs_empty_skips_the_scale_fetch(self, mocker):
+        self._std_dirs(mocker, config_dir="", rules_dir="")
+        import raven.server as server
+        from raven.severity import default_scale
+        mp = self._provider({})
+        assert server._fetch_severity_scale(mp, "o/r", "main").ranks == \
+            default_scale().ranks
+        mp.fetch_file.assert_not_called()
+
+    def test_scale_fetch_failure_on_both_paths_still_fails_the_merge_closed(self, mocker):
+        """The on_fetch_failed contract predates the move and must survive
+        it: a scale Raven merely failed to READ must not silently
+        substitute the looser built-in gate on a merge-capable path."""
+        self._std_dirs(mocker)
+        import raven.server as server
+        mocker.patch.object(server, "inc")
+        mp = MagicMock()
+        mp.fetch_file.side_effect = RuntimeError("boom")
+        failed = []
+        server._fetch_severity_scale(mp, "o/r", "main",
+                                     on_fetch_failed=lambda: failed.append(True))
+        assert failed == [True]
+
+    def test_new_path_read_failure_fails_the_merge_closed_even_with_a_legacy_scale(self, mocker):
+        """The non-obvious half of the fail-closed contract: a review that
+        got a perfectly usable scale off the legacy path STILL refuses to
+        merge, because the `.raven` file it could not read may be a
+        stricter scale that supersedes it. Nothing about the returned
+        object shows this — only on_fetch_failed does — so a refactor
+        that dropped the flag once any path succeeded would look correct
+        and silently re-open the gate."""
+        self._std_dirs(mocker)
+        import raven.server as server
+        mocker.patch.object(server, "inc")
+
+        def fetch(repo, path, ref=None):
+            if path == self.NEW_SCALE:
+                raise RuntimeError("transport blew up")
+            return self.SCALE_BODY
+
+        mp = MagicMock()
+        mp.fetch_file.side_effect = fetch
+        failed = []
+        scale = server._fetch_severity_scale(
+            mp, "o/r", "main", on_fetch_failed=lambda: failed.append(True))
+
+        # The legacy scale governs the review that still posts...
+        assert scale.ordered() == ["bad", "nit"]
+        # ...but the merge gate is closed regardless.
+        assert failed == [True]
+
+    def test_scale_absent_on_both_paths_does_not_fail_closed(self, mocker):
+        """"No file anywhere" is the normal case for most repos and must
+        stay a silent default — only a READ FAILURE fails closed."""
+        self._std_dirs(mocker)
+        import raven.server as server
+        mp = self._provider({})
+        failed = []
+        server._fetch_severity_scale(mp, "o/r", "main",
+                                     on_fetch_failed=lambda: failed.append(True))
+        assert failed == []
+
+
+class TestLegacyConfigPathNote:
+    """Every review that read config from the deprecated path carries a
+    migration note in its body — the in-band nag that replaces a
+    dashboard metric."""
+
+    def _dirs(self, mocker):
+        import raven.server as server
+        mocker.patch.object(server, "CONFIG_DIR", ".raven")
+        mocker.patch.object(server, "RULES_DIR", ".claude/rules")
+
+    def test_no_note_when_nothing_legacy_was_read(self, mocker):
+        self._dirs(mocker)
+        import raven.server as server
+        assert server._legacy_config_path_lines({}) == []
+        assert server._legacy_config_path_lines({"legacy_config_paths": []}) == []
+
+    def test_note_names_the_old_and_the_new_path(self, mocker):
+        self._dirs(mocker)
+        import raven.server as server
+        lines = server._legacy_config_path_lines(
+            {"legacy_config_paths": ["severities.json"]})
+        body = "\n".join(lines)
+        assert ".claude/rules/raven/severities.json" in body
+        assert ".raven/severities.json" in body
+
+    def test_note_covers_every_legacy_file_read(self, mocker):
+        self._dirs(mocker)
+        import raven.server as server
+        body = "\n".join(server._legacy_config_path_lines(
+            {"legacy_config_paths": ["prompts/review.md", "severities.json"]}))
+        assert ".raven/prompts/review.md" in body
+        assert ".raven/severities.json" in body
+
+    def test_note_suppressed_when_the_legacy_dir_is_disabled(self, mocker):
+        """RULES_DIR="" means the legacy path can't have been read, so a
+        stale field on a cached review dict must not render a note
+        pointing at a path that doesn't resolve."""
+        import raven.server as server
+        mocker.patch.object(server, "CONFIG_DIR", ".raven")
+        mocker.patch.object(server, "RULES_DIR", "")
+        assert server._legacy_config_path_lines(
+            {"legacy_config_paths": ["severities.json"]}) == []
+
+    def test_markdown_breaking_paths_are_dropped_not_escaped(self, mocker):
+        """The note renders paths inside code spans in a PR comment. Only
+        Raven's own literals ever reach this field today, but the review
+        dict it rides on is model-shaped — a backtick must not be able to
+        close the span and start emitting free markdown."""
+        self._dirs(mocker)
+        import raven.server as server
+        body = "\n".join(server._legacy_config_path_lines({
+            "legacy_config_paths": ["ev`il.md", "with\nnewline", "severities.json"],
+        }))
+        assert "ev`il" not in body
+        assert "newline" not in body
+        assert ".raven/severities.json" in body
+
+    def test_summary_body_carries_the_note(self, mocker):
+        self._dirs(mocker)
+        import raven.server as server
+        body = server._format_comment({
+            "severity": "low", "summary": "s", "findings": [],
+            "legacy_config_paths": ["prompts/review.md"],
+        })
+        assert ".raven/prompts/review.md" in body
+
+    def test_inline_body_carries_the_note(self, mocker):
+        """RAVEN_REVIEW_OUTPUT=inline never calls _format_comment — the
+        nag must not vanish for those operators (same trap the severity
+        mismatch line already fell into once)."""
+        self._dirs(mocker)
+        import raven.server as server
+        body = server._format_inline_leftovers(
+            [], review={"legacy_config_paths": ["severities.json"]})
+        assert ".raven/severities.json" in body
+
+    def test_severity_mismatch_line_names_the_path_actually_read(self, mocker):
+        """The mismatch note points the operator at a file to go fix — it
+        must name where the scale really came from, not a hardcoded
+        location the repo may no longer use."""
+        self._dirs(mocker)
+        import raven.server as server
+        review = {
+            "unknown_severities": ["critical"],
+            "severity_scale_names": ["blocker", "bug", "nit"],
+        }
+        assert ".raven/severities.json" in "\n".join(
+            server._severity_mismatch_lines(review))
+
+        review["legacy_config_paths"] = ["severities.json"]
+        assert ".claude/rules/raven/severities.json" in "\n".join(
+            server._severity_mismatch_lines(review))
+
+
+class TestProcessPrReportsLegacyConfigPaths:
+    """Call-site guard: the on_legacy_path callback must actually be wired
+    into _process_pr's fetches and reach the posted body. A unit test on
+    the helper alone would pass with the callback never threaded."""
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def _payload(self):
+        return {
+            "repo": "owner/repo", "sender": "alice", "pr_number": 42,
+            "pr_title": "PR #42", "pr_url": "https://git/pulls/42",
+            "head_sha": "abc123", "head_ref": "feature", "base_ref": "main",
+        }
+
+    def _provider(self, files):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [
+            {"user": {"login": "Raven"}, "state": "APPROVED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_head_sha.return_value = "abc123"
+        mc.fetch_pr_diff.return_value = "diff --git a/f.py b/f.py\n+line\n"
+        mc.fetch_file.side_effect = (
+            lambda repo, path, ref=None: files.get(path, ""))
+        mc.list_directory.return_value = []
+        mc.submit_review.return_value = {"id": 1}
+        mc.add_label_to_pr.return_value = None
+        mc.merge_pr.return_value = True
+        mc.get_commit_status.return_value = "success"
+        return mc
+
+    def _submitted_body(self, mc):
+        call = mc.submit_review.call_args
+        return call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
+
+    def _run(self, mc, mocker):
+        mocker.patch.object(_server_mod, "CONFIG_DIR", ".raven")
+        mocker.patch.object(_server_mod, "RULES_DIR", ".claude/rules")
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", "summary"),
+            patch("raven.server.review_diff",
+                  return_value={"severity": "low", "summary": "s", "findings": []}),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+
+    def test_legacy_scale_read_is_nagged_in_the_review_body(self, mocker):
+        mc = self._provider({
+            ".claude/rules/raven/severities.json":
+                '{"severities": {"nit": 1, "bad": 2}}',
+        })
+        self._run(mc, mocker)
+        assert ".raven/severities.json" in self._submitted_body(mc)
+
+    def test_legacy_review_override_is_nagged_in_the_review_body(self, mocker):
+        mc = self._provider({
+            ".claude/rules/raven/prompts/review.md": "OVERRIDE",
+        })
+        self._run(mc, mocker)
+        assert ".raven/prompts/review.md" in self._submitted_body(mc)
+
+    def test_no_nag_when_config_lives_at_the_new_path(self, mocker):
+        mc = self._provider({
+            ".raven/severities.json": '{"severities": {"nit": 1, "bad": 2}}',
+        })
+        self._run(mc, mocker)
+        assert "Deprecated Raven config path" not in self._submitted_body(mc)
+
+    def test_no_nag_when_the_repo_has_no_config_at_all(self, mocker):
+        mc = self._provider({})
+        self._run(mc, mocker)
+        assert "Deprecated Raven config path" not in self._submitted_body(mc)
+
+
+class TestProcessCommentReportsLegacyConfigPaths:
+    """The comment-reply flow is the only path that reads the RESPOND
+    override, so it owns the nag for that file — _process_pr never
+    fetches it and would never notice."""
+
+    def _payload(self):
+        return {
+            "repo": "u/r", "pr_number": 1,
+            "comment_body": "@raven what about this?", "comment_id": 12,
+            "parent_comment_id": None, "_is_mention": True,
+        }
+
+    def _provider(self, files):
+        mp = MagicMock(spec=GitProvider)
+        mp.name = "gitea"
+        mp.fetch_pr_diff.return_value = "diff..."
+        mp.get_pr_comments.return_value = []
+        mp.get_comment_thread.return_value = []
+        mp.get_pr_state.return_value = "open"
+        mp.get_pr_head_sha.return_value = "abc123"
+        mp.get_pr_base_ref.return_value = "main"
+        mp.get_authenticated_user.return_value = "raven"
+        mp.supports_comment_threads = True
+        mp.fetch_file.side_effect = (
+            lambda repo, path, ref=None: files.get(path, ""))
+        return mp
+
+    def _posted_body(self, mp):
+        return mp.post_pr_comment.call_args.args[2]
+
+    def _run(self, mp, mocker):
+        mocker.patch.object(_server_mod, "CONFIG_DIR", ".raven")
+        mocker.patch.object(_server_mod, "RULES_DIR", ".claude/rules")
+        with patch("raven.server.respond_to_comment",
+                   return_value={"response": "here you go"}):
+            _process_comment(mp, self._payload())
+
+    def test_legacy_respond_override_is_nagged_in_the_reply(self, mocker):
+        mp = self._provider({
+            ".claude/rules/raven/prompts/respond.md": "OVERRIDE",
+        })
+        self._run(mp, mocker)
+        body = self._posted_body(mp)
+        assert "here you go" in body
+        assert ".raven/prompts/respond.md" in body
+
+    def test_no_nag_when_the_respond_override_is_at_the_new_path(self, mocker):
+        mp = self._provider({".raven/prompts/respond.md": "OVERRIDE"})
+        self._run(mp, mocker)
+        assert "Deprecated Raven config path" not in self._posted_body(mp)
 
 
 # ------------------------------------------------------------------ #
@@ -8427,8 +8892,9 @@ class TestFetchSeverityScale:
         p = self._provider(mocker, exc=RuntimeError("boom"))
         assert server._fetch_severity_scale(p, "acme/repo", "r").ranks == default_scale().ranks
 
-    def test_rules_dir_disabled_skips_the_fetch(self, mocker):
+    def test_both_config_dirs_disabled_skips_the_fetch(self, mocker):
         import raven.server as server
+        mocker.patch.object(server, "CONFIG_DIR", "")
         mocker.patch.object(server, "RULES_DIR", "")
         p = self._provider(mocker, body='{"severities": {"a": 1, "b": 2}}')
         server._fetch_severity_scale(p, "acme/repo", "r")

@@ -89,6 +89,9 @@ services:
       # silently fall back to the default, breaking the disable switch.
       - RAVEN_RULES_DIR=${RAVEN_RULES_DIR-.claude/rules}
       - RAVEN_REVIEW_RULES_TOTAL_CHARS=${RAVEN_REVIEW_RULES_TOTAL_CHARS:-16000}
+      # Raven's own per-repo config (prompt overrides + severities.json).
+      # Same ${VAR-default} (no colon) reasoning as RAVEN_RULES_DIR above.
+      - RAVEN_CONFIG_DIR=${RAVEN_CONFIG_DIR-.raven}
       # ── Raven internals (defaults must match raven/server.py + raven/providers/gitea.py)
       - RAVEN_LABEL_NAME=${RAVEN_LABEL_NAME:-raven-reviewed}
       - RAVEN_MAX_WORKERS=${RAVEN_MAX_WORKERS:-16}

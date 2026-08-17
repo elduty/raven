@@ -2,6 +2,46 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## v0.6.1 — 2026-08-17
+
+Housekeeping release. Raven's per-repo configuration moves out of `.claude/`, where every other agent working in a repo was loading it into context. No new features, and existing repos keep working untouched — but **read the Breaking section before deploying if you set `RAVEN_RULES_DIR=""`**: that variable no longer suppresses repo-supplied prompt overrides and severity scales on its own.
+
+### Breaking
+
+- **`RAVEN_RULES_DIR=""` no longer disables prompt overrides and the severity scale.** It now switches off rule injection and the legacy fallback path only. Anyone who used it as a blanket kill switch for repo-supplied configuration needs `RAVEN_CONFIG_DIR=""` as well; the two directories are now separately gated because they serve different audiences.
+
+### Changed
+
+- **Raven's per-repo config moved out of `.claude/` into `.raven/`.** Prompt overrides and the severity scale now live at `.raven/prompts/{review,respond}.md` and `.raven/severities.json`, configurable via the new `RAVEN_CONFIG_DIR` (default `.raven`).
+
+  | Old | New |
+  |---|---|
+  | `.claude/rules/raven/prompts/review.md` | `.raven/prompts/review.md` |
+  | `.claude/rules/raven/prompts/respond.md` | `.raven/prompts/respond.md` |
+  | `.claude/rules/raven/severities.json` | `.raven/severities.json` |
+
+  They used to sit under `.claude/rules/raven/`, where every other agent working in the repo swept them into its context — a review-bot prompt override is thousands of tokens of instructions addressed to one tool and noise to every other. Raven's own rule listing is flat, so it never re-read that subtree itself: the leak was entirely outbound, which is why nothing in Raven ever surfaced it.
+
+  `.claude/rules/*.md` rule injection is **unchanged**. Those are the repo's own rules, and other agents reading them is the point — that directory keeps `RAVEN_RULES_DIR` and its existing behaviour.
+
+- The "Severity config mismatch" note in a review body now names the path the scale was actually read from, instead of a hardcoded `{RAVEN_RULES_DIR}/raven/severities.json`. The line exists to send someone to a file to go edit, so it has to name a file that is really there.
+
+- While the legacy fallback exists, a repo with no Raven configuration at all costs two extra file fetches per review — one probing for the review override, one for `severities.json`, both 404s. Both disappear when the fallback is removed.
+
+### Upgrading
+
+**Nothing to do.** The old paths are still read whenever the new ones are absent, and the new path wins when both exist. Move the files at your leisure.
+
+Every review that falls back to a deprecated path carries a ⚠️ note in its body naming the file and where to move it, so the prompt to migrate reaches whoever is reading the pull request, and stops the moment they act on it. A hard cut was deliberately avoided: a repo whose `severities.json` silently stopped being found would fall back to the built-in scale, and for a repo that tightened `blocks_at_or_above` under the same `low`/`medium`/`high` tier names, that built-in scale is the *looser* gate — it would have begun auto-merging past the repo's own blocking tier with no error anywhere.
+
+The findings cache is unaffected. Its per-entry hash covers resolved *content*, not paths, so relocating a file byte-identically produces the same hash — no forced re-review, and no findings regenerated without the comment IDs that carry user resolutions.
+
+The one exception is the configuration named under Breaking above: if you run `RAVEN_RULES_DIR=""` to suppress repo-supplied configuration instance-wide, add `RAVEN_CONFIG_DIR=""` before deploying, or repos will begin supplying prompt overrides and severity scales again from `.raven/`.
+
+### Stats
+
+1386 tests across 19 test files (up from 1350 at v0.6.0).
+
 ## v0.6.0 — 2026-08-14
 
 Feature release. A repository can now define its own severity vocabulary instead of using Raven's built-in `low`/`medium`/`high`, and the tier that blocks a merge becomes the repo's decision rather than a global environment variable. Everything else here is correctness work, most of it on the path that decides whether a review approves.

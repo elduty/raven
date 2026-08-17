@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from flask import Flask, abort, jsonify, request
 
@@ -1745,8 +1745,20 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # diffs from incurring rules/list_directory + per-file fetches
         # only to bail before the AI call.
         rules = _fetch_rules(provider, repo_full_name, base_ref)
+
+        # Deprecated-config-path nag. Same local-closure shape as
+        # scale_fetch_failed below and for the same reason: _process_pr
+        # runs one PR to completion per call, so a closure carries this
+        # without any cross-repo module state.
+        legacy_config_paths: list[str] = []
+
+        def _note_legacy_config_path(relpath: str) -> None:
+            if relpath not in legacy_config_paths:
+                legacy_config_paths.append(relpath)
+
         review_prompt_override = _fetch_prompt_override(
             provider, repo_full_name, base_ref, "review",
+            on_legacy_path=_note_legacy_config_path,
         )
         # scale_fetch_failed distinguishes "severities.json could not be
         # read" (fail the merge gate closed below — see coverage_gap for
@@ -1764,7 +1776,8 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             scale_fetch_failed = True
 
         scale = _fetch_severity_scale(provider, repo_full_name, base_ref,
-                                      on_fetch_failed=_mark_scale_fetch_failed)
+                                      on_fetch_failed=_mark_scale_fetch_failed,
+                                      on_legacy_path=_note_legacy_config_path)
 
         # User-resolved-comment filter, pass 1 (pre-review). Findings
         # whose backing inline comment the developer marked resolved via
@@ -1879,6 +1892,13 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 carried_findings=revalidation_candidates or None,
                 scale=scale,
             )
+        # Ride the migration nag on the review dict, the same channel
+        # unknown_severities uses to reach both body renderers. Set here
+        # rather than at each _format_* call so the parse-error and
+        # advisory bodies carry it too.
+        if legacy_config_paths:
+            review["legacy_config_paths"] = list(legacy_config_paths)
+
         # Save original findings before merging carried ones (used for cache write)
         fresh_findings = list(review.get("findings", []))
 
@@ -2541,9 +2561,19 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             nonlocal comment_scale_fetch_failed
             comment_scale_fetch_failed = True
 
+        # Deprecated-config-path nag, as in _process_pr. The reply is the
+        # only body this flow posts, so it carries the note for both the
+        # scale and the respond override.
+        comment_legacy_config_paths: list[str] = []
+
+        def _note_comment_legacy_config_path(relpath: str) -> None:
+            if relpath not in comment_legacy_config_paths:
+                comment_legacy_config_paths.append(relpath)
+
         comment_scale = _fetch_severity_scale(
             provider, repo_full_name, comment_base_ref,
-            on_fetch_failed=_mark_comment_scale_fetch_failed)
+            on_fetch_failed=_mark_comment_scale_fetch_failed,
+            on_legacy_path=_note_comment_legacy_config_path)
         # Fetch the PR head SHA up-front for the code-snippet block below.
         try:
             cmd_head_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
@@ -2637,6 +2667,7 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             )
             respond_prompt_override = _fetch_prompt_override(
                 provider, repo_full_name, base_ref, "respond",
+                on_legacy_path=_note_comment_legacy_config_path,
             )
         except Exception as e:
             logger.debug("Could not resolve base ref / respond override for PR #%d: %s",
@@ -2699,6 +2730,10 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             body = f"\U0001f985 **Re: {location}**\n\n{response}"
         else:
             body = f"\U0001f985 {response}"
+        legacy_lines = _legacy_config_path_lines(
+            {"legacy_config_paths": comment_legacy_config_paths})
+        if legacy_lines:
+            body += "\n\n" + "\n".join(legacy_lines)
         provider.post_pr_comment(repo_full_name, pr_number, body,
                                  parent_comment_id=comment_id)
         inc("raven_responses_total", {"repo": repo_full_name})
@@ -3677,7 +3712,111 @@ def _fetch_changed_files(provider: GitProvider, repo_full_name: str, head_sha: s
 # context for every review. Override with RAVEN_RULES_DIR (set to empty
 # string to disable entirely). Default matches the common Claude-Code
 # convention of ``.claude/rules/``.
+#
+# These are the repo's OWN rules, shared with every agent working in it —
+# Raven reading them is the point. Contrast CONFIG_DIR below, which holds
+# config that is Raven's business alone.
 RULES_DIR = os.environ.get("RAVEN_RULES_DIR", ".claude/rules")
+
+# Directory holding Raven's per-repo configuration: prompt overrides
+# (``prompts/{review,respond}.md``) and the severity scale
+# (``severities.json``). Override with RAVEN_CONFIG_DIR (empty string
+# disables per-repo Raven config entirely).
+#
+# Deliberately OUTSIDE ``.claude/``, where all three lived until
+# 2026-08-17. Agents working in a repo sweep ``.claude/`` into their
+# context wholesale, so a Raven prompt override — thousands of tokens of
+# instructions addressed to a code-review bot, relevant to no other
+# tool — was being loaded by every one of them. Raven's own rule listing
+# is flat (``providers/*.list_directory``), so it never re-read that
+# subtree itself: the leak was entirely outbound, which is exactly why
+# nothing here caught it.
+CONFIG_DIR = os.environ.get("RAVEN_CONFIG_DIR", ".raven")
+
+
+def _legacy_config_path(relpath: str) -> str | None:
+    """The pre-2026-08-17 home of ``{CONFIG_DIR}/{relpath}``, under
+    ``{RULES_DIR}/raven/``.
+
+    ``None`` when ``RULES_DIR`` is disabled — there is no legacy path to
+    read, and no legacy path to name in the migration note.
+    """
+    if not RULES_DIR:
+        return None
+    return f"{RULES_DIR}/raven/{relpath}"
+
+
+class _RepoConfigFile(NamedTuple):
+    """Outcome of resolving one per-repo config file across both homes.
+
+    ``content`` is ``""`` when the file is absent from both. ``legacy``
+    marks a hit on the deprecated path (drives the migration note).
+    ``fetch_failed`` marks that at least one attempt RAISED — distinct
+    from "absent", and the distinction is load-bearing for the severity
+    scale's fail-closed merge gate.
+    """
+    content: str
+    legacy: bool
+    fetch_failed: bool
+
+
+def _fetch_repo_config_file(provider: GitProvider, repo_full_name: str,
+                            ref: str, relpath: str,
+                            on_legacy_path: Callable[[str], None] | None = None,
+                            ) -> _RepoConfigFile:
+    """Read ``{CONFIG_DIR}/{relpath}`` at ``ref``, falling back to the
+    legacy ``{RULES_DIR}/raven/{relpath}``.
+
+    The new path wins whenever it holds content, and the legacy path is
+    not even probed in that case — so a repo mid-migration that left the
+    old file behind gets the new one, and pays no extra API call.
+
+    ``on_legacy_path`` fires with ``relpath`` (not the full path — the
+    renderer reconstructs both ends from the current dirs) only when the
+    content actually came from the deprecated location. Callers use it to
+    nag in-band; see ``_legacy_config_path_lines``.
+
+    A whitespace-only file counts as absent on BOTH paths: blanking the
+    new file is how someone disables an override, and having that
+    silently resurrect the legacy one would be a nasty surprise.
+
+    Never raises — a config file that can't be read must not stop the
+    review. ``fetch_failed`` reports the failure to callers that need to
+    act on it.
+    """
+    fetch_failed = False
+    candidates: list[tuple[str, bool]] = []
+    if CONFIG_DIR:
+        candidates.append((f"{CONFIG_DIR}/{relpath}", False))
+    legacy_path = _legacy_config_path(relpath)
+    if legacy_path:
+        candidates.append((legacy_path, True))
+
+    for path, is_legacy in candidates:
+        try:
+            content = provider.fetch_file(repo_full_name, path, ref=ref)
+        except Exception as e:
+            # Both providers return "" for a 404 (the common "no such
+            # file" case), so reaching this means a real auth/transport
+            # failure. Keep trying the other path — one location being
+            # unreachable says nothing about the other.
+            logger.warning("Could not read %s at %s for %s: %s",
+                           path, ref[:8] if ref else "", repo_full_name, e)
+            fetch_failed = True
+            continue
+        if content and content.strip():
+            if is_legacy:
+                logger.warning(
+                    "%s read Raven config from the deprecated path %s — "
+                    "move it to %s/%s (the old path still works, but "
+                    "everything under %s is loaded into every other "
+                    "agent's context in this repo)",
+                    repo_full_name, path, CONFIG_DIR, relpath, RULES_DIR)
+                if on_legacy_path is not None:
+                    on_legacy_path(relpath)
+            return _RepoConfigFile(content, is_legacy, fetch_failed)
+
+    return _RepoConfigFile("", False, fetch_failed)
 
 
 def _fetch_rules(provider: GitProvider, repo_full_name: str, ref: str) -> dict[str, str]:
@@ -3722,40 +3861,39 @@ def _fetch_rules(provider: GitProvider, repo_full_name: str, ref: str) -> dict[s
 
 
 def _fetch_prompt_override(provider: GitProvider, repo_full_name: str,
-                            ref: str, name: str) -> str | None:
-    """Fetch a per-repo prompt override from ``{RULES_DIR}/raven/prompts/{name}.md``.
+                            ref: str, name: str,
+                            on_legacy_path: Callable[[str], None] | None = None,
+                            ) -> str | None:
+    """Fetch a per-repo prompt override from ``{CONFIG_DIR}/prompts/{name}.md``,
+    falling back to the legacy ``{RULES_DIR}/raven/prompts/{name}.md``.
 
     Returns the file contents on success, ``None`` on any failure mode
-    (missing file, fetch error, empty / whitespace-only content, or
-    ``RULES_DIR`` disabled). Callers must treat ``None`` as "no override,
+    (missing file, fetch error, empty / whitespace-only content, or both
+    config dirs disabled). Callers must treat ``None`` as "no override,
     use the built-in default".
 
     ``name`` is ``"review"`` or ``"respond"`` — not validated, but only
     those two are currently wired into the reviewer.
+
+    ``on_legacy_path`` — see ``_fetch_repo_config_file``. Optional and
+    keyword-friendly so every existing call site is unaffected.
     """
-    if not RULES_DIR:
+    relpath = f"prompts/{name}.md"
+    result = _fetch_repo_config_file(provider, repo_full_name, ref, relpath,
+                                     on_legacy_path=on_legacy_path)
+    if not result.content:
         return None
-    path = f"{RULES_DIR}/raven/prompts/{name}.md"
-    try:
-        content = provider.fetch_file(repo_full_name, path, ref=ref)
-    except Exception as e:
-        # fetch_file returns "" on 404 (override absent — the common
-        # case); reaching this except means an auth/transport failure
-        # that prevents Raven from honoring a configured override.
-        logger.warning("Prompt override fetch for %s@%s/%s failed (using built-in default): %s",
-                       repo_full_name, ref[:8] if ref else "", path, e)
-        return None
-    if not content or not content.strip():
-        return None
-    logger.info("Loaded %s prompt override from %s for %s",
-                name, path, repo_full_name)
-    return content
+    logger.info("Loaded %s prompt override for %s", name, repo_full_name)
+    return result.content
 
 
 def _fetch_severity_scale(provider: GitProvider, repo_full_name: str,
                           ref: str,
-                          on_fetch_failed: Callable[[], None] | None = None) -> SeverityScale:
-    """Load ``{RULES_DIR}/raven/severities.json`` at ``ref``.
+                          on_fetch_failed: Callable[[], None] | None = None,
+                          on_legacy_path: Callable[[str], None] | None = None,
+                          ) -> SeverityScale:
+    """Load ``{CONFIG_DIR}/severities.json`` at ``ref``, falling back to
+    the legacy ``{RULES_DIR}/raven/severities.json``.
 
     Always returns a usable scale. A missing file, a fetch failure, or an
     invalid file falls back to the built-in default — a defined
@@ -3778,26 +3916,30 @@ def _fetch_severity_scale(provider: GitProvider, repo_full_name: str,
     existing caller (and every test that calls or mocks this function
     positionally / by return value) is unaffected; only ``_process_pr``'s
     fresh-review call site wires it up. See CLAUDE.md "Severity scale".
-    """
-    if not RULES_DIR:
-        return default_scale()
 
-    path = f"{RULES_DIR}/raven/severities.json"
-    try:
-        body = provider.fetch_file(repo_full_name, path, ref=ref)
-    except Exception as e:
-        logger.warning("Could not read %s at %s for %s (using default severity "
-                       "scale): %s", path, ref[:8], repo_full_name, e)
+    ``on_legacy_path`` — see ``_fetch_repo_config_file``.
+
+    A read failure on EITHER path fires ``on_fetch_failed``, even when the
+    other path yielded a usable scale: an unreadable ``{CONFIG_DIR}``
+    file may be a scale stricter than whatever we managed to fall back
+    to, and "we could not see the current config" is the condition the
+    merge gate exists to refuse on.
+    """
+    result = _fetch_repo_config_file(provider, repo_full_name, ref,
+                                     "severities.json",
+                                     on_legacy_path=on_legacy_path)
+    if result.fetch_failed:
         inc("raven_severity_scale_fetch_failed_total", {"repo": repo_full_name})
         if on_fetch_failed is not None:
             on_fetch_failed()
+
+    if not result.content:
         return default_scale()
 
-    if not body or not body.strip():
-        return default_scale()
-
+    path = (_legacy_config_path("severities.json") if result.legacy
+            else f"{CONFIG_DIR}/severities.json")
     try:
-        scale = from_json(body)
+        scale = from_json(result.content)
     except InvalidScale as e:
         logger.warning("Invalid %s in %s — using the default severity scale: %s",
                        path, repo_full_name, e)
@@ -3856,6 +3998,52 @@ def _max_severity_from_findings(findings: list[dict],
     return scale.least_severe
 
 
+def _legacy_config_path_lines(review: dict) -> list[str]:
+    """Migration nag for a review that read Raven config from the
+    deprecated ``{RULES_DIR}/raven/`` home instead of ``{CONFIG_DIR}/``.
+
+    Rendered on EVERY affected review rather than counted on a dashboard:
+    the person who can move the file is the one reading the PR, and the
+    nag stops by itself the moment they do.
+
+    Reconstructs both ends of each move from the relative path the fetch
+    reported, so the note always names the paths this instance actually
+    resolves. Returns ``[]`` when nothing legacy was read (the common
+    case), when the field is absent (cached / pre-move review dicts), or
+    when ``RULES_DIR`` is disabled — with no legacy dir configured there
+    is no old path to name, and a stale field must not render a note
+    pointing at nothing.
+    """
+    relpaths = review.get("legacy_config_paths") or []
+    if not relpaths or not isinstance(relpaths, list):
+        return []
+    moves = []
+    for rp in relpaths:
+        rp = str(rp)
+        # Defence in depth. This field is set only by _process_pr from
+        # Raven's own literals, and _validate_review rebuilds the review
+        # dict from a whitelist so a model-emitted key can't reach here —
+        # but the dict is otherwise model-shaped, and these paths render
+        # inside code spans in a PR comment. A backtick or newline would
+        # break out of the span; drop rather than escape.
+        if "`" in rp or "\n" in rp:
+            continue
+        old = _legacy_config_path(rp)
+        if old:
+            moves.append(f"`{old}` → `{CONFIG_DIR}/{rp}`")
+    if not moves:
+        return []
+    return [
+        "> ⚠️ **Deprecated Raven config path.** This review read config "
+        f"from Raven's pre-`{CONFIG_DIR}` location: {'; '.join(moves)}. "
+        "The old path still works but will stop being read in a future "
+        f"release. Raven's per-repo config moved out of `{RULES_DIR}/` "
+        "because agents working in this repo load that directory into "
+        "their context wholesale, and Raven's config is no use to any of "
+        "them."
+    ]
+
+
 def _severity_mismatch_lines(review: dict) -> list[str]:
     """Lines reporting a vocabulary mismatch between the model's emitted
     severities and the scale actually in effect — the empirical detection
@@ -3868,8 +4056,11 @@ def _severity_mismatch_lines(review: dict) -> list[str]:
     — doesn't silently drop this line. Each caller is responsible for its
     own leading blank-line spacing before the returned lines.
 
-    Names ``{RULES_DIR}/raven/severities.json`` ONLY when a repo scale is
-    actually governing this review. ``unknown_severities`` fires just as
+    Names the severities.json path ONLY when a repo scale is
+    actually governing this review — and names the path the scale was
+    really read from (``legacy_config_paths`` says whether that was the
+    deprecated home), because this line's whole job is to send the
+    operator to a file to go edit. ``unknown_severities`` fires just as
     often for the ~100% of repos with no severities.json at all (built-in
     low/medium/high in effect) — pointing at a file that was never read,
     and likely doesn't exist, sent the operator chasing the wrong cause;
@@ -3895,7 +4086,10 @@ def _severity_mismatch_lines(review: dict) -> list[str]:
             "severity names, or the model not honouring the vocabulary."
         )
     else:
-        scale_ref = f"`{RULES_DIR}/raven/severities.json`"
+        legacy = "severities.json" in (review.get("legacy_config_paths") or [])
+        scale_path = (_legacy_config_path("severities.json") if legacy
+                      else f"{CONFIG_DIR}/severities.json")
+        scale_ref = f"`{scale_path}`"
         fix_hint = "Fix the scale or the prompt override so they use the same names."
     return [
         f"> ⚠️ **Severity config mismatch.** This review emitted severity "
@@ -3952,6 +4146,11 @@ def _format_comment(review: dict, mode: str = "review",
         lines.append("")
         lines.extend(mismatch_lines)
 
+    legacy_lines = _legacy_config_path_lines(review)
+    if legacy_lines:
+        lines.append("")
+        lines.extend(legacy_lines)
+
     if findings:
         lines.append("")
         lines.append("**Findings:**")
@@ -3985,8 +4184,9 @@ def _format_inline_leftovers(findings: list[dict],
     that can't ride on a diff line are those with no postable file/line —
     PR-wide notes and ⚠️ coverage-gap markers (filename, no line). Those are
     listed in a short body so they aren't silently dropped. Returns ``""``
-    when every finding is inline-anchored AND there's no severity-mismatch
-    note (see below), so a clean review posts no body.
+    when every finding is inline-anchored AND there's neither a
+    severity-mismatch note nor a deprecated-config-path note (see below),
+    so a clean review posts no body.
 
     ``scale`` should be the repo's resolved scale — see ``_format_comment``
     for why omitting it is unsafe for a custom vocabulary (every tier
@@ -3994,7 +4194,8 @@ def _format_inline_leftovers(findings: list[dict],
     threaded through.
 
     ``review`` — when supplied — surfaces the same "Severity config
-    mismatch" note ``_format_comment`` renders (``_severity_mismatch_lines``).
+    mismatch" and "Deprecated Raven config path" notes ``_format_comment``
+    renders (``_severity_mismatch_lines``, ``_legacy_config_path_lines``).
     Inline mode never calls ``_format_comment``, so without this the
     feature's whole detection story (which names were unrecognised, what
     the scale actually allows) was invisible under
@@ -4004,7 +4205,8 @@ def _format_inline_leftovers(findings: list[dict],
     """
     scale = scale or default_scale()
     mismatch_lines = _severity_mismatch_lines(review) if review else []
-    if not findings and not mismatch_lines:
+    legacy_lines = _legacy_config_path_lines(review) if review else []
+    if not findings and not mismatch_lines and not legacy_lines:
         return ""
     lines = ["🦅 **Raven**"]
     if findings:
@@ -4018,6 +4220,9 @@ def _format_inline_leftovers(findings: list[dict],
     if mismatch_lines:
         lines.append("")
         lines.extend(mismatch_lines)
+    if legacy_lines:
+        lines.append("")
+        lines.extend(legacy_lines)
     return "\n".join(lines)
 
 

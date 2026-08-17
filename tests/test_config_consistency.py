@@ -18,6 +18,7 @@ _COMPOSE = (_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 _REVIEWER = (_ROOT / "raven" / "reviewer.py").read_text(encoding="utf-8")
 _DOCKERFILE = (_ROOT / "Dockerfile").read_text(encoding="utf-8")
 _REVIEW_PROMPT = (_ROOT / "prompts" / "review.md").read_text(encoding="utf-8")
+_SERVER = (_ROOT / "raven" / "server.py").read_text(encoding="utf-8")
 
 
 def _compose_default(var: str) -> str | None:
@@ -26,9 +27,26 @@ def _compose_default(var: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _compose_default_nocolon(var: str) -> str | None:
+    """The ``<default>`` in a ``- VAR=${VAR-<default>}`` compose line.
+
+    The colon-less form is required for the directory vars: with
+    ``${VAR:-default}`` an empty string in ``.env`` substitutes the
+    default, silently breaking the documented "empty disables it" switch.
+    """
+    m = re.search(rf"-\s*{re.escape(var)}=\$\{{{re.escape(var)}-([^}}]*)\}}", _COMPOSE)
+    return m.group(1) if m else None
+
+
 def _code_default(var: str) -> str | None:
     """The default literal in ``os.environ.get("VAR", "<default>")``."""
     m = re.search(rf'os\.environ\.get\(\s*"{re.escape(var)}"\s*,\s*"([^"]*)"\s*\)', _REVIEWER)
+    return m.group(1) if m else None
+
+
+def _server_default(var: str) -> str | None:
+    """The default literal in server.py's ``os.environ.get("VAR", "...")``."""
+    m = re.search(rf'os\.environ\.get\(\s*"{re.escape(var)}"\s*,\s*"([^"]*)"\s*\)', _SERVER)
     return m.group(1) if m else None
 
 
@@ -54,6 +72,40 @@ def test_ai_timeout_default_matches_between_compose_and_code():
     assert compose == code, (
         f"docker-compose RAVEN_AI_TIMEOUT default {compose!r} != reviewer.py "
         f"default {code!r} — keep the two in sync (audit #7 drift)")
+
+
+def test_config_dir_default_matches_between_compose_and_code():
+    compose = _compose_default_nocolon("RAVEN_CONFIG_DIR")
+    code = _server_default("RAVEN_CONFIG_DIR")
+    assert compose is not None and code is not None
+    assert compose == code, (
+        f"docker-compose RAVEN_CONFIG_DIR default {compose!r} != server.py "
+        f"default {code!r} — keep the two in sync (audit #7 drift)")
+
+
+def test_config_and_rules_dirs_use_the_colonless_compose_form():
+    """Both directory vars document "empty string disables this". That
+    only holds with ``${VAR-default}``; ``${VAR:-default}`` substitutes
+    the default on an empty value and silently re-enables the feature."""
+    for var in ("RAVEN_RULES_DIR", "RAVEN_CONFIG_DIR"):
+        assert _compose_default_nocolon(var) is not None, \
+            f"{var} must use ${{{var}-default}} (no colon) in docker-compose.yml"
+        assert _compose_default(var) is None, \
+            f"{var} must NOT use the ${{{var}:-default}} form — it breaks the disable switch"
+
+
+def test_raven_config_lives_outside_the_agent_rules_dir():
+    """The whole point of the move: Raven's per-repo config must not
+    default to a subdirectory of the rules dir, where every other agent
+    in the repo sweeps it into context."""
+    config_default = _server_default("RAVEN_CONFIG_DIR")
+    rules_default = _server_default("RAVEN_RULES_DIR")
+    assert config_default and rules_default
+    assert not config_default.startswith(rules_default.rstrip("/") + "/"), (
+        f"RAVEN_CONFIG_DIR default {config_default!r} is inside "
+        f"RAVEN_RULES_DIR {rules_default!r} — that reintroduces the "
+        "context leak the .raven/ move exists to fix")
+    assert not config_default.startswith(".claude/")
 
 
 def test_dockerfile_does_not_set_model_or_effort_env():
