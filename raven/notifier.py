@@ -7,9 +7,16 @@ from urllib.parse import urlsplit
 
 import requests
 
+from . import metrics
 from .reviewer import severity_gte
+from .severity import BLOCKING, SeverityScale, default_scale
 
 logger = logging.getLogger(__name__)
+
+# Channels that already warned about an unresolvable min_severity for a
+# given repo — logged once, not on every review, so a misconfigured
+# channel doesn't spam the log on every push.
+_warned_thresholds: set[str] = set()
 
 # ── Channel registry ──────────────────────────────────────────────── #
 
@@ -54,17 +61,22 @@ def notify(repo_name: str, ref: str, review: dict, link: str = "", action: str =
     text = _format_message(repo_name, ref, review, link, action)
     any_sent = False
 
-    severity = review.get("severity", "low")
-
     for channel in channels:
         # Per-repo filter
         repos = channel.get("repos")
         if repos and repo_name not in repos:
             continue
 
-        # Per-channel severity filter
+        # Per-channel severity filter. min_severity is operator config
+        # naming a tier — meaningless in a repo that defined its own
+        # vocabulary. Resolve by rank when the name exists in this repo's
+        # scale, otherwise fall back to gate semantics ("notify when the
+        # review blocks"), the only threshold that means the same thing in
+        # every vocabulary. Failure direction is notify-rather-than-suppress:
+        # a missed alert is worse than a redundant one, and this path has no
+        # merge authority.
         min_sev = channel.get("min_severity")
-        if min_sev and not severity_gte(severity, min_sev):
+        if min_sev and not _passes_threshold(review, min_sev, repo_name):
             continue
 
         channel_type = channel.get("type", "")
@@ -94,6 +106,108 @@ def notify(repo_name: str, ref: str, review: dict, link: str = "", action: str =
     return any_sent
 
 
+def _scale_from_review(review: dict) -> SeverityScale:
+    """Reconstruct the reviewed repo's ``SeverityScale`` from the fields
+    that cross the reviewer -> notifier boundary on the review dict
+    (``severity_scale_names`` / ``severity_blocks_at``).
+
+    Shared by ``_passes_threshold`` and ``_format_message`` so there is one
+    reconstruction, not two independently-maintained copies. Ranks are
+    positional (``len(names) - i``), which preserves *order* but not the
+    scale's original rank numbers — correct for every comparison this
+    module makes (emoji position, threshold rank), and why ``fingerprint()``
+    is never called on the result.
+
+    Falls back to ``default_scale()`` when the review dict carries no scale
+    at all — a legacy or cached review from before this feature — matching
+    today's exact behaviour rather than inventing new colours/defaults for
+    old data.
+    """
+    names = review.get("severity_scale_names") or []
+    if not names:
+        return default_scale()
+    ranks = {n: len(names) - i for i, n in enumerate(names)}
+    # The blocking tier arrives on its own field, so a malformed or
+    # partially-updated review dict can name a tier this scale does not
+    # contain — SeverityScale.blocks() would then raise KeyError on
+    # ranks[blocks_at_or_above] and lose the notification for a review
+    # that already ran. Every current writer emits both fields from one
+    # scale object, so this is an invariant guard rather than a live
+    # bug; degrade to "nothing blocks on severity alone", which fails in
+    # this module's usual direction — toward notifying.
+    blocks_at = review.get("severity_blocks_at")
+    if blocks_at not in ranks:
+        blocks_at = None
+    return SeverityScale(ranks=ranks, blocks_at_or_above=blocks_at)
+
+
+def _passes_threshold(review: dict, min_sev: str, repo_name: str) -> bool:
+    """Does ``review`` clear a channel's ``min_severity`` config?
+
+    ``min_severity`` is operator config naming a tier in SOME severity
+    vocabulary — but with per-repo scales, a channel filtering on
+    "medium" is meaningless for a repo whose tiers are nit/bug/blocker.
+    Resolution mirrors the emoji decision: compare by rank when the name
+    exists in this review's scale; otherwise fall back to gate semantics
+    (``BLOCKING`` sentinel, or any name absent from the scale) — "notify
+    when the review blocks the merge" is the only threshold that means
+    the same thing in every vocabulary.
+
+    Unknown-name handling is deliberately NOT ``SeverityScale.normalize``'s
+    fail-closed-to-most-severe: that contract is for MODEL-emitted
+    severities (an untrusted claim, where "I don't know" must assume the
+    worst). Here the unknown value is OPERATOR config, and failing closed
+    would mean silently suppressing notifications on a typo — the wrong
+    direction when this path has no merge authority and a missed alert
+    outweighs a redundant one.
+
+    ``severity`` on ``review`` itself defaults to ``scale.least_severe``,
+    matching ``_format_message`` — not ``""``. The reviewer always
+    populates it, so this only matters for a degenerate/legacy dict, but
+    the two must agree: ``""`` isn't a tier ``SeverityScale.rank()`` can
+    see, so it used to normalize fail-closed to the scale's MOST severe
+    tier here while ``_format_message`` rendered the identical dict as the
+    LEAST severe one — the exact contradictory-defaults defect class this
+    task exists to prevent (PR #216 review, Finding 3).
+    """
+    scale = _scale_from_review(review)
+    severity = review.get("severity", scale.least_severe)
+    names = review.get("severity_scale_names") or []
+    # Read the blocking tier off the reconstructed scale, not the raw
+    # dict field: _scale_from_review drops a tier it cannot resolve, and
+    # the two must agree or the `blocks_at is None` short-circuit below
+    # would fall through to a scale.blocks() that disagrees with it.
+    blocks_at = scale.blocks_at_or_above
+    clean = str(min_sev).strip().lower()
+
+    # No scale on the review dict at all — a legacy or cached review from
+    # before this feature. Fall back to today's exact behaviour rather
+    # than to gate semantics: with no scale, blocks_at is also absent,
+    # and "notify when it blocks" would degrade into "always notify" and
+    # break every existing channel filter.
+    if not names and clean != BLOCKING:
+        return severity_gte(severity, clean)
+
+    if clean != BLOCKING and names and clean in names:
+        return scale.rank(severity) >= scale.rank(clean)
+
+    if clean != BLOCKING and names and clean not in names:
+        key = f"{repo_name}:{clean}"
+        if key not in _warned_thresholds:
+            _warned_thresholds.add(key)
+            logger.warning(
+                "Channel min_severity %r is not a tier in %s's severity scale "
+                "(%s) — falling back to 'notify when the review blocks'. Use "
+                "'blocking' to make this explicit.",
+                clean, repo_name, ", ".join(names),
+            )
+        metrics.inc("raven_notify_threshold_fallback_total", {"repo": repo_name})
+
+    if blocks_at is None:
+        return True
+    return scale.blocks(severity)
+
+
 def _redacted_host(url: str) -> str:
     """Hostname (plus port, if any) of a channel URL — safe to log.
 
@@ -116,13 +230,11 @@ def _exception_summary(e: Exception) -> str:
 
 # ── Message formatting ────────────────────────────────────────────── #
 
-SEVERITY_EMOJI = {"high": "🔴", "medium": "🟠", "low": "🟡"}
-
-
 def _format_message(repo_name: str, ref: str, review: dict, link: str, action: str) -> str:
-    severity = review.get("severity", "low")
+    scale = _scale_from_review(review)
+    severity = review.get("severity", scale.least_severe)
     summary = review.get("summary", "")
-    emoji = SEVERITY_EMOJI.get(severity, "🟡")
+    emoji = scale.emoji(severity)
 
     if action == "merge_failed":
         header = "🦅 *Raven* — ⚠️ Auto-merge failed"

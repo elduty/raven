@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from flask import Flask, abort, jsonify, request
 
@@ -24,11 +25,10 @@ from .providers import GitProvider, DiffTruncatedError, DiffUnverifiableError, g
 from .providers.gitea import GiteaProvider
 from .metrics import add, inc, Timer, format_prometheus
 from .notifier import notify
-from .reviewer import review_diff, respond_to_comment, severity_gte, SEVERITY_ORDER, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, MAX_DIFF_LINES, terminate_active_processes, RespondParseError, RAVEN_AI_MODEL, RAVEN_AI_EFFORT, RAVEN_AI_TIMEOUT, RAVEN_AI_RETRY
+from .reviewer import review_diff, respond_to_comment, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, diff_hash, hunk_positions, hunk_context_digests, MAX_DIFF_LINES, terminate_active_processes, RespondParseError, RAVEN_AI_MODEL, RAVEN_AI_EFFORT, RAVEN_AI_TIMEOUT, RAVEN_AI_RETRY
 from .ai import get_backend
 from .ai.base import AIError
-
-_SEVERITY_NAME = {v: k for k, v in SEVERITY_ORDER.items()}
+from .severity import SeverityScale, default_scale, from_json, InvalidScale
 
 
 def _review_failure_reason(exc: Exception) -> str:
@@ -326,7 +326,7 @@ class CacheEntry:
     `comment_id` (set at submit time) lives inside `findings[fname][i]`
     so retraction can match cached findings back to provider comments."""
     timestamp: float
-    hashes: dict[str, str]            # filename -> diff_hash
+    hashes: dict[str, str]            # filename -> SHA256 of the RAW diff chunk
     findings: dict[str, list]         # filename -> [findings]
     verdict: str | None = None        # 'approve' | 'needs_work' | None
     summary: str | None = None        # last review's top-level body
@@ -346,6 +346,83 @@ class CacheEntry:
     # ("Coverage-gap tracking"); pinned end-to-end by
     # tests/test_server.py::TestCoverageGapBlocksMerge.
     coverage_gap_files: list[str] = field(default_factory=list)
+    # Per-repo review config this entry was computed under: the resolved
+    # severity scale + the per-repo review prompt override, hashed by
+    # _entry_config_hash(). review_config_hash() (module-level, wipes the
+    # WHOLE cache) can't express "this one repo's scale changed" — this
+    # field is the per-entry complement. Defaults to "" for entries loaded
+    # from cache files written before this field existed.
+    #
+    # The "" default behaves DIFFERENTLY on the two read paths, and that
+    # asymmetry is deliberate, not an inconsistency:
+    #   * _process_pr (a fresh AI review runs) — "" mismatches a real
+    #     _entry_config_hash() once, the review runs anyway, and the
+    #     post-submit write records a real hash. One-time cost, then
+    #     re-warmed, the same as any other config change.
+    #   * _maybe_dispatch_cached_merge (NO review runs — this is the
+    #     cached-approve-only dispatch path) — "" is treated as an ACTIVE
+    #     mismatch against a caller-supplied expected hash, not skipped.
+    #     There is no write on this path to re-warm from, so "skip the
+    #     comparison for a hash-less entry" would let it auto-merge under
+    #     any future scale forever. See _maybe_dispatch_cached_merge's
+    #     docstring for the gate itself.
+    config_hash: str = ""
+    # Rebase tolerance. ``hashes`` above is the RAW chunk hash and answers
+    # "is this literally the same diff?" — it is what the no-changes skip
+    # and, through it, _maybe_dispatch_cached_merge's hash gate compare,
+    # so a cached approve still only short-circuits to a merge when
+    # nothing moved at all. These two answer the narrower question the
+    # incremental delta actually asks:
+    #   * content_hashes — reviewer.diff_hash(chunk): the added/removed
+    #     lines only. A rebase rewrites a chunk's ``index`` blob SHAs,
+    #     ``@@`` line numbers and context lines without touching the PR's
+    #     own edits, and re-reviewing on that basis re-posts findings the
+    #     developer already resolved (resolution matches on comment_id,
+    #     which a regenerated finding does not have). Files equal here are
+    #     NOT re-reviewed.
+    #   * hunks — reviewer.hunk_positions(chunk): new-side (start, length)
+    #     per hunk. A file can be content-equal while every line number in
+    #     it moved, and carried findings keep the ``line`` they were found
+    #     at — so without this they would re-post anchored to whatever
+    #     code the rebase slid into that position. _remap_carried_lines
+    #     shifts them by the per-hunk delta; a finding that cannot be
+    #     mapped safely sends its file back into changed_files for a real
+    #     re-review instead.
+    # Both default empty. An entry with no content_hashes has nothing to
+    # compare against, so the delta falls back to the raw hashes — the
+    # pre-existing behaviour, NOT "every file changed" — and with no
+    # hunks there is simply nothing to remap. DIFF_HASH_SCHEME folds into
+    # review_config_hash(), so in practice the whole cache wipes once on
+    # the upgrade and both fields are populated from the next review on.
+    content_hashes: dict[str, str] = field(default_factory=dict)
+    hunks: dict[str, list] = field(default_factory=dict)
+    #   * hunk_context — reviewer.hunk_context_digests(chunk): a digest of
+    #     each hunk's surrounding lines. Positions alone cannot tell a
+    #     rebase (same edit, moved by the base branch) from the author
+    #     RELOCATING a byte-identical edit elsewhere in the file — both
+    #     leave content_hashes equal and the hunk geometry intact, so the
+    #     remap "succeeds" and the finding is carried onto a new line that
+    #     was never reviewed. Context content is what separates them: a
+    #     rebase keeps it byte-identical while its position moves. A
+    #     mismatch here makes _remap_carried_lines give up and re-review.
+    #     Empty for entries written before this field, which simply skips
+    #     the comparison — the same degrade-to-previous-behaviour rule the
+    #     two fields above follow.
+    hunk_context: dict[str, list] = field(default_factory=dict)
+
+
+def _entry_config_hash(scale: SeverityScale, prompt_override: str | None) -> str:
+    """Per-repo review config that the global review_config_hash() cannot
+    express: the resolved severity scale and the per-repo prompt override
+    (closes backlog #15 — the override was missing from the cache key
+    entirely). A mismatch against ``CacheEntry.config_hash`` means the
+    entry was computed under a vocabulary or prompt that no longer
+    applies to this repo."""
+    h = hashlib.sha256()
+    h.update(scale.fingerprint().encode("utf-8"))
+    h.update(b"\x00")
+    h.update((prompt_override or "").encode("utf-8"))
+    return h.hexdigest()[:16]
 
 
 _previous_diffs: dict[str, CacheEntry] = {}
@@ -389,8 +466,22 @@ def _load_cache() -> None:
                         verdict=entry.get("verdict"),
                         summary=entry.get("summary"),
                         coverage_gap_files=list(entry.get("coverage_gap_files") or []),
+                        config_hash=entry.get("config_hash") or "",
+                        content_hashes=dict(entry.get("content_hashes") or {}),
+                        # JSON has no tuples — restore the (start, length)
+                        # pairs hunk_positions produced, and let a row that
+                        # isn't a pair of ints fail into the guard below
+                        # rather than reach _remap_carried_lines malformed.
+                        hunks={
+                            k: [(int(h[0]), int(h[1])) for h in v]
+                            for k, v in (entry.get("hunks") or {}).items()
+                        },
+                        hunk_context={
+                            k: [str(h) for h in v]
+                            for k, v in (entry.get("hunk_context") or {}).items()
+                        },
                     )
-                except (KeyError, TypeError, ValueError) as e:
+                except (KeyError, TypeError, ValueError, IndexError) as e:
                     logger.warning("Skipping malformed cache entry %s: %s", key, e)
                     skipped += 1
         if skipped:
@@ -998,10 +1089,27 @@ def _is_sole_reviewer(provider: GitProvider, repo_full_name: str, pr_number: int
     return True
 
 
+def _approve_from_severity(severity: str, scale: SeverityScale) -> bool:
+    """Does this review severity permit an approve verdict?
+
+    Replaces ``severity_gte(REVIEW_APPROVE_MAX_SEVERITY, severity)``, which
+    reads the built-in three-tier vocabulary and therefore ranks every
+    custom tier name at 0 — tying with the threshold and approving
+    everything, including the repo's most severe tier.
+
+    ``scale.blocks()`` normalizes unknown names to the most severe tier, so
+    an unrecognised value fails closed here exactly as it does in
+    ``_validate_review`` (PR #211).
+    """
+    return not scale.blocks(severity)
+
+
 def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
                                  pr_number: int, pr_title: str, pr_url: str,
                                  head_sha: str | None = None,
-                                 current_hashes: dict[str, str] | None = None) -> bool:
+                                 current_hashes: dict[str, str] | None = None,
+                                 expected_config_hash: str | None = None,
+                                 scale: SeverityScale | None = None) -> bool:
     """Dispatch auto-merge from a CACHED approve verdict, without a fresh
     AI review pass. Returns True when a merge was dispatched to the
     CI-wait pool, False on any decline.
@@ -1033,17 +1141,46 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
       * the cached per-file diff hashes must EXACTLY match hashes of the
         current head's diff — the cached approval must describe the code
         being merged, not some prior commit (stale-approval wedge);
+      * when the caller supplies ``expected_config_hash`` (the per-repo
+        severity scale + prompt override this dispatch would be judged
+        under, right now), it must equal ``entry.config_hash`` exactly —
+        otherwise the cached approve was computed under a vocabulary or
+        prompt that no longer applies, and re-dispatching it without a
+        fresh AI pass could auto-merge under a stale gate (severity-scale
+        cache-safety half of the per-entry config hash; see
+        ``_entry_config_hash``). This DELIBERATELY includes a legacy
+        entry with ``config_hash == ""`` (written before this check
+        existed): unlike ``_process_pr``'s read path, where a "" mismatch
+        triggers a fresh review that then records a real hash and
+        re-warms the entry, this is the no-review path — there is no
+        write to re-warm from, so treating "" as "skip the comparison"
+        would let a hash-less entry auto-merge under any scale forever.
+        Only a caller that omits the argument entirely (every call site
+        predating this feature, and every existing test built around
+        that default) skips the comparison — additive, not a new blanket
+        requirement;
       * PR must be open (mirrors _process_comment's fail-closed state gate);
       * Raven must be the sole reviewer (shared ``_is_sole_reviewer`` gate).
 
     Outcomes land in ``raven_cached_merge_dispatch_total{outcome,repo}``
     as ``dispatched`` / ``declined_<reason>``.
+
+    ``scale`` is the repo's resolved severity scale, used only to render
+    the synthesized notify payload's ``severity`` field correctly for a
+    custom vocabulary — it plays no role in any of the gates above (the
+    dispatch decision is entry.verdict == "approve", not a severity
+    comparison). Omitting it falls back to ``default_scale()``, under
+    which an unranked custom tier name silently collapses to the
+    default scale's least-severe reading (task-14 defect class: found
+    outside Task 14's assigned scope, fixed as part of it per team-lead
+    ruling — same file, same shape).
     """
     def _decline(reason: str) -> bool:
         inc("raven_cached_merge_dispatch_total",
             {"outcome": f"declined_{reason}", "repo": repo_full_name})
         return False
 
+    scale = scale or default_scale()
     pr_key = f"{provider.name}:{repo_full_name}#{pr_number}"
 
     if RAVEN_REVIEW_MODE == "advisory":
@@ -1102,6 +1239,12 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
                         "head (per-file diff hashes diverge) — skipping cached "
                         "merge dispatch", pr_number)
             return _decline("hash_mismatch")
+        if (expected_config_hash is not None
+                and entry.config_hash != expected_config_hash):
+            logger.info("PR #%d: cached approval's review config hash does not "
+                        "match the repo's current severity scale / prompt "
+                        "override — skipping cached merge dispatch", pr_number)
+            return _decline("config_hash_mismatch")
         cached_summary = entry.summary or ""
         remaining_findings = [f for fl in entry.findings.values() for f in fl]
 
@@ -1129,9 +1272,11 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
     # payloads inside _do_merge — same shape _process_comment builds.
     synthetic_review = {
         "approve": True,
-        "severity": _max_severity_from_findings(remaining_findings),
+        "severity": _max_severity_from_findings(remaining_findings, scale),
         "summary": cached_summary,
         "findings": remaining_findings,
+        "severity_scale_names": scale.ordered(),
+        "severity_blocks_at": scale.blocks_at_or_above,
     }
     merge_strategy = os.environ.get("MERGE_STRATEGY", "squash")
     logger.info("PR #%d: dispatching auto-merge from cached approve verdict "
@@ -1173,6 +1318,86 @@ def _is_coverage_gap_marker(finding: dict, gap_files: set[str]) -> bool:
         and not finding.get("line")
         and str(finding.get("message", "")).startswith("⚠️")
     )
+
+
+def _remap_carried_lines(
+    old_hunks: list, new_hunks: list, findings: list[dict],
+    old_context: list | None = None, new_context: list | None = None,
+) -> dict[int, int] | None:
+    """Map each finding's ``line`` from ``old_hunks`` onto ``new_hunks``.
+
+    Called only for a file whose ``content_hashes`` entry is unchanged —
+    the PR's own added/removed lines are byte-identical — but whose hunks
+    sit at different absolute positions because the base branch moved
+    under them. Findings carry the ``line`` the model reported at review
+    time (per ``prompts/review.md``, a NEW-side line number), so re-posting
+    them unshifted anchors each inline comment to whatever the rebase slid
+    into that position.
+
+    Returns ``{old_line: new_line}`` for the lines that need moving, or
+    ``None`` when the mapping cannot be made safely. ``None`` is a
+    fail-safe, not an error: the caller puts the file back into
+    ``changed_files``, which restores exactly the pre-rebase-tolerance
+    behaviour (re-review the file, regenerate its findings) for the cases
+    this cannot prove. It happens when
+
+      * the hunk count differs — a base edit landing within context range
+        can merge two hunks into one, so ``hunks[i]`` no longer describes
+        the same edit on both sides;
+      * a matched hunk's new-side length differs, which means the same
+        thing at a finer grain; or
+      * a finding's line falls outside every recorded hunk (a stale or
+        hand-written ``line``) and so has no delta to shift by.
+
+    Findings with no usable ``line`` (PR-wide notes, ⚠️ coverage-gap
+    markers) are skipped rather than rejected — they post no inline
+    comment, so they have nothing to anchor.
+    """
+    if len(old_hunks) != len(new_hunks):
+        return None
+    # Geometry alone cannot tell a rebase from a relocation: the author
+    # moving a byte-identical edit elsewhere in the file leaves the
+    # content hash equal AND the hunk shape intact, so every check below
+    # passes and the finding is carried onto code that was never
+    # reviewed in its new position. Context content is the discriminator
+    # — a rebase keeps it byte-identical while the position moves. Only
+    # compared when both sides recorded it; an entry from before the
+    # field degrades to the previous behaviour rather than re-reviewing
+    # everything.
+    if (old_context and new_context
+            and list(old_context) != list(new_context)):
+        return None
+    pairs = [(tuple(o), tuple(n)) for o, n in zip(old_hunks, new_hunks)]
+    mapping: dict[int, int] = {}
+    for f in findings:
+        line = f.get("line")
+        if not isinstance(line, int) or isinstance(line, bool) or line <= 0:
+            continue
+        for (old_start, old_len), (new_start, new_len) in pairs:
+            if old_start <= line < old_start + old_len:
+                if old_len != new_len:
+                    return None
+                if new_start != old_start:
+                    mapping[line] = line + (new_start - old_start)
+                break
+        else:
+            return None
+    return mapping
+
+
+def _finding_at_remapped_line(finding: dict, mapping: dict[int, int] | None) -> dict:
+    """``finding`` with its ``line`` shifted per ``mapping``, or unchanged.
+
+    Returns a copy when it shifts — the cached finding dict is shared with
+    the entry the comment flow reads under ``_previous_diffs_lock``, so
+    the line move must not be an in-place mutation of it.
+    """
+    if not mapping:
+        return finding
+    new_line = mapping.get(finding.get("line"))
+    if new_line is None:
+        return finding
+    return {**finding, "line": new_line}
 
 
 def _process_pr(provider: GitProvider, payload: dict) -> None:
@@ -1301,20 +1526,56 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # Incremental review: only review files that changed since last review
         pr_key = f"{provider.name}:{repo_full_name}#{pr_number}"
         file_chunks = {f: c for f, c in split_diff_by_file(clean_diff)}
-        current_hashes = {f: hashlib.sha256(c.encode()).hexdigest() for f, c in file_chunks.items()}
+        # Two hashes per file, answering two different questions — see
+        # CacheEntry.content_hashes. ``current_hashes`` (raw chunk) is
+        # "is this literally the same diff?" and gates the no-changes
+        # skip and the cached-merge dispatch under it;
+        # ``current_content_hashes`` is "did the PR's own edits to this
+        # file change?" and picks the incremental delta.
+        current_hashes = {f: hashlib.sha256(c.encode()).hexdigest()
+                          for f, c in file_chunks.items()}
+        current_content_hashes = {f: diff_hash(c) for f, c in file_chunks.items()}
+        current_hunks = {f: hunk_positions(c) for f, c in file_chunks.items()}
+        current_hunk_context = {f: hunk_context_digests(c)
+                                for f, c in file_chunks.items()}
         now = time.time()
         with _previous_diffs_lock:
             cached = _previous_diffs.get(pr_key)
             if cached:
                 previous_hashes = cached.hashes
+                previous_content_hashes = cached.content_hashes
+                previous_hunks = cached.hunks
+                previous_hunk_context = cached.hunk_context
                 cached_findings = cached.findings
             else:
                 previous_hashes = {}
+                previous_content_hashes = {}
+                previous_hunks = {}
+                previous_hunk_context = {}
                 cached_findings = {}
 
-        changed_files = {f for f, h in current_hashes.items() if previous_hashes.get(f) != h}
+        # Raw-chunk delta: the literal "did anything at all move?" set.
+        # Only this one may reach the no-changes skip, because the cached
+        # merge dispatched from there approves the head WITHOUT a fresh
+        # review — that shortcut stays limited to a byte-identical diff.
+        raw_changed_files = {f for f, h in current_hashes.items()
+                             if previous_hashes.get(f) != h}
+        # Content delta: the set actually worth re-reviewing. A file the
+        # rebase only slid around is not in here, so it is not re-reviewed
+        # and its findings (with their comment_ids, hence the developer's
+        # resolutions) carry forward instead of being regenerated.
+        # An entry from a cache file written before content_hashes existed
+        # has nothing to compare against, so it falls back to the raw
+        # delta — exactly the pre-existing behaviour, not "everything
+        # changed". DIFF_HASH_SCHEME wipes the cache once on upgrade
+        # anyway; this only has to be sane in the meantime.
+        changed_files = (
+            {f for f, h in current_content_hashes.items()
+             if previous_content_hashes.get(f) != h}
+            if previous_content_hashes else set(raw_changed_files)
+        )
         removed_files = previous_hashes.keys() - current_hashes.keys()
-        if previous_hashes and not changed_files and not removed_files:
+        if previous_hashes and not raw_changed_files and not removed_files:
             logger.info("PR #%d re-review: no files changed since last review — skipping", pr_number)
             inc("raven_reviews_skipped_total", {"reason": "no_changes", "repo": repo_full_name})
             # A re-trigger with zero changed files is exactly the recovery
@@ -1325,10 +1586,80 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             # webhook payload's — it predates the diff fetch above, so the
             # pinned SHA can never be newer than the hashed diff (see the
             # helper's docstring for the race direction).
-            _maybe_dispatch_cached_merge(provider, repo_full_name, pr_number,
-                                         pr_title, pr_url, head_sha=head_sha,
-                                         current_hashes=current_hashes)
+            #
+            # The cached approve is reused WITHOUT a fresh AI pass, so it
+            # must be checked against the repo's config right now — a
+            # severities.json or prompt-override edit landing on base_ref
+            # since the cached review must not silently keep auto-merging
+            # under a vocabulary that no longer applies. One extra pair of
+            # small file reads on this path only, gated by the helper's own
+            # entry.config_hash comparison. Unlike the read side elsewhere
+            # in this function, a legacy/hash-less entry (config_hash=="")
+            # does NOT skip this comparison — there is no review on this
+            # path to record a real hash and re-warm it, so it is refused
+            # exactly like any other mismatch (see CacheEntry.config_hash's
+            # and _maybe_dispatch_cached_merge's docstrings).
+            no_changes_scale = _fetch_severity_scale(provider, repo_full_name, base_ref)
+            no_changes_override = _fetch_prompt_override(
+                provider, repo_full_name, base_ref, "review")
+            _maybe_dispatch_cached_merge(
+                provider, repo_full_name, pr_number,
+                pr_title, pr_url, head_sha=head_sha,
+                current_hashes=current_hashes,
+                expected_config_hash=_entry_config_hash(no_changes_scale, no_changes_override),
+                scale=no_changes_scale)
             return
+
+        # Line remap for the files the rebase only slid around: content
+        # equal (so not in changed_files, so not re-reviewed) but sitting
+        # at new absolute positions. Their carried findings still hold the
+        # line numbers from the previous review, which now point at
+        # whatever the base branch moved into that place. Runs BEFORE the
+        # delta is finalised because a finding that cannot be mapped
+        # safely sends its whole file back into changed_files.
+        remapped_lines: dict[str, dict[int, int]] = {}
+        for fname, new_h in current_hunks.items():
+            if fname in changed_files or fname in removed_files:
+                continue
+            old_h = previous_hunks.get(fname)
+            if not old_h or [tuple(x) for x in old_h] == [tuple(x) for x in new_h]:
+                continue
+            mapping = _remap_carried_lines(
+                old_h, new_h, cached_findings.get(fname, []),
+                previous_hunk_context.get(fname),
+                current_hunk_context.get(fname))
+            if mapping is None:
+                logger.info(
+                    "PR #%d: %s moved but its findings can't be remapped safely "
+                    "— re-reviewing the file", pr_number, fname)
+                changed_files.add(fname)
+            elif mapping:
+                logger.info("PR #%d: %s shifted — remapping %d carried finding line(s)",
+                            pr_number, fname, len(mapping))
+                remapped_lines[fname] = mapping
+
+        # Apply the shift to the cached entry itself rather than to copies
+        # taken further down. Everything downstream — the drop-or-keep
+        # prompt, the carried/fresh dedupe, the inline comments, the
+        # post-submit write — reads these same dicts, and the write
+        # matches the model's drops by object identity, so a copy would
+        # silently un-drop them. Recording a corrected line number is not
+        # a finding-set change (the "no cache effects before submit" rule
+        # guards drops, which alter the standing review's content);
+        # retraction matches on comment_id, never on line.
+        if remapped_lines:
+            with _previous_diffs_lock:
+                live_entry = _previous_diffs.get(pr_key)
+                if live_entry is not None:
+                    live_entry.findings = {
+                        fname: [_finding_at_remapped_line(f, remapped_lines.get(fname))
+                                for f in fl]
+                        for fname, fl in live_entry.findings.items()
+                    }
+                    live_entry.hunks = current_hunks
+                    live_entry.hunk_context = current_hunk_context
+                    cached = live_entry
+                    cached_findings = live_entry.findings
 
         is_incremental = False
         unchanged_files: list[str] = []
@@ -1346,6 +1677,36 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             unchanged_files = sorted(set(current_hashes) - changed_files)
             review_diff_text = "".join(file_chunks[f] for f in sorted(changed_files))
             logger.info("PR #%d incremental review: %d/%d files changed", pr_number, len(changed_files), len(current_hashes))
+        elif previous_hashes:
+            # The diff moved but the PR's own edits did not — a rebase or
+            # a merge from the base branch, nothing else. There is no new
+            # authored code to review, so re-reviewing would only
+            # regenerate the standing findings and strand the developer's
+            # resolutions (which match on comment_id). Record the new
+            # positions, shift the carried findings onto them, and stop.
+            #
+            # Deliberately NOT the no-changes skip above: that path can
+            # dispatch a cached approve straight to a merge, and this head
+            # is not the head that approval was computed on. Merging a
+            # rebased branch stays gated behind a real review — the next
+            # push takes the incremental path as usual.
+            logger.info(
+                "PR #%d: diff moved without changing the PR's own edits "
+                "(rebase or base merge) — no re-review, no merge dispatch",
+                pr_number)
+            inc("raven_reviews_skipped_total",
+                {"reason": "rebase_only", "repo": repo_full_name})
+            # The finding lines were already shifted above; record the new
+            # chunk identity so the next push diffs against this head.
+            with _previous_diffs_lock:
+                live_entry = _previous_diffs.get(pr_key)
+                if live_entry is not None:
+                    live_entry.hashes = current_hashes
+                    live_entry.content_hashes = current_content_hashes
+                    live_entry.hunks = current_hunks
+                    live_entry.hunk_context = current_hunk_context
+            _save_cache()
+            return
         else:
             review_diff_text = clean_diff
 
@@ -1387,6 +1748,23 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         review_prompt_override = _fetch_prompt_override(
             provider, repo_full_name, base_ref, "review",
         )
+        # scale_fetch_failed distinguishes "severities.json could not be
+        # read" (fail the merge gate closed below — see coverage_gap for
+        # the same pattern) from "no file" / "invalid file", both of which
+        # are legitimately silent default_scale() falls-back. A plain
+        # local flag, not module state: _process_pr runs one PR to
+        # completion per call, so a closure is enough and stays free of
+        # the cross-repo leak a shared "current scale" would risk (see
+        # CLAUDE.md's "Severity scale" on why scale is always threaded as
+        # a parameter, never global).
+        scale_fetch_failed = False
+
+        def _mark_scale_fetch_failed() -> None:
+            nonlocal scale_fetch_failed
+            scale_fetch_failed = True
+
+        scale = _fetch_severity_scale(provider, repo_full_name, base_ref,
+                                      on_fetch_failed=_mark_scale_fetch_failed)
 
         # User-resolved-comment filter, pass 1 (pre-review). Findings
         # whose backing inline comment the developer marked resolved via
@@ -1457,10 +1835,22 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         revalidation_candidates = carried_candidates
         overflow_candidates: list[dict] = []
         if len(carried_candidates) > RAVEN_CARRIED_REVALIDATION_MAX:
+            # Deliberately NOT scale.rank() — same reasoning as
+            # reviewer._cap_findings: rank()/normalize() fail CLOSED
+            # (unknown -> most severe) for MODEL-EMITTED severities, but
+            # these candidates are already-validated cache entries, so an
+            # unknown/missing severity here is a malformed-data bug. The
+            # safe direction for capping is to drop it first rather than
+            # let it crowd out a well-formed high finding for cap space —
+            # falling back to the least-severe tier's rank matches the
+            # pre-scale SEVERITY_ORDER.get(name, 0) behavior exactly.
+            least_rank = scale.ranks[scale.least_severe]
             by_sev = sorted(
                 range(len(carried_candidates)),
-                key=lambda i: -SEVERITY_ORDER.get(
-                    carried_candidates[i].get("severity", "low"), 0),
+                key=lambda i: -scale.ranks.get(
+                    str(carried_candidates[i].get("severity", "") or "")
+                    .strip().lower(),
+                    least_rank),
             )
             top = set(by_sev[:RAVEN_CARRIED_REVALIDATION_MAX])
             revalidation_candidates = [
@@ -1487,6 +1877,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 is_incremental=is_incremental,
                 unchanged_files=unchanged_files,
                 carried_findings=revalidation_candidates or None,
+                scale=scale,
             )
         # Save original findings before merging carried ones (used for cache write)
         fresh_findings = list(review.get("findings", []))
@@ -1578,10 +1969,8 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             review["findings"] = fresh_findings + carried
             review["carried_count"] = len(carried)
             # Recompute severity across all findings
-            max_sev = SEVERITY_ORDER.get(review["severity"], 0)
-            for finding in carried:
-                max_sev = max(max_sev, SEVERITY_ORDER.get(finding.get("severity", "low"), 0))
-            review["severity"] = _SEVERITY_NAME.get(max_sev, "low")
+            review["severity"] = _max_severity_from_findings(
+                [{"severity": review["severity"]}] + carried, scale)
 
         # Per-file sticky coverage gap. An incremental pass only
         # re-reviews CHANGED files, so an unchanged oversized file from
@@ -1631,12 +2020,15 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # Submit formal review — must succeed before dismissing old reviews.
         # Verdict + inline comments are computed first; the inline-mode body
         # (below) needs to know whether anything was posted inline.
-        # Normalized (strip + lower) so a capitalized/padded value can't read
-        # as an unknown severity → 0 → the strictest 'low' threshold. Mirrors
-        # reviewer._coverage_gap_floor's .lower() so both readers of this env
-        # var agree (audit 07-02 #3).
-        approve_sev = os.environ.get("REVIEW_APPROVE_MAX_SEVERITY", "low").strip().lower()
-        approve = severity_gte(approve_sev, review["severity"])
+        # Reads the repo's resolved scale (fetched above), NOT
+        # severity_gte(REVIEW_APPROVE_MAX_SEVERITY, ...) — that compares
+        # against the built-in three-tier SEVERITY_ORDER, so every custom
+        # tier name would rank 0, tie with the threshold, and approve —
+        # including the repo's most severe tier. scale.blocks() (via
+        # _approve_from_severity) normalizes unknown names to the most
+        # severe tier instead, failing closed like _validate_review
+        # (PR #211).
+        approve = _approve_from_severity(review["severity"], scale)
         # Coverage gap forces needs_work: a formal APPROVE is externally
         # visible (branch protection counts bot approvals; humans trust
         # "Raven approved") and must never post for code Raven didn't
@@ -1651,12 +2043,43 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 "PR #%d: unreviewed files remain (%s) — forcing needs_work verdict",
                 pr_number, ", ".join(review.get("coverage_gap_files") or []))
             approve = False
-        default_emoji = "\U0001f7e1"
+        # Same fail-closed treatment for a present-but-unfetchable severity
+        # scale: the review still ran and still posts (the author gets
+        # feedback), but we don't know the repo's real gate, so we must
+        # not auto-merge as if the built-in default applied. Unlike
+        # coverage_gap this needs no persisted per-entry field — every
+        # review pass (incremental or full) re-fetches the scale from
+        # scratch, so a forced needs_work verdict this pass is enough: it
+        # lands in CacheEntry.verdict, which already makes
+        # _maybe_dispatch_cached_merge refuse a later no-op-diff retrigger
+        # (entry.verdict != "approve"), and the next real push simply
+        # re-fetches.
+        if approve and scale_fetch_failed:
+            logger.warning(
+                "PR #%d: could not fetch the repo's severity scale — "
+                "forcing needs_work verdict (fail-closed; refusing to "
+                "auto-merge under a guessed scale)", pr_number)
+            approve = False
+
+        def _inline_body(f: dict) -> str:
+            # Bound once — not scale.emoji(f.get(...)) / f.get(...) twice —
+            # so both reads see the same fallback. The default is the
+            # SCALE's least-severe tier, not the literal 'low': a finding
+            # missing its severity key (e.g. a malformed/legacy cache entry
+            # carried forward — CacheEntry.findings loads straight from
+            # JSON with no per-finding validation) must still render a
+            # name and colour that exist in THIS repo's vocabulary. Sibling
+            # fix to 9d2d478, which covered the other three
+            # .get("severity", "low") sites in this function and missed
+            # this one (CLAUDE.md "recurring defect class").
+            sev = f.get("severity") or scale.least_severe
+            return f"{scale.emoji(sev)} **[{sev}]** {f['message']}"
+
         inline_comments = [
             {
                 "file": f["file"],
                 "line": f["line"],
-                "body": f"{SEVERITY_EMOJI.get(f.get('severity', 'low'), default_emoji)} **[{f.get('severity', 'low')}]** {f['message']}",
+                "body": _inline_body(f),
             }
             for f in review.get("findings", [])
             if _is_inline_postable(f)
@@ -1673,7 +2096,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         if RAVEN_REVIEW_OUTPUT == "inline":
             leftover = [f for f in review.get("findings", [])
                         if not _is_inline_postable(f)]
-            body = _format_inline_leftovers(leftover)
+            body = _format_inline_leftovers(leftover, scale, review)
             # Never submit a content-less non-approve review: Gitea rejects an
             # empty body + no inline comments for a COMMENT / REQUEST_CHANGES
             # event. (A clean APPROVE with an empty body is fine and stays
@@ -1682,15 +2105,16 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             if not body and not inline_comments and (
                 RAVEN_REVIEW_MODE == "advisory" or not approve
             ):
-                sev = review.get("severity", "low")
+                sev = review.get("severity", scale.least_severe)
                 body = (
-                    f"🦅 **Raven** — {SEVERITY_EMOJI.get(sev, default_emoji)} "
+                    f"🦅 **Raven** — {scale.emoji(sev)} "
                     f"**{sev.upper()}** — {review.get('summary') or 'changes requested'}"
                 )
         else:
             body = _format_comment(
                 review,
                 mode="advisory" if RAVEN_REVIEW_MODE == "advisory" else "review",
+                scale=scale,
             )
         # Pass comment_only conditionally via dict-spread so out-of-tree
         # providers running in non-advisory modes never see the new kwarg.
@@ -1839,6 +2263,10 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 verdict=verdict,
                 summary=cache_summary,
                 coverage_gap_files=list(review.get("coverage_gap_files") or []),
+                config_hash=_entry_config_hash(scale, review_prompt_override),
+                content_hashes=current_content_hashes,
+                hunks=current_hunks,
+                hunk_context=current_hunk_context,
             )
         _evict_cache()
         _save_cache()
@@ -1878,6 +2306,15 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             _notify_if_needed(repo_full_name, pr_number, pr_title, pr_url, review)
             return
 
+        # Same defense-in-depth for an unfetchable severity scale — the
+        # verdict force above should already make this unreachable.
+        if scale_fetch_failed:
+            logger.warning(
+                "PR #%d approved but the repo's severity scale could not "
+                "be fetched — leaving open without auto-merge", pr_number)
+            _notify_if_needed(repo_full_name, pr_number, pr_title, pr_url, review)
+            return
+
         # Errors inside the gate used to propagate to the outer
         # try/except as "internal error" and clear dedup; the helper
         # fails closed instead (returns False on any provider error).
@@ -1895,10 +2332,19 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         fut.add_done_callback(functools.partial(_log_future_exception, repo=repo_full_name))
 
     except Exception as e:
-        logger.error("Unhandled error processing PR: %s", e, exc_info=True)
         reason = _review_failure_reason(e)
         repo_label = repo_full_name or "unknown"
-        inc("raven_errors_total", {"type": "unhandled", "repo": repo_label})
+        # A classified reason (diff_truncated, timeout, …) is an expected
+        # fail-closed condition with its own per-reason metric and an
+        # actionable PR comment — one WARNING without a traceback, and no
+        # raven_errors_total increment, so alerts on that metric only fire
+        # for genuinely unexplained failures.
+        if reason == "unknown":
+            logger.error("Unhandled error processing PR: %s", e, exc_info=True)
+            inc("raven_errors_total", {"type": "unhandled", "repo": repo_label})
+        else:
+            logger.warning("Review failed (reason=%s) for %s#%s: %s",
+                           reason, repo_label, pr_number, e)
         # Classified failure metric so operators can alert per cause
         # (e.g. a spike in timeout vs auth) without scraping logs.
         inc("raven_review_failures_total", {"reason": reason, "repo": repo_label})
@@ -2070,6 +2516,34 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             logger.debug("get_pr_base_ref for PR #%s CLAUDE.md fetch failed (falling back to HEAD): %s",
                          pr_number, e)
             comment_base_ref = "HEAD"
+        # Repo severity scale — same base-ref provenance as CLAUDE.md above
+        # (a scale change must land through its own review cycle, reviewed
+        # under the OLD scale). Without this, a repo's own tier names are
+        # unranked against the built-in low/medium/high vocabulary in the
+        # two _max_severity_from_findings call sites below, silently
+        # mis-rendering (and mis-notifying) severity — the comment-reply
+        # flow was the last path still doing that (Task 14; see CLAUDE.md
+        # "Severity scale"). _fetch_severity_scale never raises — it
+        # already falls back to default_scale() internally on any failure.
+        #
+        # But "does not raise" is not "does not loosen the gate": that
+        # fallback silently substitutes the built-in vocabulary for a
+        # scale we simply failed to READ. For a repo that reuses the
+        # low/medium/high names with a tighter blocks_at_or_above, the
+        # default is the more permissive gate, so a flip-to-approve could
+        # auto-merge past the repo's own blocking tier. _process_pr
+        # already fails the merge closed on this state (see
+        # scale_fetch_failed at the fresh-review call site); mirror it
+        # here, which was the last merge-capable path without the guard.
+        comment_scale_fetch_failed = False
+
+        def _mark_comment_scale_fetch_failed() -> None:
+            nonlocal comment_scale_fetch_failed
+            comment_scale_fetch_failed = True
+
+        comment_scale = _fetch_severity_scale(
+            provider, repo_full_name, comment_base_ref,
+            on_fetch_failed=_mark_comment_scale_fetch_failed)
         # Fetch the PR head SHA up-front for the code-snippet block below.
         try:
             cmd_head_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
@@ -2488,11 +2962,12 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 if RAVEN_REVIEW_MODE == "advisory":
                     new_body = _format_comment(
                         {
-                            "severity": _max_severity_from_findings(remaining_findings),
+                            "severity": _max_severity_from_findings(remaining_findings, comment_scale),
                             "summary": revise["body"],
                             "findings": remaining_findings,
                         },
                         mode="advisory_update",
+                        scale=comment_scale,
                     )
                 else:
                     new_body = revise["body"]
@@ -2593,6 +3068,18 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             if should_dispatch_merge and not _is_sole_reviewer(
                     provider, repo_full_name, pr_number):
                 should_dispatch_merge = False
+            # Unreadable severities.json → the verdict above was computed
+            # under the built-in scale standing in for the repo's real
+            # one, which may be the looser of the two. Same fail-closed
+            # call as _process_pr's `if approve and scale_fetch_failed`.
+            # The revision itself still posts; only the merge is blocked,
+            # and the next push re-reviews with a fresh fetch.
+            if should_dispatch_merge and comment_scale_fetch_failed:
+                logger.warning(
+                    "PR #%d: severities.json could not be read — skipping "
+                    "comment-driven auto-merge (fail-closed; the repo's real "
+                    "merge gate is unknown for this pass)", pr_number)
+                should_dispatch_merge = False
             # Sticky coverage-gap gate (same fail-closed style as
             # _is_sole_reviewer): if the cached review state says parts
             # of the diff were never reviewed (oversized/failed chunks),
@@ -2641,9 +3128,11 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 # before submit_review (single source of truth).
                 synthetic_review = {
                     "approve": True,
-                    "severity": _max_severity_from_findings(remaining_findings),
+                    "severity": _max_severity_from_findings(remaining_findings, comment_scale),
                     "summary": new_body,
                     "findings": remaining_findings,
+                    "severity_scale_names": comment_scale.ordered(),
+                    "severity_blocks_at": comment_scale.blocks_at_or_above,
                 }
                 fut = ci_wait_executor.submit(
                     _safe_do_merge, provider, repo_full_name, pr_number,
@@ -2670,10 +3159,18 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 _comment_mutating_prs.discard(pr_key)
 
     except Exception as e:
-        logger.error("Failed to respond to comment: %s", e, exc_info=True)
+        reason = _review_failure_reason(e)
         repo_label = repo_full_name or "unknown"
-        inc("raven_errors_total", {"type": "comment_response_failed",
-                                   "repo": repo_label})
+        # Same ERROR-vs-WARNING split as _process_pr: classified reasons
+        # are expected conditions and must not pollute raven_errors_total
+        # or read as crashes in the logs.
+        if reason == "unknown":
+            logger.error("Failed to respond to comment: %s", e, exc_info=True)
+            inc("raven_errors_total", {"type": "comment_response_failed",
+                                       "repo": repo_label})
+        else:
+            logger.warning("Comment response failed (reason=%s) for %s#%s: %s",
+                           reason, repo_label, pr_number, e)
         # Same classified failure metric as the review flow so timeout /
         # usage-cap / auth spikes on comment replies show on the same
         # dashboard. The reply UX keeps its own threaded message below
@@ -2681,7 +3178,7 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # metric is unified. respond_to_comment already retried the
         # transient classes inside reviewer.py.
         inc("raven_review_failures_total",
-            {"reason": _review_failure_reason(e), "repo": repo_label})
+            {"reason": reason, "repo": repo_label})
         if repo_full_name and pr_number:
             try:
                 provider.post_pr_comment(
@@ -3255,41 +3752,182 @@ def _fetch_prompt_override(provider: GitProvider, repo_full_name: str,
     return content
 
 
+def _fetch_severity_scale(provider: GitProvider, repo_full_name: str,
+                          ref: str,
+                          on_fetch_failed: Callable[[], None] | None = None) -> SeverityScale:
+    """Load ``{RULES_DIR}/raven/severities.json`` at ``ref``.
+
+    Always returns a usable scale. A missing file, a fetch failure, or an
+    invalid file falls back to the built-in default — a defined
+    conservative gate beats an undefined one, and one repo's typo must not
+    stop that repo being reviewed.
+
+    ``ref`` is the PR's BASE ref, like rules and prompt overrides: a
+    change to the scale must land through its own review cycle, reviewed
+    under the OLD scale, so a hostile PR cannot widen its own merge gate.
+
+    ``on_fetch_failed`` fires ONLY for the "could not read the file"
+    branch — never for "file absent" (the normal case for most repos) or
+    "file present but invalid" (already counted separately via
+    ``raven_severity_scale_invalid_total``). The distinction matters: a
+    fetch failure means the repo may well *have* a stricter scale than the
+    built-in default and we simply failed to read it, so the caller can
+    fail the MERGE GATE closed (refuse auto-merge for this pass) without
+    refusing to review — unlike a missing file, which is silently and
+    correctly the default scale. Keyword-only and optional so every
+    existing caller (and every test that calls or mocks this function
+    positionally / by return value) is unaffected; only ``_process_pr``'s
+    fresh-review call site wires it up. See CLAUDE.md "Severity scale".
+    """
+    if not RULES_DIR:
+        return default_scale()
+
+    path = f"{RULES_DIR}/raven/severities.json"
+    try:
+        body = provider.fetch_file(repo_full_name, path, ref=ref)
+    except Exception as e:
+        logger.warning("Could not read %s at %s for %s (using default severity "
+                       "scale): %s", path, ref[:8], repo_full_name, e)
+        inc("raven_severity_scale_fetch_failed_total", {"repo": repo_full_name})
+        if on_fetch_failed is not None:
+            on_fetch_failed()
+        return default_scale()
+
+    if not body or not body.strip():
+        return default_scale()
+
+    try:
+        scale = from_json(body)
+    except InvalidScale as e:
+        logger.warning("Invalid %s in %s — using the default severity scale: %s",
+                       path, repo_full_name, e)
+        inc("raven_severity_scale_invalid_total", {"repo": repo_full_name})
+        return default_scale()
+
+    logger.info("Using repo severity scale for %s: %s (blocks at %s)",
+                repo_full_name, ", ".join(scale.ordered()),
+                scale.blocks_at_or_above or "nothing")
+    return scale
+
+
 def _notify_if_needed(repo_full_name: str, pr_number: int, pr_title: str, pr_url: str, review: dict) -> None:
     """Send notification — severity filtering is handled per-channel in notifier."""
     notify(repo_full_name, f"PR #{pr_number}: {pr_title}", review,
            link=pr_url, action="needs_review")
 
 
-SEVERITY_EMOJI = {"high": "🔴", "medium": "🟠", "low": "🟡"}
+def _max_severity_from_findings(findings: list[dict],
+                                scale: SeverityScale | None = None) -> str:
+    """Highest severity name among findings; the scale's least severe tier
+    when the list is empty or no severity is recognised.
 
+    Deliberately NOT scale.normalize() — same reasoning as
+    reviewer._cap_findings, reviewer._recompute_severity, and the
+    carried-candidates cap above. normalize() fails CLOSED (unknown ->
+    most severe) for model-emitted severities; this helper reproduces the
+    pre-scale ``SEVERITY_ORDER.get(f.get("severity", "low"), 0)``
+    behaviour, where an unrecognised or missing severity ranked LOWEST.
+    Changing that direction is a Phase B decision, not a side effect of
+    the refactor.
 
-def _max_severity_from_findings(findings: list[dict]) -> str:
-    """Highest severity name among findings; ``"low"`` when the list is
-    empty or no severity matches ``SEVERITY_ORDER``. Safe against
-    unknown severities — never raises ``StopIteration``."""
+    One deliberate exception to matching the old behaviour byte-for-byte:
+    names are stripped and lowercased before lookup (matching
+    ``reviewer._validate_review`` post-#211), so a whitespace/case
+    variant of a known name (e.g. ``"  HIGH  "``) still resolves to that
+    tier instead of being treated as unknown. The old un-normalized
+    ``SEVERITY_ORDER.get(name, 0)`` lookup would have ranked
+    ``"  HIGH  "`` as unknown (lowest) purely because of formatting noise
+    — reproducing that here would reintroduce the exact whitespace bug
+    #211 fixed.
+    """
+    scale = scale or default_scale()
     if not findings:
-        return "low"
-    max_sev = max(SEVERITY_ORDER.get(f.get("severity", "low"), 0)
-                  for f in findings)
-    for name, ord_ in SEVERITY_ORDER.items():
-        if ord_ == max_sev:
+        return scale.least_severe
+    least_rank = scale.ranks[scale.least_severe]
+    best = max(
+        (scale.ranks.get(
+            str(f.get("severity", "") or "").strip().lower(), least_rank)
+         for f in findings),
+        default=least_rank,
+    )
+    for name, rank in scale.ranks.items():
+        if rank == best:
             return name
-    return "low"
+    return scale.least_severe
 
 
-def _format_comment(review: dict, mode: str = "review") -> str:
+def _severity_mismatch_lines(review: dict) -> list[str]:
+    """Lines reporting a vocabulary mismatch between the model's emitted
+    severities and the scale actually in effect — the empirical detection
+    signal for the whole feature (see raven/severity.py's ``normalize()``
+    and CLAUDE.md's "Prompt trust model"). Returns ``[]`` when there's no
+    mismatch (the common case) or the review predates this field.
+
+    Shared by ``_format_comment`` and ``_format_inline_leftovers`` so
+    ``RAVEN_REVIEW_OUTPUT=inline`` — which never calls ``_format_comment``
+    — doesn't silently drop this line. Each caller is responsible for its
+    own leading blank-line spacing before the returned lines.
+
+    Names ``{RULES_DIR}/raven/severities.json`` ONLY when a repo scale is
+    actually governing this review. ``unknown_severities`` fires just as
+    often for the ~100% of repos with no severities.json at all (built-in
+    low/medium/high in effect) — pointing at a file that was never read,
+    and likely doesn't exist, sent the operator chasing the wrong cause;
+    there the real one is usually a prompt override emitting non-standard
+    names, or the model simply not honouring the vocabulary. Detected by
+    comparing the review's tier names against ``default_scale().ordered()``
+    — stable regardless of ``REVIEW_APPROVE_MAX_SEVERITY`` (that env var
+    only shifts ``blocks_at_or_above``, never the three tier names) — not
+    a new field: every review dict a producer builds already carries
+    ``severity_scale_names``.
+    """
+    unknown_severities = review.get("unknown_severities") or []
+    if not unknown_severities:
+        return []
+    names = review.get("severity_scale_names") or []
+    known = ", ".join(f"`{n}`" for n in names)
+    offending = ", ".join(f"`{n}`" for n in unknown_severities)
+    if names == default_scale().ordered():
+        scale_ref = "the active severity scale (this repo's built-in default)"
+        fix_hint = (
+            "This repo has no custom severity scale configured, so the "
+            "likely cause is a prompt override emitting non-standard "
+            "severity names, or the model not honouring the vocabulary."
+        )
+    else:
+        scale_ref = f"`{RULES_DIR}/raven/severities.json`"
+        fix_hint = "Fix the scale or the prompt override so they use the same names."
+    return [
+        f"> ⚠️ **Severity config mismatch.** This review emitted severity "
+        f"names not in {scale_ref}: {offending}. "
+        f"Known tiers: {known}. Unrecognised findings were treated as the "
+        f"most severe tier and the merge was blocked. {fix_hint}"
+    ]
+
+
+def _format_comment(review: dict, mode: str = "review",
+                    scale: SeverityScale | None = None) -> str:
     """Render the review summary body.
 
     ``mode`` selects the header / subtitle:
       * ``"review"``           — formal review (header: "Raven Review").
       * ``"advisory"``         — initial advisory recommendation.
       * ``"advisory_update"``  — advisory recommendation revised via comment thread.
+
+    ``scale`` should be the repo's resolved scale (``_fetch_severity_scale``)
+    whenever the caller has one — omitting it silently falls back to
+    ``default_scale()``, under which every custom tier name is unknown and
+    ``emoji()`` fails closed to most-severe for ALL of them: a real bug
+    found in review, where a nit/bug/blocker repo rendered every finding
+    🔴 regardless of tier, defeating Phase A's position-based colour work
+    entirely. ``scale=None`` stays the default so any call site that
+    hasn't been threaded a scale yet keeps behaving exactly as before.
     """
-    severity = review.get("severity", "low")
+    scale = scale or default_scale()
+    severity = review.get("severity", scale.least_severe)
     summary = review.get("summary", "")
     findings = review.get("findings", [])
-    emoji = SEVERITY_EMOJI.get(severity, "🟡")
+    emoji = scale.emoji(severity)
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     if mode == "advisory":
@@ -3305,12 +3943,21 @@ def _format_comment(review: dict, mode: str = "review") -> str:
     lines.append("")
     lines.append(f"**{emoji} {severity.upper()}** — {summary}")
 
+    # Empirical vocabulary-mismatch signal — an override that contradicts
+    # the scale is not prevented (impossible against opaque override
+    # text), it fails closed and is reported here. Missing key must be
+    # safe (cached/legacy review dicts predate this field).
+    mismatch_lines = _severity_mismatch_lines(review)
+    if mismatch_lines:
+        lines.append("")
+        lines.extend(mismatch_lines)
+
     if findings:
         lines.append("")
         lines.append("**Findings:**")
         for f in findings:
-            f_sev = f.get("severity", "low")
-            f_emoji = SEVERITY_EMOJI.get(f_sev, "🟡")
+            f_sev = f.get("severity", scale.least_severe)
+            f_emoji = scale.emoji(f_sev)
             lines.append(f"- {f_emoji} [{f_sev}] {f.get('message', '')}")
 
     if review.get("chunked"):
@@ -3329,22 +3976,48 @@ def _format_comment(review: dict, mode: str = "review") -> str:
     return "\n".join(lines)
 
 
-def _format_inline_leftovers(findings: list[dict]) -> str:
+def _format_inline_leftovers(findings: list[dict],
+                             scale: SeverityScale | None = None,
+                             review: dict | None = None) -> str:
     """Minimal body for ``RAVEN_REVIEW_OUTPUT=inline``.
 
     Inline mode posts no summary/recommendation comment. The only findings
     that can't ride on a diff line are those with no postable file/line —
     PR-wide notes and ⚠️ coverage-gap markers (filename, no line). Those are
     listed in a short body so they aren't silently dropped. Returns ``""``
-    when every finding is inline-anchored, so a clean review posts no body.
+    when every finding is inline-anchored AND there's no severity-mismatch
+    note (see below), so a clean review posts no body.
+
+    ``scale`` should be the repo's resolved scale — see ``_format_comment``
+    for why omitting it is unsafe for a custom vocabulary (every tier
+    renders 🔴). Defaults to ``default_scale()`` for callers not yet
+    threaded through.
+
+    ``review`` — when supplied — surfaces the same "Severity config
+    mismatch" note ``_format_comment`` renders (``_severity_mismatch_lines``).
+    Inline mode never calls ``_format_comment``, so without this the
+    feature's whole detection story (which names were unrecognised, what
+    the scale actually allows) was invisible under
+    ``RAVEN_REVIEW_OUTPUT=inline`` — the merge still failed closed, but
+    silently. Rendered even when ``findings`` is empty, since a mismatch
+    can occur with zero non-postable findings.
     """
-    if not findings:
+    scale = scale or default_scale()
+    mismatch_lines = _severity_mismatch_lines(review) if review else []
+    if not findings and not mismatch_lines:
         return ""
-    lines = ["🦅 **Raven** — findings without an inline location:", ""]
-    for f in findings:
-        f_sev = f.get("severity", "low")
-        f_emoji = SEVERITY_EMOJI.get(f_sev, "🟡")
-        lines.append(f"- {f_emoji} **[{f_sev}]** {f.get('message', '')}")
+    lines = ["🦅 **Raven**"]
+    if findings:
+        lines.append("")
+        lines.append("Findings without an inline location:")
+        lines.append("")
+        for f in findings:
+            f_sev = f.get("severity", scale.least_severe)
+            f_emoji = scale.emoji(f_sev)
+            lines.append(f"- {f_emoji} **[{f_sev}]** {f.get('message', '')}")
+    if mismatch_lines:
+        lines.append("")
+        lines.extend(mismatch_lines)
     return "\n".join(lines)
 
 

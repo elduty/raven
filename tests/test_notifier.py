@@ -303,6 +303,55 @@ class TestFailureLogRedaction:
         assert "SECRETtoken" not in all_logs
 
 
+class TestFormatMessageUsesRepoScale:
+    """The Slack/webhook display path must colour (and default) by the
+    reviewed repo's own severity scale, not the built-in low/medium/high
+    one. default_scale().emoji() normalizes an unknown name fail-closed to
+    the most severe tier, so a custom scale's LEAST severe tier (e.g.
+    'nit' in a nit/bug/blocker repo) would render red — the signal
+    inverted and meaningless as colour."""
+
+    def test_custom_scale_least_severe_tier_renders_yellow_not_red(self):
+        review = {
+            "severity": "nit",
+            "summary": "s",
+            "severity_scale_names": ["blocker", "bug", "nit"],
+            "severity_blocks_at": "bug",
+        }
+        text = _format_message("acme/repo", "ref", review, "", "needs_review")
+        assert "🟡" in text
+        assert "🔴" not in text
+
+    def test_custom_scale_middle_tier_renders_orange(self):
+        review = {
+            "severity": "bug",
+            "summary": "s",
+            "severity_scale_names": ["blocker", "bug", "nit"],
+            "severity_blocks_at": "bug",
+        }
+        text = _format_message("acme/repo", "ref", review, "", "needs_review")
+        assert "🟠" in text
+
+    def test_custom_scale_most_severe_tier_still_renders_red(self):
+        review = {
+            "severity": "blocker",
+            "summary": "s",
+            "severity_scale_names": ["blocker", "bug", "nit"],
+            "severity_blocks_at": "bug",
+        }
+        text = _format_message("acme/repo", "ref", review, "", "needs_review")
+        assert "🔴" in text
+
+    def test_legacy_dict_without_scale_still_defaults_and_renders_todays_colours(self):
+        """No severity_scale_names key at all (cached/pre-feature review) —
+        must render exactly as before: missing severity defaults to 'low'
+        (now: the default scale's least-severe tier, which is the same
+        value) and colours by the built-in scale."""
+        text = _format_message("acme/repo", "ref", {"summary": "s"}, "", "needs_review")
+        assert "🟡" in text
+        assert "LOW" in text
+
+
 class TestFormatMessage:
     def test_needs_review_header(self):
         text = _format_message("owner/repo", "PR #5", {"severity": "medium", "summary": "Missing validation"}, "", "needs_review")
@@ -324,3 +373,180 @@ class TestFormatMessage:
     def test_link_appended(self):
         text = _format_message("owner/repo", "ref", {"severity": "low", "summary": "ok"}, "https://git/pr/1", "")
         assert "https://git/pr/1" in text
+
+
+class TestEmojiComesFromTheScale:
+    def test_no_duplicate_emoji_table(self):
+        """The two hardcoded SEVERITY_EMOJI dicts are consolidated into
+        SeverityScale.emoji()."""
+        import raven.notifier as notifier
+        import raven.server as server
+
+        assert not hasattr(notifier, "SEVERITY_EMOJI")
+        assert not hasattr(server, "SEVERITY_EMOJI")
+
+    def test_default_scale_emoji_match_todays_colours(self):
+        from raven.severity import default_scale
+
+        s = default_scale()
+        assert s.emoji("high") == "🔴"
+        assert s.emoji("medium") == "🟠"
+        assert s.emoji("low") == "🟡"
+
+
+class TestChannelThresholdAcrossVocabularies:
+    def _review(self, severity, names, blocks_at):
+        return {"severity": severity, "summary": "s", "findings": [],
+                "severity_scale_names": names, "severity_blocks_at": blocks_at}
+
+    def test_known_name_compares_by_rank(self, mocker):
+        import raven.notifier as notifier
+        send = mocker.patch.object(notifier, "_send_slack")
+        mocker.patch.object(notifier, "_load_channels", return_value=[
+            {"type": "slack", "min_severity": "medium", "webhook": "u"}])
+        notifier.notify("acme/repo", "ref", self._review("high", ["high", "medium", "low"], "medium"), "l", "review")
+        assert send.called
+
+    def test_name_absent_from_scale_falls_back_to_blocking(self, mocker):
+        """'medium' is meaningless for a nit/bug/blocker repo. Notify when
+        the review blocks, rather than comparing across vocabularies."""
+        import raven.notifier as notifier
+        send = mocker.patch.object(notifier, "_send_slack")
+        mocker.patch.object(notifier, "_load_channels", return_value=[
+            {"type": "slack", "min_severity": "medium", "webhook": "u"}])
+        notifier.notify("acme/repo", "ref", self._review("blocker", ["blocker", "bug", "nit"], "bug"), "l", "review")
+        assert send.called
+
+    def test_non_blocking_review_suppressed_under_fallback(self, mocker):
+        import raven.notifier as notifier
+        send = mocker.patch.object(notifier, "_send_slack")
+        mocker.patch.object(notifier, "_load_channels", return_value=[
+            {"type": "slack", "min_severity": "medium", "webhook": "u"}])
+        notifier.notify("acme/repo", "ref", self._review("nit", ["blocker", "bug", "nit"], "bug"), "l", "review")
+        assert not send.called
+
+    def test_legacy_review_without_scale_keeps_todays_filtering(self, mocker):
+        """A cached review from before this feature carries no scale keys.
+        It must filter exactly as it does today, not degrade into
+        always-notify."""
+        import raven.notifier as notifier
+        send = mocker.patch.object(notifier, "_send_slack")
+        mocker.patch.object(notifier, "_load_channels", return_value=[
+            {"type": "slack", "min_severity": "high", "webhook": "u"}])
+        notifier.notify("acme/repo", "ref",
+                        {"severity": "low", "summary": "s", "findings": []},
+                        "l", "review")
+        assert not send.called
+
+    def test_explicit_blocking_sentinel(self, mocker):
+        import raven.notifier as notifier
+        send = mocker.patch.object(notifier, "_send_slack")
+        mocker.patch.object(notifier, "_load_channels", return_value=[
+            {"type": "slack", "min_severity": "blocking", "webhook": "u"}])
+        notifier.notify("acme/repo", "ref", self._review("bug", ["blocker", "bug", "nit"], "bug"), "l", "review")
+        assert send.called
+
+    def test_no_blocking_tier_fails_toward_notify(self, mocker):
+        """blocks_at is None means this repo's scale has no tier that blocks
+        a merge (REVIEW_APPROVE_MAX_SEVERITY pinned at the top tier). A
+        channel gated on 'blocking' has no rank to compare against, and the
+        fail direction here is toward notifying: a missed alert is worse
+        than a redundant one, and this path has no merge authority. This is
+        the opposite of the merge gate's fail-closed rule — do not make it
+        consistent with the gate."""
+        import raven.notifier as notifier
+        send = mocker.patch.object(notifier, "_send_slack")
+        mocker.patch.object(notifier, "_load_channels", return_value=[
+            {"type": "slack", "min_severity": "blocking", "webhook": "u"}])
+        review = self._review("low", ["high", "medium", "low"], None)
+        notifier.notify("acme/repo", "ref", review, "l", "review")
+        assert send.called
+
+
+class TestMissingSeverityKeyAgreesAcrossThresholdAndMessage:
+    """PR #216 review, Finding 3: a review dict lacking 'severity' must
+    resolve to the SAME tier in both _passes_threshold and
+    _format_message for the identical dict. They used to disagree:
+    _passes_threshold's in-scale branch evaluated scale.rank("") — and an
+    unknown name normalizes fail-closed to the scale's MOST severe tier —
+    while _format_message already defaulted to scale.least_severe. Impact
+    was limited (the reviewer always populates 'severity'), but it's
+    exactly the contradictory-defaults defect class this branch exists to
+    eliminate."""
+
+    def _review(self, names, blocks_at):
+        # Deliberately no 'severity' key.
+        return {"summary": "s", "findings": [],
+                "severity_scale_names": names, "severity_blocks_at": blocks_at}
+
+    def test_format_message_renders_the_least_severe_tier(self):
+        review = self._review(["blocker", "bug", "nit"], "bug")
+        text = _format_message("acme/repo", "ref", review, "", "needs_review")
+        assert "NIT" in text
+        assert "🟡" in text
+
+    def test_passes_threshold_agrees_with_format_message(self):
+        """Same missing-severity dict: a channel gated at the scale's
+        LEAST severe tier ('nit') must pass, and one gated at the next
+        tier up ('bug') must not — i.e. _passes_threshold reads the
+        missing severity as 'nit', exactly what _format_message renders.
+        Before the fix, rank("") failed closed to 'blocker' (most severe),
+        so BOTH assertions below would flip: 'bug' would pass too."""
+        import raven.notifier as notifier
+
+        review = self._review(["blocker", "bug", "nit"], "bug")
+        assert notifier._passes_threshold(review, "nit", "acme/repo") is True
+        assert notifier._passes_threshold(review, "bug", "acme/repo") is False
+
+    def test_notify_dispatch_agrees_end_to_end(self, mocker):
+        """Integration-level pin via the public notify() entry point, not
+        just the private helper — a channel filtering at 'bug' (not the
+        least-severe tier) must NOT fire for a review with no 'severity'
+        key, matching how that same review renders as the LEAST severe
+        tier in the message _format_message would have sent."""
+        import raven.notifier as notifier
+
+        send = mocker.patch.object(notifier, "_send_slack")
+        mocker.patch.object(notifier, "_load_channels", return_value=[
+            {"type": "slack", "min_severity": "bug", "webhook": "u"}])
+        review = self._review(["blocker", "bug", "nit"], "bug")
+        notifier.notify("acme/repo", "ref", review, "l", "review")
+        assert not send.called
+
+
+class TestScaleReconstructionInvariant:
+    """A review dict whose severity_blocks_at names a tier absent from
+    severity_scale_names must not crash the notifier.
+
+    _scale_from_review builds `ranks` from severity_scale_names but reads
+    the blocking tier from a separate field, so SeverityScale.blocks()
+    would do ranks[blocks_at_or_above] -> KeyError. All current writers
+    emit both fields from one scale object, so this is an unguarded
+    invariant rather than a live bug — but the notifier is the last step
+    of a completed review, and a KeyError there loses the notification
+    for a review that already ran (audit 2026-08-14 LOW).
+    """
+
+    def test_scale_from_review_drops_blocking_tier_absent_from_names(self):
+        from raven.notifier import _scale_from_review
+        scale = _scale_from_review({
+            "severity": "bug",
+            "severity_scale_names": ["blocker", "bug", "nit"],
+            "severity_blocks_at": "critical",   # not a tier in this scale
+        })
+        assert scale.blocks("bug") is False, (
+            "An unresolvable blocking tier must degrade to 'nothing blocks', "
+            "not raise"
+        )
+
+    def test_passes_threshold_survives_mismatched_blocking_tier(self):
+        from raven.notifier import _passes_threshold
+        review = {
+            "severity": "bug",
+            "severity_scale_names": ["blocker", "bug", "nit"],
+            "severity_blocks_at": "critical",
+        }
+        # Must not raise. Gate semantics with an unresolvable blocking
+        # tier means "nothing blocks", and notification fails toward
+        # notifying, so this returns True.
+        assert _passes_threshold(review, "blocking", "u/r") is True

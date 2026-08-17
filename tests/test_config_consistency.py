@@ -65,6 +65,31 @@ def test_dockerfile_does_not_set_model_or_effort_env():
         "Dockerfile must not set a RAVEN_AI_EFFORT ENV default (audit #7)"
 
 
+def test_readme_documents_the_severity_scale_file():
+    """README must document the per-repo severities.json file and its
+    merge-blocking-threshold key — the two facts an operator needs before
+    writing one (task-12 brief, spec 2026-08-04-configurable-severity-scale).
+    """
+    readme = open("README.md").read()
+    assert "severities.json" in readme
+    assert "blocks_at_or_above" in readme
+
+
+def test_readme_documents_the_blocking_threshold_sentinel():
+    """README must document the ``blocking`` notification-channel sentinel
+    (``severity.BLOCKING``) — the only ``min_severity`` value that means the
+    same thing in every repo's vocabulary.
+
+    The word "blocking" alone is too weak to assert on: it already appears
+    six times in README.md for unrelated reasons (``merge-blocking``,
+    ``blocking the merge``, ...), so that assertion passes whether or not
+    the sentinel itself is documented. Assert the literal config value
+    instead, the way ``test_readme_documents_the_severity_scale_file``
+    checks for ``severities.json`` and ``blocks_at_or_above``.
+    """
+    assert '"min_severity": "blocking"' in open("README.md").read()
+
+
 def test_max_findings_matches_review_prompt_cap():
     """``reviewer.MAX_FINDINGS`` mirrors the cap stated in prompts/review.md.
 

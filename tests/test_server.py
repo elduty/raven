@@ -1541,6 +1541,150 @@ class TestClassifiedFailureComment:
         assert key not in _srv._recent_prs
 
 
+class TestClassifiedFailureLogNoise:
+    """A CLASSIFIED failure (diff_truncated, timeout, …) is an expected
+    fail-closed condition that already gets a per-reason metric and an
+    actionable PR comment — it must not masquerade as a crash. Classified
+    reasons log one WARNING without a traceback and do NOT increment
+    raven_errors_total (the signal operators alert on for real bugs).
+    Only reason="unknown" keeps the ERROR + traceback + raven_errors_total
+    behaviour. Applies to both _process_pr and _process_comment.
+    """
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def _pr_payload(self):
+        return {
+            "repo": "owner/repo", "sender": "alice", "pr_number": 42,
+            "pr_title": "PR #42", "pr_url": "https://git/pulls/42",
+            "head_sha": "abc123", "head_ref": "feature", "base_ref": "main",
+        }
+
+    def _comment_payload(self):
+        return {
+            "repo": "owner/repo", "sender": "alice", "pr_number": 42,
+            "comment_body": "@Raven explain", "comment_user": "alice",
+            "comment_id": 999, "file_path": "", "line": 0,
+            "_is_mention": True,
+        }
+
+    def _pr_provider(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_head_sha.return_value = "abc123"
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.list_directory.return_value = []
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.fetch_file.return_value = ""
+        return mc
+
+    def _run_pr_failure(self, mc, caplog):
+        from raven.metrics import _counters
+        _counters.clear()
+        with (
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+            caplog.at_level("WARNING", logger="raven.server"),
+        ):
+            _process_pr(mc, self._pr_payload())
+        return dict(_counters)
+
+    def _run_comment_failure(self, exc, caplog):
+        from raven.metrics import _counters
+        _counters.clear()
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.get_pr_comments.return_value = []
+        with (
+            patch("raven.server.respond_to_comment", side_effect=exc),
+            caplog.at_level("WARNING", logger="raven.server"),
+        ):
+            _process_comment(mc, self._comment_payload())
+        return dict(_counters)
+
+    @staticmethod
+    def _errors(caplog):
+        return [r for r in caplog.records if r.levelname == "ERROR"]
+
+    @staticmethod
+    def _has_counter(counters, name, label):
+        return any(k.startswith(name) and label in k for k in counters)
+
+    def test_truncated_diff_logs_warning_without_traceback(self, caplog):
+        from raven.providers import DiffTruncatedError
+        mc = self._pr_provider()
+        mc.fetch_pr_diff.side_effect = DiffTruncatedError("diff too large for PR #42")
+        with patch("raven.server.review_diff"):
+            counters = self._run_pr_failure(mc, caplog)
+        assert self._errors(caplog) == [], (
+            "classified failure must not log at ERROR")
+        warnings = [r for r in caplog.records
+                    if r.levelname == "WARNING" and "diff_truncated" in r.getMessage()]
+        assert warnings, "expected a WARNING naming the classified reason"
+        assert all(r.exc_info is None for r in warnings), (
+            "classified failure must not carry a traceback")
+        assert not self._has_counter(counters, "raven_errors_total", 'type="unhandled"')
+        # The classified metric and the operator comment are untouched.
+        assert self._has_counter(counters, "raven_review_failures_total",
+                                 'reason="diff_truncated"')
+        assert mc.post_pr_comment.called
+
+    def test_classified_ai_failure_logs_warning_without_traceback(self, caplog):
+        from raven.ai.base import AIError
+        mc = self._pr_provider()
+        with patch("raven.server.review_diff",
+                   side_effect=AIError("timed out", reason="timeout")):
+            counters = self._run_pr_failure(mc, caplog)
+        assert self._errors(caplog) == []
+        assert any(r.levelname == "WARNING" and "timeout" in r.getMessage()
+                   for r in caplog.records)
+        assert not self._has_counter(counters, "raven_errors_total", 'type="unhandled"')
+
+    def test_unknown_pr_failure_keeps_error_log_and_unhandled_metric(self, caplog):
+        mc = self._pr_provider()
+        with patch("raven.server.review_diff", side_effect=RuntimeError("boom")):
+            counters = self._run_pr_failure(mc, caplog)
+        errors = self._errors(caplog)
+        assert len(errors) == 1
+        assert errors[0].exc_info is not None, (
+            "unknown failure must keep the full traceback")
+        assert self._has_counter(counters, "raven_errors_total", 'type="unhandled"')
+        assert self._has_counter(counters, "raven_review_failures_total",
+                                 'reason="unknown"')
+
+    def test_classified_comment_failure_logs_warning_without_traceback(self, caplog):
+        from raven.ai.base import AIError
+        counters = self._run_comment_failure(
+            AIError("usage cap hit", reason="usage_limit"), caplog)
+        assert self._errors(caplog) == []
+        warnings = [r for r in caplog.records
+                    if r.levelname == "WARNING" and "usage_limit" in r.getMessage()]
+        assert warnings, "expected a WARNING naming the classified reason"
+        assert all(r.exc_info is None for r in warnings)
+        assert not self._has_counter(counters, "raven_errors_total",
+                                     'type="comment_response_failed"')
+        assert self._has_counter(counters, "raven_review_failures_total",
+                                 'reason="usage_limit"')
+
+    def test_unknown_comment_failure_keeps_error_log_and_metric(self, caplog):
+        counters = self._run_comment_failure(RuntimeError("boom"), caplog)
+        errors = self._errors(caplog)
+        assert len(errors) == 1
+        assert errors[0].exc_info is not None
+        assert self._has_counter(counters, "raven_errors_total",
+                                 'type="comment_response_failed"')
+        assert self._has_counter(counters, "raven_review_failures_total",
+                                 'reason="unknown"')
+
+
 class TestWaitForCi:
     def test_initial_delay_skipped_on_terminal_fast_path(self):
         """Fast path: if the first probe already returns a terminal
@@ -2203,13 +2347,22 @@ class TestHelpers:
         from raven.reviewer import RAVEN_AI_MODEL
         assert RAVEN_AI_MODEL in comment
 
-    def test_severity_emoji_scheme_is_red_orange_yellow_no_green(self):
+    def test_severity_emoji_scheme_is_red_orange_yellow_no_green(self, monkeypatch):
         # Severity colors: high=red, medium=orange, low=yellow — explicitly NO
         # green anywhere (per request). Guards against regressing to the old
         # green-for-low scheme.
-        from raven.server import SEVERITY_EMOJI
-        assert SEVERITY_EMOJI == {"high": "🔴", "medium": "🟠", "low": "🟡"}
-        assert "🟢" not in SEVERITY_EMOJI.values()
+        from raven.severity import default_scale
+        scale = default_scale()
+        assert {n: scale.emoji(n) for n in ("high", "medium", "low")} == {
+            "high": "🔴", "medium": "🟠", "low": "🟡"}
+        assert "🟢" not in {scale.emoji(n) for n in scale.ordered()}
+        # Position-based, not gate-based: the three colours must not vary
+        # with REVIEW_APPROVE_MAX_SEVERITY (Task 1 regression this test
+        # could not previously catch — see Task 4 correction).
+        for threshold in ("low", "medium", "high"):
+            monkeypatch.setenv("REVIEW_APPROVE_MAX_SEVERITY", threshold)
+            assert {n: default_scale().emoji(n) for n in ("high", "medium", "low")} == {
+                "high": "🔴", "medium": "🟠", "low": "🟡"}
         # A low finding renders yellow (not green) in the rendered body.
         body = _format_comment({"severity": "low", "summary": "x",
                                 "findings": [{"severity": "low", "message": "m"}]})
@@ -2319,6 +2472,32 @@ class TestHelpers:
         monkeypatch.delenv("RAVEN_MAX_FILE_LINES", raising=False)
         monkeypatch.delenv("RAVEN_MAX_FILES", raising=False)
         assert _resolve_file_context_caps() == (500, 10)
+
+    def test_max_severity_from_findings_matches_pre_scale_behavior(self):
+        """Unrecognised or missing severities must rank LOWEST, not
+        highest — this is NOT scale.normalize()/scale.rank() territory
+        (those fail CLOSED for model-emitted severities). This helper
+        reproduces the pre-scale
+        ``SEVERITY_ORDER.get(f.get("severity", "low"), 0)`` behaviour
+        exactly, same reasoning as reviewer._cap_findings and the
+        carried-candidates cap in _process_pr."""
+        from raven.server import _max_severity_from_findings
+
+        # Missing key, empty string, and None all default to "low" on
+        # main — none of them may resolve to "high" here.
+        assert _max_severity_from_findings([{"message": "no severity key"}]) == "low"
+        assert _max_severity_from_findings([{"severity": ""}]) == "low"
+        assert _max_severity_from_findings([{"severity": None}]) == "low"
+        # An unrecognised (but non-empty) value also ranks lowest.
+        assert _max_severity_from_findings([{"severity": "critical"}]) == "low"
+        # Known values, and empty list, are unchanged.
+        assert _max_severity_from_findings([{"severity": "low"}]) == "low"
+        assert _max_severity_from_findings([]) == "low"
+        # Whitespace/case variants of a known name still resolve.
+        assert _max_severity_from_findings([{"severity": "  HIGH  "}]) == "high"
+        # A recognised finding still wins the max over an unrecognised one.
+        assert _max_severity_from_findings(
+            [{"severity": "critical"}, {"severity": "medium"}]) == "medium"
 
 
 class TestIncrementalReview:
@@ -2788,6 +2967,333 @@ class TestIncrementalReview:
         assert "carry me" in submitted_body
 
 
+class TestRebaseTolerance:
+    """A rebase rewrites a file's diff chunk — ``index`` blob SHAs, ``@@``
+    line numbers, surrounding context — without touching the PR's own
+    edits. Re-reviewing on that basis regenerates the file's findings,
+    and a regenerated finding has no ``comment_id``, which is what the
+    user-resolved filter matches on: every resolution on that file is
+    lost. So content-equal files are carried, not re-reviewed — and
+    because they are carried rather than regenerated, their line numbers
+    have to be moved onto the code's new position by hand."""
+
+    # b.py: one hunk at new-side line 7, the PR's edit on line 10.
+    B_BEFORE = (
+        "diff --git a/b.py b/b.py\n"
+        "index e88160e..b394268 100644\n"
+        "--- a/b.py\n"
+        "+++ b/b.py\n"
+        "@@ -7,7 +7,7 @@ def g():\n"
+        " ctx7\n ctx8\n ctx9\n"
+        "-other10\n"
+        "+other10_edited_by_pr\n"
+        " ctx11\n"
+    )
+    # Same edit after the base branch grew b.py by 40 lines above it.
+    B_AFTER = (B_BEFORE
+               .replace("index e88160e..b394268", "index ed765b6..7a4440c")
+               .replace("@@ -7,7 +7,7 @@", "@@ -47,7 +47,7 @@"))
+    # The SAME edit relocated by the author to a different part of the
+    # file: identical +/- lines (so identical content hash) and an
+    # identical hunk shape, but landing in different surrounding code.
+    # Indistinguishable from B_AFTER on positions alone — only the
+    # context tells them apart.
+    B_MOVED = (
+        "diff --git a/b.py b/b.py\n"
+        "index e88160e..cccccc1 100644\n"
+        "--- a/b.py\n"
+        "+++ b/b.py\n"
+        "@@ -47,7 +47,7 @@ def somewhere_else():\n"
+        " zzz47\n zzz48\n zzz49\n"
+        "-other10\n"
+        "+other10_edited_by_pr\n"
+        " zzz51\n"
+    )
+    A_OLD = "diff --git a/a.py b/a.py\n@@ -1,1 +1,1 @@\n+old\n"
+    A_NEW = "diff --git a/a.py b/a.py\n@@ -1,1 +1,1 @@\n+new\n"
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def _normalized_payload(self, pr_number=42):
+        return {
+            "repo": "owner/repo", "sender": "alice", "pr_number": pr_number,
+            "pr_title": f"PR #{pr_number}", "pr_url": "https://git/pulls/42",
+            "head_sha": "abc123", "head_ref": "feature", "base_ref": "main",
+        }
+
+    def _make_provider(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_file.return_value = ""
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.get_resolved_comment_ids.return_value = set()
+        mc.submit_review.return_value = {"id": 1}
+        mc.add_label_to_pr.return_value = None
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.side_effect = [
+            [],                                                   # auto-add check
+            [{"user": {"login": "Raven"}, "state": "APPROVED"}],  # gate check
+        ]
+        return mc
+
+    def _seed(self, chunks: dict, findings: dict, verdict=None):
+        """Cache a prior review of ``chunks`` (filename -> chunk)."""
+        import hashlib, time as _time
+        from raven.reviewer import diff_hash, hunk_positions, hunk_context_digests
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(
+            timestamp=_time.time(),
+            hashes={f: hashlib.sha256(c.encode()).hexdigest()
+                    for f, c in chunks.items()},
+            content_hashes={f: diff_hash(c) for f, c in chunks.items()},
+            hunks={f: hunk_positions(c) for f, c in chunks.items()},
+            # Populated exactly as a real post-submit write does — a seed
+            # missing it would silently exercise the legacy-entry degrade
+            # path instead of current behaviour. That path has its own
+            # test (test_legacy_entry_without_context_still_remaps).
+            hunk_context={f: hunk_context_digests(c) for f, c in chunks.items()},
+            findings=findings,
+            verdict=verdict,
+        )
+        return _previous_diffs["gitea:owner/repo#42"]
+
+    def _finding(self, line=10, **kw):
+        f = {"severity": "high", "file": "b.py", "line": line,
+             "message": "bug on the PR's edited line", "comment_id": 999}
+        f.update(kw)
+        return f
+
+    def _run(self, diff, review=None):
+        mc = self._make_provider()
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+        ):
+            mc.fetch_pr_diff.return_value = diff
+            mock_review.return_value = review or {
+                "severity": "low", "summary": "a ok", "findings": []}
+            _process_pr(mc, self._normalized_payload())
+        return mc, mock_review
+
+    def test_shifted_file_is_not_re_reviewed(self):
+        """The whole point: b.py's own edits are byte-identical, so it
+        stays out of the delta and keeps its comment_id-bearing findings."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding()]})
+        _, mock_review = self._run(self.A_NEW + self.B_AFTER)
+        reviewed = mock_review.call_args.args[0]
+        assert "a.py" in reviewed
+        assert "b.py" not in reviewed
+        assert mock_review.call_args.kwargs["unchanged_files"] == ["b.py"]
+
+    def test_carried_finding_follows_the_shift(self):
+        """Carried findings re-post from the cache, so an unshifted line
+        would anchor the inline comment to whatever the rebase slid into
+        that position. The hunk moved 7 -> 47, so line 10 -> 50."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10)]})
+        mc, _ = self._run(self.A_NEW + self.B_AFTER)
+        inline = mc.submit_review.call_args.kwargs["inline_comments"]
+        assert [c["line"] for c in inline if c["file"] == "b.py"] == [50]
+
+    def test_shift_is_recorded_in_the_cache(self):
+        """The next pass has to diff against the shifted state, not the
+        pre-rebase one, or the remap would be applied twice."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10)]})
+        self._run(self.A_NEW + self.B_AFTER)
+        entry = _previous_diffs["gitea:owner/repo#42"]
+        assert entry.findings["b.py"][0]["line"] == 50
+        assert entry.hunks["b.py"] == [(47, 7)]
+
+    def test_comment_id_survives_the_shift(self):
+        """The remap must not cost the finding its comment_id — that is
+        the whole identity the user-resolved filter and retraction use."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10)]})
+        self._run(self.A_NEW + self.B_AFTER)
+        assert _previous_diffs["gitea:owner/repo#42"].findings["b.py"][0]["comment_id"] == 999
+
+    def test_unshifted_rebase_carries_the_finding_untouched(self):
+        """Base edits *below* the PR's hunk rewrite the blob SHAs only.
+        Nothing to remap — and nothing to re-review either."""
+        b_reindexed = self.B_BEFORE.replace("index e88160e..b394268",
+                                            "index 9999999..8888888")
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10)]})
+        mc, mock_review = self._run(self.A_NEW + b_reindexed)
+        assert "b.py" not in mock_review.call_args.args[0]
+        inline = mc.submit_review.call_args.kwargs["inline_comments"]
+        assert [c["line"] for c in inline if c["file"] == "b.py"] == [10]
+
+    def test_real_edit_to_a_shifted_file_still_re_reviews(self):
+        """Rebase tolerance must not swallow an actual change: a file
+        that both moved AND was edited belongs in the delta."""
+        b_edited = self.B_AFTER.replace("+other10_edited_by_pr",
+                                        "+other10_edited_again")
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding()]})
+        _, mock_review = self._run(self.A_NEW + b_edited)
+        assert "b.py" in mock_review.call_args.args[0]
+
+    def test_relocated_edit_is_re_reviewed_not_remapped(self):
+        """Audit 2026-08-17 MED. The content hash keeps only the +/- line
+        bodies, so an author relocating a byte-identical edit elsewhere in
+        the same file produces an identical hash — and identical hunk
+        geometry, so the remap "succeeds" and simply shifts the finding.
+        The relocated code is then never reviewed in its new position.
+
+        That matters because position is what makes a line dangerous: the
+        same statement is inert in a dead branch and live on a hot path.
+        A first pass could approve it where it was harmless, and a later
+        push consolidate the carried approve into a merge.
+
+        Context is the only signal that separates this from the rebase
+        case it is deliberately tolerant of, so a hunk whose surrounding
+        code changed must fall back to a real re-review."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10)]})
+        _, mock_review = self._run(self.A_NEW + self.B_MOVED)
+        assert "b.py" in mock_review.call_args.args[0], (
+            "an edit relocated into different surrounding code must be "
+            "re-reviewed, not silently carried onto its new line"
+        )
+
+    def test_legacy_entry_without_context_still_remaps(self):
+        """Entries written before hunk_context existed have nothing to
+        compare, so they degrade to the previous behaviour (remap on
+        geometry alone) rather than re-reviewing every carried file.
+
+        Deliberately NOT closed by bumping DIFF_HASH_SCHEME: that wipes
+        the whole findings cache, and a full re-review regenerates
+        findings without their comment_ids — losing exactly the developer
+        resolutions this feature exists to preserve. One unprotected push
+        per PR is the cheaper trade; the next review writes the field."""
+        entry = self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                           {"a.py": [], "b.py": [self._finding(line=10)]})
+        entry.hunk_context = {}          # as loaded from an older cache file
+        _, mock_review = self._run(self.A_NEW + self.B_AFTER)
+        assert "b.py" not in mock_review.call_args.args[0]
+
+    def test_genuine_rebase_still_carries(self):
+        """Guard against over-tightening: the rebase case keeps its
+        context byte-identical and must still avoid a re-review."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10)]})
+        _, mock_review = self._run(self.A_NEW + self.B_AFTER)
+        assert "b.py" not in mock_review.call_args.args[0]
+
+    def test_unmappable_finding_forces_a_re_review(self):
+        """Fail-safe: when the hunks can't be matched one-to-one (a base
+        edit landing in context range merges two hunks into one), we
+        can't prove where the finding's code went — fall back to the
+        pre-rebase-tolerance behaviour and re-review the file."""
+        b_two_hunks = (
+            "diff --git a/b.py b/b.py\n"
+            "@@ -7,7 +7,7 @@ def g():\n"
+            "-other10\n"
+            "+other10_edited_by_pr\n"
+            "@@ -60,3 +60,3 @@ def h():\n"
+            "-tail\n"
+            "+tail_edited\n"
+        )
+        b_one_hunk = (
+            "diff --git a/b.py b/b.py\n"
+            "@@ -7,60 +7,60 @@ def g():\n"
+            "-other10\n"
+            "+other10_edited_by_pr\n"
+            "-tail\n"
+            "+tail_edited\n"
+        )
+        self._seed({"a.py": self.A_OLD, "b.py": b_two_hunks},
+                   {"a.py": [], "b.py": [self._finding(line=8)]})
+        _, mock_review = self._run(self.A_NEW + b_one_hunk)
+        assert "b.py" in mock_review.call_args.args[0]
+
+    def test_finding_outside_every_hunk_forces_a_re_review(self):
+        """A line that matches no recorded hunk has no delta to shift by,
+        so it is not silently left at a position we can't vouch for."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=900)]})
+        _, mock_review = self._run(self.A_NEW + self.B_AFTER)
+        assert "b.py" in mock_review.call_args.args[0]
+
+    def test_file_less_findings_do_not_block_the_remap(self):
+        """PR-wide findings post no inline comment, so they have nothing
+        to anchor and must not drag the file into a re-review."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10)],
+                    "": [{"severity": "low", "message": "PR-wide note"}]})
+        _, mock_review = self._run(self.A_NEW + self.B_AFTER)
+        assert "b.py" not in mock_review.call_args.args[0]
+
+    def test_rebase_only_push_reviews_nothing(self):
+        """Nothing the PR authored changed, so there is no new code to
+        review — regenerating the standing findings would only strand
+        the developer's resolutions."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10)]})
+        mc, mock_review = self._run(self.A_OLD + self.B_AFTER)
+        mock_review.assert_not_called()
+        mc.submit_review.assert_not_called()
+        # …but the shift is still recorded, so the findings stay anchored.
+        entry = _previous_diffs["gitea:owner/repo#42"]
+        assert entry.findings["b.py"][0]["line"] == 50
+        assert entry.hashes["b.py"] != entry.hashes["a.py"]
+
+    def test_rebase_only_push_does_not_dispatch_a_cached_merge(self):
+        """The no-changes skip can send a cached approve straight to a
+        merge with no fresh review. A rebased head is not the head that
+        approval was computed on, so it must not reach that path — the
+        raw-chunk hash, not the content hash, is what gates it."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": []}, verdict="approve")
+        mc = self._make_provider()
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server._maybe_dispatch_cached_merge") as mock_dispatch,
+        ):
+            mc.fetch_pr_diff.return_value = self.A_OLD + self.B_AFTER
+            _process_pr(mc, self._normalized_payload())
+        mock_review.assert_not_called()
+        mock_dispatch.assert_not_called()
+
+    def test_untouched_head_still_reaches_the_cached_merge(self):
+        """The converse: a byte-identical re-trigger is still the
+        no-changes skip, so the standing-approval recovery path is
+        unaffected by any of this."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": []}, verdict="approve")
+        mc = self._make_provider()
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server._maybe_dispatch_cached_merge") as mock_dispatch,
+        ):
+            mc.fetch_pr_diff.return_value = self.A_OLD + self.B_BEFORE
+            _process_pr(mc, self._normalized_payload())
+        mock_review.assert_not_called()
+        mock_dispatch.assert_called_once()
+
+    def test_legacy_cache_entry_behaves_as_before(self):
+        """An entry written before content_hashes existed has nothing to
+        compare against — it must fall back to the raw delta, not to
+        'everything changed'."""
+        import hashlib, time as _time
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(
+            timestamp=_time.time(),
+            hashes={"a.py": hashlib.sha256(self.A_OLD.encode()).hexdigest(),
+                    "b.py": hashlib.sha256(self.B_BEFORE.encode()).hexdigest()},
+            findings={"a.py": [], "b.py": [self._finding()]},
+        )
+        _, mock_review = self._run(self.A_NEW + self.B_BEFORE)
+        reviewed = mock_review.call_args.args[0]
+        assert "a.py" in reviewed and "b.py" not in reviewed
+
+
 class TestCarriedFindingsRevalidation:
     """Carried findings are re-validated by the incremental review call
     (drop-or-keep via `dropped_carried`) instead of being merged
@@ -3159,6 +3665,27 @@ class TestCarriedFindingsRevalidation:
         assert "low two" in submitted_body
         cached_after = _previous_diffs["gitea:owner/repo#42"].findings.get("b.py", [])
         assert [f["message"] for f in cached_after] == ["low one", "low two"]
+
+    def test_carried_cap_ranks_unknown_severity_lowest(self):
+        """Capping must NOT use scale.rank()'s model-emitted-severity fail
+        CLOSED convention (unknown -> most severe) — these are already-
+        validated cache entries, so the safe direction is the opposite:
+        fail OPEN, ranking an unknown/empty severity as the LEAST severe,
+        same as reviewer._cap_findings. Regression this pins: with
+        scale.rank(), an unknown/empty-severity carried finding ties with
+        (and, via stable sort, wins a cap slot ahead of) a genuine high
+        finding instead of losing to it."""
+        unknown = {"severity": "wat", "file": "b.py", "line": 1, "message": "unknown one"}
+        empty = {"severity": "", "file": "b.py", "line": 2, "message": "empty one"}
+        h1 = {"severity": "high", "file": "b.py", "line": 3, "message": "high one"}
+        self._seed_cache({"a.py": [], "b.py": [unknown, empty, h1]})
+        mc = self._make_provider()
+        with patch("raven.server.RAVEN_CARRIED_REVALIDATION_MAX", 1):
+            mock_review = self._run(mc, {"severity": "low", "summary": "ok", "findings": []})
+        # Cap of 1: only the genuine high finding should reach the model —
+        # unknown/empty severities must rank at the bottom, not tie for
+        # the top with (and displace) a real high finding.
+        assert mock_review.call_args.kwargs["carried_findings"] == [h1]
 
     def test_duplicate_fresh_restatement_deduped(self):
         """The prompt forbids copying carried findings into `findings`,
@@ -3687,6 +4214,98 @@ class TestCoverageGapBlocksMerge:
         assert mc.submit_review.call_args.kwargs["approve"] is False
         mock_merge.assert_not_called()
         assert _previous_diffs["gitea:owner/repo#42"].coverage_gap_files == ["b.py"]
+
+
+class TestUnfetchableScaleBlocksMerge:
+    """PR #216 review, Finding 1: a severities.json that EXISTS but could
+    not be FETCHED (transient network/auth failure at the provider) must
+    not be treated the same as "no file" — the repo may have a stricter
+    scale than the built-in default, and silently reviewing under a
+    guessed vocabulary risks auto-merging a PR the repo's real gate would
+    have blocked. Mirrors TestCoverageGapBlocksMerge: the review still
+    posts (the author gets feedback) but the verdict is forced to
+    needs_work and auto-merge is refused."""
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def _payload(self, pr_number=42):
+        return {
+            "repo": "owner/repo", "sender": "alice", "pr_number": pr_number,
+            "pr_title": f"PR #{pr_number}", "pr_url": "https://git/pulls/42",
+            "head_sha": "abc123", "head_ref": "feature", "base_ref": "main",
+        }
+
+    def _make_provider(self, fetch_file_side_effect):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_file.side_effect = fetch_file_side_effect
+        mc.fetch_pr_diff.return_value = "diff --git a/f b/f\n+line\n"
+        mc.submit_review.return_value = {"id": 1}
+        mc.add_label_to_pr.return_value = None
+        mc.get_commit_status.return_value = "success"
+        mc.merge_pr.return_value = True
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [
+            {"user": {"login": "Raven"}, "state": "APPROVED"},
+        ]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_head_sha.return_value = "abc123"
+        return mc
+
+    def _run_with_fetch(self, fetch_file_side_effect, review):
+        mc = self._make_provider(fetch_file_side_effect)
+        with (
+            patch("raven.server.review_diff", return_value=review),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+            patch("raven.server._safe_do_merge") as mock_merge,
+        ):
+            _process_pr(mc, self._payload())
+        return mc, mock_merge
+
+    def test_fetch_failure_forces_needs_work_and_skips_merge(self):
+        def fetch_file(repo, path, ref=None, **kw):
+            if path.endswith("severities.json"):
+                raise RuntimeError("boom: transient fetch failure")
+            return ""
+
+        review = {"severity": "low", "summary": "clean", "findings": []}
+        mc, mock_merge = self._run_with_fetch(fetch_file, review)
+
+        mc.submit_review.assert_called_once()
+        assert mc.submit_review.call_args.kwargs["approve"] is False
+        mock_merge.assert_not_called()
+        mc.merge_pr.assert_not_called()
+
+    def test_fetch_failure_increments_metric(self, mocker):
+        import raven.server as server
+        spy = mocker.patch.object(server, "inc")
+
+        def fetch_file(repo, path, ref=None, **kw):
+            if path.endswith("severities.json"):
+                raise RuntimeError("boom")
+            return ""
+
+        review = {"severity": "low", "summary": "clean", "findings": []}
+        self._run_with_fetch(fetch_file, review)
+
+        spy.assert_any_call("raven_severity_scale_fetch_failed_total",
+                            {"repo": "owner/repo"})
+
+    def test_missing_file_still_approves(self):
+        """Regression guard: the ordinary "no severities.json at all" case
+        (most repos) must still approve exactly as before — only a real
+        fetch EXCEPTION triggers the fail-closed behaviour."""
+        def fetch_file(repo, path, ref=None, **kw):
+            return ""  # every fetch cleanly reports "absent", none raise
+
+        review = {"severity": "low", "summary": "clean", "findings": []}
+        mc, mock_merge = self._run_with_fetch(fetch_file, review)
+
+        assert mc.submit_review.call_args.kwargs["approve"] is True
+        mock_merge.assert_called_once()
 
 
 class TestDedup:
@@ -4555,8 +5174,15 @@ class TestPullRequestComment:
         mc.supports_comment_threads = False
         mc.get_pr_head_sha.return_value = "abc123"
         mc.fetch_pr_diff.return_value = "diff --git a/server.py\n+x\n"
-        # Return CLAUDE.md first, then the code snippet (two calls)
-        mc.fetch_file.side_effect = ["", "\n".join(f"row-{i}" for i in range(1, 101))]
+        # Path-keyed rather than an ordered positional list: fetch_file is
+        # also called for the repo's severities.json (base-ref provenance,
+        # Task 14), and a fixed-position list breaks the instant another
+        # base-ref fetch is added between two existing ones. Keyed by path
+        # instead, so the fixture describes WHAT each path returns, not how
+        # many calls happen or in what order.
+        mc.fetch_file.side_effect = lambda repo, path, ref="HEAD": (
+            "\n".join(f"row-{i}" for i in range(1, 101)) if path == "server.py" else ""
+        )
         mc.get_pr_comments.return_value = []
         with patch("raven.server.respond_to_comment") as mock_respond:
             mock_respond.return_value = {"response": "ok", "revise": None, "retract_findings": []}
@@ -4750,6 +5376,48 @@ class TestCachePersistence:
         assert entry.hashes == {"a.py": "hash1"}
         assert entry.findings["a.py"][0]["message"] == "bug"
 
+    def test_round_trip_restores_rebase_tolerance_state(self, tmp_path):
+        """content_hashes/hunks must survive a restart. Dropping them
+        silently reverts the PR to full re-review-on-rebase, and JSON has
+        no tuples, so the (start, length) pairs need restoring by hand."""
+        from raven.server import CacheEntry
+        cache_file = tmp_path / "raven" / "findings_cache.json"
+        _previous_diffs["owner/repo#1"] = CacheEntry(
+            timestamp=100.0,
+            hashes={"a.py": "raw1"},
+            findings={"a.py": []},
+            content_hashes={"a.py": "content1"},
+            hunks={"a.py": [(7, 7), (40, 3)]},
+        )
+        with patch("raven.server._CACHE_FILE", cache_file), \
+             patch("raven.server._CACHE_DIR", tmp_path / "raven"):
+            _save_cache()
+            _previous_diffs.clear()
+            _load_cache()
+        entry = _previous_diffs["owner/repo#1"]
+        assert entry.content_hashes == {"a.py": "content1"}
+        assert entry.hunks == {"a.py": [(7, 7), (40, 3)]}
+
+    def test_malformed_hunks_skip_only_that_entry(self, tmp_path):
+        """A corrupt hunk row must fail into the per-entry guard, not
+        reach _remap_carried_lines and blow up mid-review."""
+        import json as _json
+        from raven.reviewer import review_config_hash
+        cache_file = tmp_path / "cache.json"
+        cache_file.write_text(_json.dumps({
+            "_config_hash": review_config_hash(),
+            "entries": {
+                "owner/repo#1": {"timestamp": 1.0, "hashes": {}, "findings": {},
+                                 "hunks": {"a.py": [[7]]}},
+                "owner/repo#2": {"timestamp": 2.0, "hashes": {"b.py": "h"},
+                                 "findings": {}},
+            },
+        }), encoding="utf-8")
+        with patch("raven.server._CACHE_FILE", cache_file):
+            _load_cache()
+        assert "owner/repo#1" not in _previous_diffs
+        assert "owner/repo#2" in _previous_diffs
+
     def test_load_missing_file(self, tmp_path):
         cache_file = tmp_path / "nonexistent" / "cache.json"
         with patch("raven.server._CACHE_FILE", cache_file):
@@ -4865,6 +5533,48 @@ class TestCachePersistence:
             _load_cache()
         entry = _previous_diffs["u/r#7"]
         assert entry.coverage_gap_files == []
+
+    def test_config_hash_round_trips(self, tmp_path):
+        """config_hash (Task 10 — per-entry cache invalidation) survives a
+        save/load cycle so the config-hash gate still works after a
+        service restart."""
+        from raven.server import CacheEntry
+        cache_file = tmp_path / "raven" / "findings_cache.json"
+        _previous_diffs["owner/repo#10"] = CacheEntry(
+            timestamp=1.0, hashes={}, findings={},
+            verdict="approve", summary="ok",
+            config_hash="abc123def4567890",
+        )
+        with patch("raven.server._CACHE_FILE", cache_file), \
+             patch("raven.server._CACHE_DIR", tmp_path / "raven"):
+            _save_cache()
+            _previous_diffs.clear()
+            _load_cache()
+        assert _previous_diffs["owner/repo#10"].config_hash == "abc123def4567890"
+
+    def test_load_entry_without_config_hash_defaults_empty(self, tmp_path):
+        """Cache files written before config_hash existed (every cache
+        file on disk before this feature ships) must load cleanly with
+        the '' legacy default, not crash or raise KeyError."""
+        from raven.reviewer import review_config_hash
+        cache_dir = tmp_path / "raven"
+        cache_dir.mkdir()
+        cache_file = cache_dir / "findings_cache.json"
+        cache_file.write_text(json.dumps({
+            "_config_hash": review_config_hash(),
+            "entries": {"u/r#8": {
+                "timestamp": 1700.0,
+                "hashes": {"a.py": "h"},
+                "findings": {"a.py": []},
+                "verdict": "approve",
+                "summary": "LGTM",
+            }},
+        }))
+        with patch("raven.server._CACHE_DIR", cache_dir), \
+             patch("raven.server._CACHE_FILE", cache_file):
+            _load_cache()
+        entry = _previous_diffs["u/r#8"]
+        assert entry.config_hash == ""
 
     def test_save_emits_new_dict_shape(self, tmp_path):
         """_save_cache serializes the new dict shape, not the legacy 3-tuple."""
@@ -6479,6 +7189,41 @@ class TestProcessCommentRevision:
         finally:
             _previous_diffs.pop(pr_key, None)
 
+    def test_flip_to_approve_suppressed_when_severity_scale_fetch_fails(
+        self, mock_provider_for_comment_flow, cached_needs_work, monkeypatch,
+    ):
+        """Fail-closed parity with _process_pr (audit 2026-08-14 MED).
+
+        When severities.json cannot be READ, _fetch_severity_scale falls
+        back to default_scale() — which for a repo that reuses the
+        built-in low/medium/high names but sets a tighter
+        blocks_at_or_above is a LOOSER gate than its real policy.
+        _process_pr already refuses to approve on that state via its
+        on_fetch_failed closure; the comment-driven flip-to-approve is
+        the one remaining merge-capable path that did not, so a
+        transient provider error could auto-merge past the repo's own
+        blocking tier. The reply itself still posts — only the merge is
+        blocked."""
+        submitted = self._capture_executor(monkeypatch)
+
+        def _fail_severities(repo, path, ref=None, *a, **kw):
+            if path.endswith("severities.json"):
+                raise RuntimeError("transient provider failure")
+            return ""
+
+        mock_provider_for_comment_flow.fetch_file.side_effect = _fail_severities
+        with patch("raven.server.respond_to_comment") as mock_respond:
+            self._flip_to_approve(mock_respond)
+            _process_comment(mock_provider_for_comment_flow, self._payload())
+
+        assert mock_provider_for_comment_flow.post_pr_comment.called, (
+            "The conversational reply must still post — only the merge is gated"
+        )
+        assert not submitted, (
+            "severities.json unreadable means the repo's real merge gate is "
+            "unknown; a comment-driven flip-to-approve must not auto-merge"
+        )
+
 
 class TestProcessCommentRaceGuard:
     def test_comment_flow_does_not_add_itself_to_in_progress(
@@ -6640,6 +7385,210 @@ class TestProcessCommentRaceGuard:
             mock_provider_for_comment_flow.submit_review.assert_not_called()
         finally:
             _previous_diffs.pop(pr_key, None)
+
+
+class TestCommentFlowUsesTheRepoScale:
+    """Task 14: the comment-reply flow is the last path that rendered on
+    the built-in low/medium/high vocabulary regardless of the repo's own
+    severities.json — the same defect class Task 12b fixed for
+    _process_pr's renderers (nine total across the feature; none caught
+    by a green suite)."""
+
+    def test_max_severity_uses_the_supplied_scale(self):
+        import raven.server as server
+        from raven.severity import SeverityScale
+        s = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                          blocks_at_or_above="bug")
+        findings = [{"severity": "nit"}, {"severity": "bug"}]
+        assert server._max_severity_from_findings(findings, s) == "bug"
+
+    def test_custom_tier_not_rendered_as_default_vocabulary(self):
+        """Without the scale, a repo's tier name that isn't in the
+        built-in vocabulary is unranked against it, and
+        _max_severity_from_findings (deliberately, matching the
+        pre-scale SEVERITY_ORDER.get(name, 0) behaviour preserved
+        through Phase A — see its own docstring) ties an unranked name
+        with the scale's LEAST severe tier, not the most severe one.
+        So a repo's 'blocker' — its own most severe tier — silently
+        renders and would notify as 'low' if the scale were never
+        threaded through: an under-representation, the opposite of
+        fail-closed, and exactly the silent-wrong-answer failure this
+        task exists to prevent.
+
+        (Note: the task brief's own draft of this test asserted
+        '== "high"' for the unscoped call — verified empirically wrong
+        against the shipped _max_severity_from_findings, whose docstring
+        and Phase-A history both establish "unrecognised -> least
+        severe" as the deliberate, preserved behaviour. Corrected here;
+        see task-14-report.md.)
+        """
+        import raven.server as server
+        from raven.severity import SeverityScale
+        s = SeverityScale(ranks={"nit": 10, "blocker": 30},
+                          blocks_at_or_above="blocker")
+        assert server._max_severity_from_findings([{"severity": "blocker"}], s) == "blocker"
+        assert server._max_severity_from_findings([{"severity": "blocker"}]) == "low"
+
+    def test_process_comment_fetches_the_scale_from_base_ref(
+            self, mock_provider_for_comment_flow, mocker):
+        """_process_comment must resolve the repo scale from the PR's base
+        ref, like it already does for CLAUDE.md — not from the head SHA."""
+        import raven.server as server
+        from raven.severity import default_scale
+
+        spy = mocker.patch.object(server, "_fetch_severity_scale",
+                                  return_value=default_scale())
+        mock_provider_for_comment_flow.get_pr_base_ref.return_value = "base-sha"
+
+        with patch("raven.server.respond_to_comment",
+                   return_value={"response": "ok", "revise": None, "retract_findings": []}):
+            server._process_comment(mock_provider_for_comment_flow, {
+                "repo": "u/r", "pr_number": 1,
+                "comment_body": "?", "comment_id": 12,
+                "parent_comment_id": None, "_is_mention": True,
+            })
+
+        assert spy.called
+        assert spy.call_args[0][2] == "base-sha"
+
+    def test_advisory_update_body_uses_the_fetched_scale_not_default(
+            self, mock_provider_for_comment_flow, cached_needs_work,
+            mocker, monkeypatch):
+        """Integration-level pin (mirrors Task 12b's approach — a
+        renderer-only unit test can't catch a call-site regression):
+        the advisory_update body posted by _process_comment must render
+        with the REPO'S scale in BOTH places _format_comment needs it —
+        the computed severity string AND the ``scale=`` kwarg that
+        drives its emoji.
+
+        Deliberately uses the MIDDLE tier ('bug'), not the most-severe
+        one: a most-severe example is a weak mutation target here,
+        because ``SeverityScale.emoji()`` fails closed to most-severe
+        on an unrecognised name, so an unthreaded ``scale=`` kwarg would
+        *coincidentally* still render red for a most-severe finding —
+        this test would have passed even with that call site's
+        ``scale=comment_scale`` reverted (caught only by mutation
+        testing, see task-14-report.md). 'bug' can't coincide: under
+        the real scale it's neither most nor least severe (🟠); if
+        _max_severity_from_findings is unthreaded, 'bug' is unranked
+        against default_scale() and collapses to its least-severe tier
+        ('low'); if _format_comment's scale= is unthreaded, 'bug'
+        stays the right STRING but its emoji fails closed to
+        default_scale()'s most-severe (🔴, since 'bug' is unranked
+        there too). Either mutation alone is now visibly wrong."""
+        import raven.server as server
+        from raven.severity import SeverityScale
+
+        scale = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                              blocks_at_or_above="bug")
+        mocker.patch.object(server, "_fetch_severity_scale", return_value=scale)
+        monkeypatch.setattr("raven.server.RAVEN_REVIEW_MODE", "advisory")
+
+        from raven.server import _previous_diffs
+        pr_key = "gitea:u/r#1"
+        _previous_diffs[pr_key].findings = {
+            "a.py": [{"severity": "bug", "message": "m"}],
+        }
+
+        with patch("raven.server.respond_to_comment") as mock_respond, \
+             patch("raven.server._safe_do_merge"):
+            mock_respond.return_value = {
+                "response": "ack",
+                "revise": {"verdict": "approve", "body": "Revised: LGTM"},
+                "retract_findings": [],
+            }
+            server._process_comment(mock_provider_for_comment_flow, {
+                "repo": "u/r", "pr_number": 1,
+                "comment_body": "?", "comment_id": 12,
+                "parent_comment_id": None, "_is_mention": True,
+            })
+
+        kwargs = mock_provider_for_comment_flow.submit_review.call_args.kwargs
+        assert "🟠" in kwargs["body"]
+        assert "BUG" in kwargs["body"]
+        assert "🔴" not in kwargs["body"]
+
+    def test_synthetic_merge_review_uses_the_fetched_scale_not_default(
+            self, mock_provider_for_comment_flow, cached_needs_work, mocker):
+        """Integration-level pin for the OTHER _max_severity_from_findings
+        call site (~:2777): the synthetic review dict built for the
+        comment-driven auto-merge dispatch must compute 'severity' from
+        the repo's own scale too, not default_scale()."""
+        import raven.server as server
+        from raven.severity import SeverityScale
+
+        scale = SeverityScale(ranks={"nit": 10, "blocker": 30},
+                              blocks_at_or_above="blocker")
+        mocker.patch.object(server, "_fetch_severity_scale", return_value=scale)
+        mock_provider_for_comment_flow.get_pr_reviews.return_value = []
+        mock_provider_for_comment_flow.get_pr_requested_reviewers.return_value = []
+
+        from raven.server import _previous_diffs
+        pr_key = "gitea:u/r#1"
+        _previous_diffs[pr_key].findings = {
+            "a.py": [{"severity": "blocker", "message": "m"}],
+        }
+
+        with patch("raven.server.respond_to_comment") as mock_respond, \
+             patch("raven.server._safe_do_merge") as mock_merge:
+            mock_respond.return_value = {
+                "response": "ok",
+                "revise": {"verdict": "approve", "body": "Revised: LGTM"},
+                "retract_findings": [],
+            }
+            server._process_comment(mock_provider_for_comment_flow, {
+                "repo": "u/r", "pr_number": 1,
+                "comment_body": "?", "comment_id": 12,
+                "parent_comment_id": None, "_is_mention": True,
+            })
+
+        mock_merge.assert_called_once()
+        synthetic_review = mock_merge.call_args.args[5]
+        assert synthetic_review["severity"] == "blocker"
+
+    def test_synthetic_merge_review_carries_scale_fields(
+            self, mock_provider_for_comment_flow, cached_needs_work, mocker):
+        """Finding 1 (PR #216 review, 2nd pass): the synthetic review dict
+        built for comment-driven auto-merge dispatch must carry
+        severity_scale_names / severity_blocks_at — every REAL review dict
+        (review_diff's output) carries them, and notifier._scale_from_review
+        needs them to reconstruct the repo's actual scale. Without these
+        two fields the notifier silently reconstructs default_scale(), so
+        a custom-scale repo's merge_failed/ci_failed notification would
+        mis-colour (fail closed to most-severe or wrong emoji) and
+        _passes_threshold would mis-filter against built-in ranks."""
+        import raven.server as server
+        from raven.severity import SeverityScale
+
+        scale = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                              blocks_at_or_above="bug")
+        mocker.patch.object(server, "_fetch_severity_scale", return_value=scale)
+        mock_provider_for_comment_flow.get_pr_reviews.return_value = []
+        mock_provider_for_comment_flow.get_pr_requested_reviewers.return_value = []
+
+        from raven.server import _previous_diffs
+        pr_key = "gitea:u/r#1"
+        _previous_diffs[pr_key].findings = {
+            "a.py": [{"severity": "bug", "message": "m"}],
+        }
+
+        with patch("raven.server.respond_to_comment") as mock_respond, \
+             patch("raven.server._safe_do_merge") as mock_merge:
+            mock_respond.return_value = {
+                "response": "ok",
+                "revise": {"verdict": "approve", "body": "Revised: LGTM"},
+                "retract_findings": [],
+            }
+            server._process_comment(mock_provider_for_comment_flow, {
+                "repo": "u/r", "pr_number": 1,
+                "comment_body": "?", "comment_id": 12,
+                "parent_comment_id": None, "_is_mention": True,
+            })
+
+        mock_merge.assert_called_once()
+        synthetic_review = mock_merge.call_args.args[5]
+        assert synthetic_review["severity_scale_names"] == ["blocker", "bug", "nit"]
+        assert synthetic_review["severity_blocks_at"] == "bug"
 
 
 # ------------------------------------------------------------------ #
@@ -6878,6 +7827,52 @@ class TestReviewOutputChannels:
         assert "blocked" in body
         assert call.kwargs["approve"] is False
 
+    def test_inline_surfaces_severity_mismatch_note(self):
+        """Finding 2 (PR #216 review): under RAVEN_REVIEW_OUTPUT=inline,
+        _process_pr builds the body via _format_inline_leftovers and never
+        calls _format_comment — so the config-error line naming the
+        unrecognised severities (the feature's whole detection story) was
+        invisible to the operator, even though the merge still failed
+        closed. Must surface the same note the summary/both path gets from
+        _format_comment."""
+        mc = self._make_provider()
+        review = dict(self._REVIEW)
+        review["unknown_severities"] = ["critical"]
+        review["severity_scale_names"] = ["blocker", "bug", "nit"]
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", "inline"),
+            patch("raven.server.review_diff", return_value=review),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+        call = mc.submit_review.call_args
+        body = call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
+        assert "Severity config mismatch" in body
+        assert "`critical`" in body
+
+    def test_inline_mismatch_note_survives_with_no_leftover_findings(self):
+        """A mismatch can occur with zero non-postable findings (every
+        finding is inline-anchored, or there are none at all) — the note
+        must still surface rather than being swallowed by the "nothing to
+        show inline -> empty body" shortcut."""
+        mc = self._make_provider()
+        review = {
+            "severity": "medium", "summary": "ok", "findings": [],
+            "unknown_severities": ["critical"],
+            "severity_scale_names": ["blocker", "bug", "nit"],
+        }
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", "inline"),
+            patch("raven.server.review_diff", return_value=review),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+        call = mc.submit_review.call_args
+        body = call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
+        assert "Severity config mismatch" in body
+
 
 class TestCachedMergeDispatch:
     """_maybe_dispatch_cached_merge: dispatch auto-merge from a cached
@@ -6963,6 +7958,25 @@ class TestCachedMergeDispatch:
         assert args[7] == "abc123"          # head-SHA pinned for _do_merge
         assert self._outcomes(mock_inc) == ["dispatched"]
 
+    def test_dispatch_synthetic_review_carries_scale_fields(self):
+        """Finding 1 (PR #216 review, 2nd pass): the synthesized review
+        dict must carry severity_scale_names / severity_blocks_at, like
+        every REAL review dict does — without them notifier._scale_from_review
+        silently reconstructs default_scale() for the merge_failed/
+        ci_failed notification this dict eventually reaches, mis-colouring
+        (and mis-filtering) a custom-scale repo."""
+        from raven.severity import SeverityScale
+        scale = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                              blocks_at_or_above="bug")
+        self._seed_cache()
+        mc = self._make_provider()
+        with patch("raven.server.ci_wait_executor") as mock_exec:
+            mock_exec.submit.return_value = MagicMock()
+            self._call(mc, scale=scale)
+        review_arg = mock_exec.submit.call_args[0][6]
+        assert review_arg["severity_scale_names"] == ["blocker", "bug", "nit"]
+        assert review_arg["severity_blocks_at"] == "bug"
+
     def test_dispatch_recomputes_hashes_when_not_supplied(self):
         """Without precomputed hashes the helper must fetch the CURRENT
         diff and hash it — the cached approval must describe the head."""
@@ -6995,6 +8009,29 @@ class TestCachedMergeDispatch:
         review_arg = mock_exec.submit.call_args[0][6]
         assert review_arg["findings"] == [finding]
         assert review_arg["severity"] == "medium"
+
+    def test_dispatch_synthetic_review_uses_the_supplied_scale(self):
+        """Task 14 (found outside its assigned file scope, fixed as part
+        of it per team-lead ruling — same file, same defect class):
+        _process_pr's no-changes-skip branch already resolves the repo's
+        scale (``no_changes_scale``) to compute ``expected_config_hash``,
+        but never threaded it into this call, so the synthesized notify
+        payload's severity silently fell back to default_scale() and
+        misreported any cached finding using a custom tier name. A
+        'bug'-severity finding (unranked in the built-in vocabulary)
+        must report 'bug' — not collapse to default_scale()'s
+        least-severe reading ('low')."""
+        from raven.severity import SeverityScale
+        finding = {"severity": "bug", "file": "f.py", "line": 3, "message": "m"}
+        self._seed_cache(findings={"f.py": [finding]})
+        mc = self._make_provider()
+        scale = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                              blocks_at_or_above="bug")
+        with patch("raven.server.ci_wait_executor") as mock_exec:
+            mock_exec.submit.return_value = MagicMock()
+            assert self._call(mc, scale=scale) is True
+        review_arg = mock_exec.submit.call_args[0][6]
+        assert review_arg["severity"] == "bug"
 
     # ── safety invariants: every gate fails closed ─────────────────── #
 
@@ -7197,8 +8234,23 @@ class TestNoChangesSkipCachedMergeDispatch:
         _recent_prs.clear()
         _previous_diffs.clear()
 
-    def _seed_cache(self, verdict="approve", gap=()):
+    def _seed_cache(self, verdict="approve", gap=(), config_hash=None):
+        # config_hash defaults to the REAL hash _maybe_dispatch_cached_merge
+        # will expect for this class's provider fixture (mc.fetch_file
+        # returns "" -> default_scale(), no prompt override) — not "".
+        # Before the config-hash mismatch fix, "" silently skipped that
+        # comparison, so an entry left at its old zero-value default
+        # dispatched anyway; after the fix "" is treated as an active
+        # mismatch (see TestCachedMergeRespectsConfigHash), so a fixture
+        # meant to represent a CURRENTLY VALID cached approve — which is
+        # what test_no_changes_skip_dispatches_cached_approve needs — must
+        # carry a real, matching hash like any review completed under
+        # this feature would.
         import time as _time
+        if config_hash is None:
+            from raven.server import _entry_config_hash
+            from raven.severity import default_scale
+            config_hash = _entry_config_hash(default_scale(), None)
         _previous_diffs[self.PR_KEY] = CacheEntry(
             timestamp=_time.time(),
             hashes={"f.py": hashlib.sha256(self.DIFF.encode()).hexdigest()},
@@ -7206,6 +8258,7 @@ class TestNoChangesSkipCachedMergeDispatch:
             verdict=verdict,
             summary="cached body",
             coverage_gap_files=list(gap),
+            config_hash=config_hash,
         )
 
     def _payload(self):
@@ -7248,6 +8301,44 @@ class TestNoChangesSkipCachedMergeDispatch:
         mock_review.assert_not_called()        # no AI pass
         mc.merge_pr.assert_called_once()       # merge still dispatched
         assert mc.merge_pr.call_args.kwargs["head_sha"] == "abc123"
+
+    def test_no_changes_skip_dispatch_uses_the_repos_scale(self):
+        """Task 14 (found outside its assigned scope, fixed as part of it
+        per team-lead ruling — same file, same defect class): this branch
+        already fetches ``no_changes_scale`` (to compute
+        ``expected_config_hash``) but never threaded it into the
+        dispatch call — the synthesized notify payload's severity
+        silently fell back to default_scale(). A cached finding using
+        the repo's own vocabulary ('bug') must report 'bug', not the
+        default scale's fallback ('low')."""
+        import json
+        from raven.server import _entry_config_hash
+
+        scale_json = json.dumps({
+            "severities": {"nit": 10, "bug": 20, "blocker": 30},
+            "blocks_at_or_above": "bug",
+        })
+        from raven.severity import from_json
+        scale = from_json(scale_json)
+
+        self._seed_cache(config_hash=_entry_config_hash(scale, None))
+        _previous_diffs[self.PR_KEY].findings = {
+            "f.py": [{"severity": "bug", "file": "f.py", "line": 1, "message": "m"}],
+        }
+        mc = self._make_provider()
+        mc.fetch_file.side_effect = lambda repo, path, ref="HEAD": (
+            scale_json if path.endswith("severities.json") else ""
+        )
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server._safe_do_merge") as mock_merge,
+            patch("raven.server.notify"),
+        ):
+            _process_pr(mc, self._payload())
+        mock_review.assert_not_called()
+        mock_merge.assert_called_once()
+        synthetic_review = mock_merge.call_args.args[5]
+        assert synthetic_review["severity"] == "bug"
 
     def test_no_changes_skip_does_not_merge_needs_work(self):
         self._seed_cache(verdict="needs_work")
@@ -7293,3 +8384,696 @@ class TestNoChangesSkipCachedMergeDispatch:
             _process_pr(mc, self._payload())
         mock_review.assert_not_called()
         mc.merge_pr.assert_not_called()
+
+
+class TestFetchSeverityScale:
+    def _provider(self, mocker, body=None, exc=None):
+        p = mocker.Mock()
+        if exc is not None:
+            p.fetch_file.side_effect = exc
+        else:
+            p.fetch_file.return_value = body
+        return p
+
+    def test_reads_from_the_base_ref(self, mocker):
+        import raven.server as server
+        p = self._provider(mocker, body='{"severities": {"nit": 1, "bad": 2}}')
+        scale = server._fetch_severity_scale(p, "acme/repo", "base-sha")
+        assert scale.ordered() == ["bad", "nit"]
+        args, kwargs = p.fetch_file.call_args
+        assert "severities.json" in args[1]
+        assert kwargs.get("ref") == "base-sha"
+
+    def test_missing_file_falls_back_to_default(self, mocker):
+        import raven.server as server
+        from raven.severity import default_scale
+        p = self._provider(mocker, body=None)
+        assert server._fetch_severity_scale(p, "acme/repo", "r").ranks == default_scale().ranks
+
+    def test_invalid_file_falls_back_and_counts(self, mocker):
+        import raven.server as server
+        from raven.severity import default_scale
+
+        inc = mocker.patch.object(server, "inc")
+        p = self._provider(mocker, body='{"severities": {"only": 1}}')
+        scale = server._fetch_severity_scale(p, "acme/repo", "r")
+
+        assert scale.ranks == default_scale().ranks
+        inc.assert_any_call("raven_severity_scale_invalid_total", {"repo": "acme/repo"})
+
+    def test_fetch_error_falls_back(self, mocker):
+        import raven.server as server
+        from raven.severity import default_scale
+        p = self._provider(mocker, exc=RuntimeError("boom"))
+        assert server._fetch_severity_scale(p, "acme/repo", "r").ranks == default_scale().ranks
+
+    def test_rules_dir_disabled_skips_the_fetch(self, mocker):
+        import raven.server as server
+        mocker.patch.object(server, "RULES_DIR", "")
+        p = self._provider(mocker, body='{"severities": {"a": 1, "b": 2}}')
+        server._fetch_severity_scale(p, "acme/repo", "r")
+        p.fetch_file.assert_not_called()
+
+
+class TestSeverityMismatchComment:
+    def test_comment_names_offending_and_known_tiers(self):
+        import raven.server as server
+        review = {"severity": "blocker", "summary": "s", "findings": [],
+                  "unknown_severities": ["critical", "major"],
+                  "severity_scale_names": ["blocker", "bug", "nit"]}
+        body = server._format_comment(review)
+        assert "Severity config mismatch" in body
+        assert "`critical`" in body and "`major`" in body
+        assert "blocker" in body and "nit" in body
+
+    def test_no_line_when_vocabulary_matches(self):
+        import raven.server as server
+        review = {"severity": "bug", "summary": "s", "findings": [],
+                  "unknown_severities": [], "severity_scale_names": ["bug"]}
+        assert "Severity config mismatch" not in server._format_comment(review)
+
+    def test_absent_key_is_safe(self):
+        """Cached/legacy reviews have no such key."""
+        import raven.server as server
+        body = server._format_comment({"severity": "low", "summary": "s", "findings": []})
+        assert "Severity config mismatch" not in body
+
+    def test_custom_scale_mismatch_names_the_file(self):
+        """When a repo scale is actually in effect (names differ from the
+        built-in default), the message should still point at the file
+        that governs it — this is the useful, actionable case."""
+        import raven.server as server
+        review = {"severity": "blocker", "summary": "s", "findings": [],
+                  "unknown_severities": ["critical"],
+                  "severity_scale_names": ["blocker", "bug", "nit"]}
+        body = server._format_comment(review)
+        assert "severities.json" in body
+
+    def test_default_scale_mismatch_does_not_name_a_nonexistent_file(self):
+        """Finding 2 (PR #216 review, 2nd pass): unknown_severities fires
+        just as often for the ~100% of repos with NO severities.json at
+        all (default low/medium/high in effect) — where the file the old
+        message pointed at was never read and likely doesn't exist. Detect
+        this by comparing severity_scale_names against
+        default_scale().ordered(); when they match, the message must not
+        name that file, and should instead point at the real likely
+        causes (a prompt override, or the model not honouring the
+        vocabulary)."""
+        import raven.server as server
+        from raven.severity import default_scale
+        review = {"severity": "high", "summary": "s", "findings": [],
+                  "unknown_severities": ["critical"],
+                  "severity_scale_names": default_scale().ordered()}
+        body = server._format_comment(review)
+        assert "Severity config mismatch" in body
+        assert "severities.json" not in body
+        assert "active severity scale" in body
+        assert "prompt override" in body
+
+    def test_inline_leftovers_renders_the_same_note(self):
+        """Finding 2 (PR #216 review): _format_inline_leftovers must
+        render the identical mismatch note _format_comment does, given the
+        same review dict — RAVEN_REVIEW_OUTPUT=inline never calls
+        _format_comment, so without this the note was invisible."""
+        import raven.server as server
+        review = {"severity": "blocker", "summary": "s", "findings": [],
+                  "unknown_severities": ["critical", "major"],
+                  "severity_scale_names": ["blocker", "bug", "nit"]}
+        body = server._format_inline_leftovers([], review=review)
+        assert "Severity config mismatch" in body
+        assert "`critical`" in body and "`major`" in body
+        assert "blocker" in body and "nit" in body
+
+    def test_inline_leftovers_no_line_when_vocabulary_matches(self):
+        import raven.server as server
+        review = {"severity": "bug", "summary": "s", "findings": [],
+                  "unknown_severities": [], "severity_scale_names": ["bug"]}
+        assert server._format_inline_leftovers([], review=review) == ""
+
+    def test_inline_leftovers_default_scale_mismatch_does_not_name_a_file(self):
+        """Same fix, shared helper, other renderer."""
+        import raven.server as server
+        from raven.severity import default_scale
+        review = {"severity": "high", "summary": "s", "findings": [],
+                  "unknown_severities": ["critical"],
+                  "severity_scale_names": default_scale().ordered()}
+        body = server._format_inline_leftovers([], review=review)
+        assert "severities.json" not in body
+        assert "active severity scale" in body
+
+    def test_inline_leftovers_review_omitted_is_safe(self):
+        """Existing callers that don't pass review= (none left in
+        production, but direct unit callers/tests) must keep working."""
+        import raven.server as server
+        assert server._format_inline_leftovers([]) == ""
+
+
+class TestFormatCommentUsesTheRepoScale:
+    """_format_comment / _format_inline_leftovers must colour findings from
+    the SCALE THEY'RE GIVEN, not silently default_scale(). A real bug found
+    in review: with a nit/bug/blocker repo scale, every custom tier name is
+    unknown to default_scale(), and emoji()/normalize() fail closed to
+    most-severe for an unrecognised name — so EVERY finding rendered 🔴
+    regardless of its actual tier, defeating Phase A's position-based
+    colour system entirely (the emoji conveyed nothing)."""
+
+    def _scale(self):
+        from raven.severity import SeverityScale
+        return SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                             blocks_at_or_above="bug")
+
+    def test_format_comment_colours_each_custom_tier_correctly(self):
+        import raven.server as server
+        scale = self._scale()
+        review = {
+            "severity": "blocker", "summary": "s",
+            "findings": [
+                {"severity": "blocker", "message": "m1"},
+                {"severity": "bug", "message": "m2"},
+                {"severity": "nit", "message": "m3"},
+            ],
+        }
+        body = server._format_comment(review, scale=scale)
+        assert "🔴 [blocker]" in body
+        assert "🟠 [bug]" in body
+        assert "🟡 [nit]" in body
+
+    def test_format_comment_default_scale_renders_as_today(self):
+        import raven.server as server
+        review = {
+            "severity": "high", "summary": "s",
+            "findings": [
+                {"severity": "high", "message": "m1"},
+                {"severity": "medium", "message": "m2"},
+                {"severity": "low", "message": "m3"},
+            ],
+        }
+        body = server._format_comment(review)
+        assert "🔴 [high]" in body
+        assert "🟠 [medium]" in body
+        assert "🟡 [low]" in body
+
+    def test_inline_leftovers_colours_each_custom_tier_correctly(self):
+        import raven.server as server
+        scale = self._scale()
+        findings = [
+            {"severity": "blocker", "message": "m1"},
+            {"severity": "bug", "message": "m2"},
+            {"severity": "nit", "message": "m3"},
+        ]
+        body = server._format_inline_leftovers(findings, scale)
+        assert "🔴 **[blocker]**" in body
+        assert "🟠 **[bug]**" in body
+        assert "🟡 **[nit]**" in body
+
+    def test_inline_leftovers_default_scale_renders_as_today(self):
+        import raven.server as server
+        findings = [
+            {"severity": "high", "message": "m1"},
+            {"severity": "medium", "message": "m2"},
+            {"severity": "low", "message": "m3"},
+        ]
+        body = server._format_inline_leftovers(findings)
+        assert "🔴 **[high]**" in body
+        assert "🟠 **[medium]**" in body
+        assert "🟡 **[low]**" in body
+
+
+class TestProcessPrThreadsScaleIntoRenderers:
+    """Integration-level guard on the _process_pr call sites: the resolved
+    repo scale must reach _format_comment / _format_inline_leftovers, not
+    fall back to their default_scale(). Exercises the real dispatch path
+    (not a direct unit call to the renderer) so a regression at the CALL
+    SITE — not just the renderer signature — is caught."""
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def _payload(self):
+        return {
+            "repo": "owner/repo", "sender": "alice", "pr_number": 42,
+            "pr_title": "PR #42", "pr_url": "https://git/pulls/42",
+            "head_sha": "abc123", "head_ref": "feature", "base_ref": "main",
+        }
+
+    def _make_provider(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_head_sha.return_value = "abc123"
+        mc.fetch_pr_diff.return_value = "diff --git a/f.py b/f.py\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.submit_review.return_value = {"id": 1}
+        mc.add_label_to_pr.return_value = None
+        mc.merge_pr.return_value = True
+        mc.get_commit_status.return_value = "success"
+        return mc
+
+    def _scale(self):
+        from raven.severity import SeverityScale
+        return SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                             blocks_at_or_above="bug")
+
+    def _submitted_body(self, mc):
+        call = mc.submit_review.call_args
+        return call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
+
+    def test_summary_mode_body_uses_the_repo_scale(self):
+        mc = self._make_provider()
+        review = {
+            "severity": "bug", "summary": "s",
+            "findings": [
+                {"severity": "bug", "message": "the middle tier"},
+                {"severity": "nit", "message": "the least severe tier"},
+            ],
+        }
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", "summary"),
+            patch("raven.server.review_diff", return_value=review),
+            patch("raven.server._fetch_severity_scale", return_value=self._scale()),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+        body = self._submitted_body(mc)
+        assert "🟠 [bug]" in body
+        assert "🟡 [nit]" in body
+        # The bug this guards against: both tiers rendering 🔴 identically.
+        assert "🔴 [nit]" not in body
+
+    def test_inline_mode_body_uses_the_repo_scale(self):
+        mc = self._make_provider()
+        review = {
+            "severity": "bug", "summary": "s",
+            "findings": [
+                {"severity": "nit", "message": "no file/line — body-only"},
+            ],
+        }
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", "inline"),
+            patch("raven.server.review_diff", return_value=review),
+            patch("raven.server._fetch_severity_scale", return_value=self._scale()),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+        body = self._submitted_body(mc)
+        assert "🟡" in body
+        assert "🔴" not in body
+
+
+class TestPerEntryConfigHash:
+    def test_entry_written_under_one_scale_misses_under_another(self):
+        import raven.server as server
+        from raven.severity import SeverityScale
+
+        a = SeverityScale(ranks={"a": 1, "b": 2}, blocks_at_or_above="b")
+        b = SeverityScale(ranks={"x": 1, "y": 2}, blocks_at_or_above="y")
+
+        entry = server.CacheEntry(timestamp=0, hashes={}, findings={},
+                                  config_hash=server._entry_config_hash(a, None))
+        assert server._entry_config_hash(b, None) != entry.config_hash
+
+    def test_same_scale_and_override_hits(self):
+        import raven.server as server
+        from raven.severity import SeverityScale
+        s = SeverityScale(ranks={"a": 1, "b": 2}, blocks_at_or_above="b")
+        assert server._entry_config_hash(s, "OVERRIDE") == server._entry_config_hash(s, "OVERRIDE")
+
+    def test_override_change_alone_changes_the_hash(self):
+        import raven.server as server
+        from raven.severity import SeverityScale
+        s = SeverityScale(ranks={"a": 1, "b": 2}, blocks_at_or_above="b")
+        assert server._entry_config_hash(s, "A") != server._entry_config_hash(s, "B")
+
+    def test_legacy_entry_without_hash_is_a_miss(self):
+        import raven.server as server
+        from raven.severity import default_scale
+        entry = server.CacheEntry(timestamp=0, hashes={}, findings={})
+        assert entry.config_hash == ""
+        assert entry.config_hash != server._entry_config_hash(default_scale(), None)
+
+
+class TestCachedMergeRespectsConfigHash:
+    """Merge-safety half of the per-entry config hash: _maybe_dispatch_cached_merge
+    re-dispatches an auto-merge from a cached approve verdict WITHOUT a fresh
+    AI pass, so a scale/prompt-override change on base_ref since that verdict
+    was cached must not silently keep dispatching merges under the old
+    config. A caller that doesn't supply ``expected_config_hash`` at all
+    skips the comparison entirely — see TestPerEntryConfigHash and the
+    existing TestCachedMergeDispatch / TestNoChangesSkipCachedMergeDispatch
+    suites, which rely on exactly that skip and must keep passing unmodified.
+
+    A caller that DOES supply ``expected_config_hash`` gets a strict
+    equality check against ``entry.config_hash`` — INCLUDING a legacy
+    entry whose ``config_hash == ""`` (written before this feature
+    shipped). That is a deliberate asymmetry with `_process_pr`'s read
+    path (see CacheEntry.config_hash's docstring): there, a "" mismatch
+    triggers a fresh review that records a real hash and re-warms the
+    entry, so treating it as "skip, not a miss" costs one review, once.
+    Here, on the NO-review cached-merge-dispatch path, there is no write
+    to re-warm from — an original implementation that special-cased ""
+    as "skip the comparison" left a legacy entry able to auto-merge under
+    *any* future scale change forever, defeating the entire point of this
+    task. That hole was found by review, not by the original test suite
+    (a fully green 1200+ run never caught it), which is why this class
+    pins the strict behaviour explicitly."""
+
+    DIFF = "diff --git a/f.py b/f.py\n+line\n"
+    PR_KEY = "gitea:owner/repo#42"
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def _diff_hashes(self):
+        from raven.reviewer import split_diff_by_file as _split
+        return {f: hashlib.sha256(c.encode()).hexdigest()
+                for f, c in _split(self.DIFF)}
+
+    def _seed_cache(self, config_hash=""):
+        import time as _time
+        _previous_diffs[self.PR_KEY] = CacheEntry(
+            timestamp=_time.time(),
+            hashes=self._diff_hashes(),
+            findings={"f.py": []},
+            verdict="approve",
+            summary="cached body",
+            config_hash=config_hash,
+        )
+
+    def _make_provider(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_pr_diff.return_value = self.DIFF
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [
+            {"user": {"login": "Raven"}, "state": "APPROVED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_state.return_value = "open"
+        mc.get_pr_head_sha.return_value = "abc123"
+        mc.get_commit_status.return_value = "success"
+        mc.merge_pr.return_value = True
+        return mc
+
+    def _call(self, mc, **kwargs):
+        from raven.server import _maybe_dispatch_cached_merge
+        kwargs.setdefault("head_sha", "abc123")
+        return _maybe_dispatch_cached_merge(
+            mc, "owner/repo", 42, "PR #42", "http://x", **kwargs)
+
+    def test_matching_expected_hash_still_dispatches(self):
+        """Positive control: a cached entry whose recorded config_hash
+        matches what the caller expects right now is not blocked by this
+        gate."""
+        import raven.server as server
+        self._seed_cache(config_hash="samehash1234")
+        mc = self._make_provider()
+        with (
+            patch("raven.server.ci_wait_executor") as mock_exec,
+            patch("raven.server.inc") as mock_inc,
+        ):
+            mock_exec.submit.return_value = MagicMock()
+            result = self._call(mc, expected_config_hash="samehash1234")
+        assert result is True
+        outcomes = [c.args[1]["outcome"] for c in mock_inc.call_args_list
+                    if c.args[0] == "raven_cached_merge_dispatch_total"]
+        assert outcomes == ["dispatched"]
+
+    def test_mismatched_expected_hash_declines(self):
+        """The gate this task exists for: a cached approve computed under
+        one config_hash must never dispatch under a different one."""
+        self._seed_cache(config_hash="oldhash1234")
+        mc = self._make_provider()
+        with (
+            patch("raven.server.ci_wait_executor") as mock_exec,
+            patch("raven.server.inc") as mock_inc,
+        ):
+            result = self._call(mc, expected_config_hash="newhash5678")
+        assert result is False
+        mock_exec.submit.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        outcomes = [c.args[1]["outcome"] for c in mock_inc.call_args_list
+                    if c.args[0] == "raven_cached_merge_dispatch_total"]
+        assert outcomes == ["declined_config_hash_mismatch"]
+
+    def test_legacy_entry_with_no_recorded_hash_is_refused(self):
+        """CRITICAL: an entry cached before this feature shipped has
+        config_hash="". Unlike _process_pr's read path — where a ""
+        mismatch triggers a fresh review that records a real hash and
+        re-warms the entry — this is the NO-review cached-merge-dispatch
+        path: there is no write here to re-warm from. Skipping the
+        comparison for a hash-less entry would let it auto-merge under
+        ANY future severity-scale / prompt-override change forever,
+        which is exactly the hole this task exists to close. The entry
+        must be refused (declined_config_hash_mismatch) whenever the
+        caller supplies a real expected hash, the same as any other
+        config_hash inequality — "" is not a wildcard."""
+        self._seed_cache(config_hash="")
+        mc = self._make_provider()
+        with (
+            patch("raven.server.ci_wait_executor") as mock_exec,
+            patch("raven.server.inc") as mock_inc,
+        ):
+            result = self._call(mc, expected_config_hash="anyrealhash999")
+        assert result is False
+        mock_exec.submit.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        outcomes = [c.args[1]["outcome"] for c in mock_inc.call_args_list
+                    if c.args[0] == "raven_cached_merge_dispatch_total"]
+        assert outcomes == ["declined_config_hash_mismatch"]
+
+    def test_no_expected_hash_supplied_skips_the_check(self):
+        """A caller that doesn't participate (omits the kwarg entirely)
+        gets today's behaviour — the default used by every pre-existing
+        call site/test."""
+        self._seed_cache(config_hash="somehash")
+        mc = self._make_provider()
+        with (
+            patch("raven.server.ci_wait_executor") as mock_exec,
+            patch("raven.server.inc") as mock_inc,
+        ):
+            mock_exec.submit.return_value = MagicMock()
+            result = self._call(mc)
+        assert result is True
+
+    def test_no_changes_skip_declines_dispatch_on_scale_change(self):
+        """End-to-end via _process_pr's no-changes-skip path (wedge 2's
+        recovery branch): a cached approve recorded under one severity
+        scale must not auto-merge once the repo's severities.json (read
+        from base_ref) has changed, even though the diff itself didn't."""
+        import raven.server as server
+        from raven.severity import SeverityScale
+
+        old_scale = SeverityScale(ranks={"a": 1, "b": 2}, blocks_at_or_above="b")
+        self._seed_cache(config_hash=server._entry_config_hash(old_scale, None))
+        mc = self._make_provider()
+        mc.fetch_file.return_value = '{"severities": {"x": 1, "y": 2}, "blocks_at_or_above": "y"}'
+        payload = {
+            "repo": "owner/repo", "sender": "alice", "pr_number": 42,
+            "pr_title": "PR #42", "pr_url": "http://x",
+            "head_sha": "abc123", "head_ref": "feature", "base_ref": "main",
+        }
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+        ):
+            _process_pr(mc, payload)
+        mock_review.assert_not_called()          # still no fresh AI pass
+        mc.merge_pr.assert_not_called()           # but the scale changed — no merge
+
+    def test_no_changes_skip_declines_dispatch_for_legacy_hashless_entry(self):
+        """CRITICAL — the hole found in Task 10's review: a cached approve
+        of UNKNOWN provenance (config_hash="", written before this feature
+        shipped — or simply never validated against any scale) must not
+        auto-merge via the no-changes-skip recovery path just because it
+        has no recorded hash to compare against. Reproduces the exact
+        live sequence the reviewer found: legacy entry -> repo's
+        severities.json changes on base_ref -> _process_pr's no-changes
+        path -> review_diff is NOT called (no fresh AI pass) but merge_pr
+        must ALSO not be called. Distinct from
+        test_no_changes_skip_declines_dispatch_on_scale_change above
+        (real-hash vs different-real-hash) — this is "" vs a real hash,
+        the specific case the original implementation special-cased into
+        skipping the comparison instead of refusing."""
+        self._seed_cache(config_hash="")
+        mc = self._make_provider()
+        mc.fetch_file.return_value = '{"severities": {"x": 1, "y": 2}, "blocks_at_or_above": "y"}'
+        payload = {
+            "repo": "owner/repo", "sender": "alice", "pr_number": 42,
+            "pr_title": "PR #42", "pr_url": "http://x",
+            "head_sha": "abc123", "head_ref": "feature", "base_ref": "main",
+        }
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+        ):
+            _process_pr(mc, payload)
+        mock_review.assert_not_called()          # still no fresh AI pass
+        mc.merge_pr.assert_not_called()           # hash-less entry — no merge either
+
+
+class TestCacheWriteRecordsConfigHash:
+    """The write side of Task 10: a completed review's cache entry must
+    record the config_hash it was computed under, or every future
+    config-hash comparison is vacuous (stored "" forever vs a real hash,
+    a permanent one-way mismatch instead of the intended one-time miss)."""
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def _make_provider(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_pr_diff.return_value = "diff --git a/f.py b/f.py\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.submit_review.return_value = {"id": 1}
+        mc.add_label_to_pr.return_value = None
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.side_effect = [
+            [],                                                     # auto-add check
+            [{"user": {"login": "Raven"}, "state": "APPROVED"}],   # gate check
+        ]
+        return mc
+
+    def test_fresh_review_records_the_current_config_hash(self):
+        import raven.server as server
+        from raven.severity import default_scale
+
+        mc = self._make_provider()
+        payload = {
+            "repo": "owner/repo", "sender": "alice", "pr_number": 99,
+            "pr_title": "PR #99", "pr_url": "http://x",
+            "head_sha": "abc123", "head_ref": "feature", "base_ref": "main",
+        }
+        with (
+            patch("raven.server.review_diff",
+                  return_value={"severity": "low", "summary": "ok", "findings": []}),
+            patch("raven.server.notify"),
+        ):
+            _process_pr(mc, payload)
+        entry = _previous_diffs["gitea:owner/repo#99"]
+        assert entry.config_hash == server._entry_config_hash(default_scale(), None)
+        assert entry.config_hash != ""
+
+
+class TestApproveGateUsesTheRepoScale:
+    """Task 13 — THE CORE OF THE FEATURE. The approve decision must read
+    the repo's SeverityScale, not the built-in SEVERITY_ORDER vocabulary
+    via severity_gte. Every custom tier name is unknown to SEVERITY_ORDER,
+    ranks 0, ties with the threshold, and approves — including the repo's
+    most severe tier. See PR #211's disarmed-gate bug, one layer up."""
+
+    def _scale(self):
+        from raven.severity import SeverityScale
+        return SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                             blocks_at_or_above="bug")
+
+    def test_below_blocking_tier_approves(self):
+        import raven.server as server
+        assert server._approve_from_severity("nit", self._scale()) is True
+
+    def test_at_blocking_tier_blocks(self):
+        import raven.server as server
+        assert server._approve_from_severity("bug", self._scale()) is False
+
+    def test_above_blocking_tier_blocks(self):
+        import raven.server as server
+        assert server._approve_from_severity("blocker", self._scale()) is False
+
+    def test_unknown_tier_blocks(self):
+        """Fail closed — an unrecognised name must never approve."""
+        import raven.server as server
+        assert server._approve_from_severity("wat", self._scale()) is False
+
+    def test_nothing_blocks_scale_approves_everything(self):
+        from raven.severity import SeverityScale
+        import raven.server as server
+        s = SeverityScale(ranks={"a": 1, "b": 2}, blocks_at_or_above=None)
+        assert server._approve_from_severity("b", s) is True
+
+    def test_default_scale_reproduces_todays_decisions(self, monkeypatch):
+        """The env-configured default must decide exactly as severity_gte does."""
+        import raven.server as server
+        from raven.severity import default_scale
+        from raven.reviewer import severity_gte
+
+        for env in ("low", "medium", "high"):
+            monkeypatch.setenv("REVIEW_APPROVE_MAX_SEVERITY", env)
+            scale = default_scale()
+            for sev in ("low", "medium", "high"):
+                assert server._approve_from_severity(sev, scale) is severity_gte(env, sev), \
+                    f"divergence at REVIEW_APPROVE_MAX_SEVERITY={env}, severity={sev}"
+
+
+class TestInlineCommentBodyDefaultsToScaleNotLiteralLow:
+    """The eighth instance of this feature's recurring defect class: a
+    default-vocabulary literal ('low') sitting next to a SeverityScale.
+    9d2d478 fixed three .get("severity", "low") sites in _process_pr's
+    inline-comment construction and missed the actual inline comment
+    body line — reachable because CacheEntry.findings loads straight
+    from JSON with no per-finding validation, so a legacy/malformed
+    carried finding with no 'severity' key hits this. Under a custom
+    scale it must render that scale's least-severe tier and colour, not
+    the literal 'low' / 🔴."""
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def _payload(self):
+        return {
+            "repo": "owner/repo", "sender": "alice", "pr_number": 42,
+            "pr_title": "PR #42", "pr_url": "https://git/pulls/42",
+            "head_sha": "abc123", "head_ref": "feature", "base_ref": "main",
+        }
+
+    def _make_provider(self):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_head_sha.return_value = "abc123"
+        mc.fetch_pr_diff.return_value = "diff --git a/f.py b/f.py\n+line\n"
+        mc.fetch_file.return_value = ""
+        mc.submit_review.return_value = {"id": 1}
+        mc.add_label_to_pr.return_value = None
+        mc.merge_pr.return_value = True
+        mc.get_commit_status.return_value = "success"
+        return mc
+
+    def _scale(self):
+        from raven.severity import SeverityScale
+        return SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                             blocks_at_or_above="bug")
+
+    def test_finding_with_no_severity_key_uses_scale_least_severe(self):
+        """No 'severity' key at all (not even an unrecognised one) — the
+        exact shape a pre-validation legacy cache entry can carry."""
+        mc = self._make_provider()
+        review = {
+            "severity": "nit", "summary": "s",
+            "findings": [
+                {"file": "f.py", "line": 3, "message": "no severity key"},
+            ],
+        }
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", "both"),
+            patch("raven.server.review_diff", return_value=review),
+            patch("raven.server._fetch_severity_scale", return_value=self._scale()),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+        inline = mc.submit_review.call_args.kwargs["inline_comments"]
+        assert len(inline) == 1
+        body = inline[0]["body"]
+        assert "🟡" in body
+        assert "[nit]" in body
+        assert "🔴" not in body
+        assert "[low]" not in body

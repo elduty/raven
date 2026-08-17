@@ -2,6 +2,59 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## v0.6.0 — 2026-08-14
+
+Feature release. A repository can now define its own severity vocabulary instead of using Raven's built-in `low`/`medium`/`high`, and the tier that blocks a merge becomes the repo's decision rather than a global environment variable. Everything else here is correctness work, most of it on the path that decides whether a review approves.
+
+### Added
+
+- **Per-repo configurable severity scale.** Drop a `severities.json` under `{RAVEN_RULES_DIR}/raven/` (default `.claude/rules/raven/severities.json`) naming your own tiers, their order, and which one blocks a merge:
+
+  ```json
+  {
+    "severities": { "nit": 10, "bug": 20, "blocker": 30 },
+    "blocks_at_or_above": "bug",
+    "descriptions": { "blocker": "Exploitable or destructive. Never merges." }
+  }
+  ```
+
+  Raven renders the review prompt *from that scale*, so the vocabulary the model is asked for and the vocabulary the merge gate enforces are one object read twice, not two settings to keep in agreement. The scale also drives the PR comment's colours, the Slack message, and per-channel notification filtering.
+
+  Read from the PR's **base ref**, like `CLAUDE.md` and `.claude/rules/*.md` — so a scale change lands through its own review cycle, reviewed under the *old* scale. A pull request cannot widen the gate that judges it.
+
+  Notification channels gain a `"min_severity": "blocking"` sentinel, meaning "notify when the review blocks the merge" — the only threshold that means the same thing in every repo's vocabulary, and the one to use across a multi-repo deployment.
+
+  **Repos without the file are unaffected**: the built-in `low`/`medium`/`high` scale gated by `REVIEW_APPROVE_MAX_SEVERITY` behaves exactly as before, asserted across all nine threshold × severity combinations. See the README's "Severity scale" section for the file format, validation rules, and a worked five-tier example.
+
+### Fixed
+
+- **A severity name Raven doesn't recognise no longer disarms the merge gate.** A model-emitted tier outside the configured scale now resolves to the *most severe* tier — "I don't know how bad this is" has to read as "assume the worst", because the alternative silently approves. Operator-configured thresholds deliberately resolve the opposite way, to the strictest reading, so a typo in `REVIEW_APPROVE_MAX_SEVERITY` or a channel's `min_severity` can't turn into approve-everything or notify-nothing.
+- **The review's severity is reconciled against its own findings, failing closed in both directions.** A response asserting `"severity": "low"` while listing a high-severity finding was previously approved and auto-merged on the stated value. The gate now takes the **more severe** of the model's claim and the highest severity among its findings, so a claim can neither lower the bar below what the findings justify nor be discarded when it is the more alarming of the two — the latter matters because `{"severity": "high", "findings": []}` is exactly what a findings-suppression prompt injection produces. A blocking claim with nothing listed under it posts one PR-wide finding explaining the disagreement, so the hold is never a bare "changes requested" over an empty list. Disagreements are counted in `raven_severity_mismatch_total`.
+- **An unreadable `severities.json` now fails the merge closed.** The fetch falls back to the built-in scale, which for a repo that reuses the default tier names with a tighter `blocks_at_or_above` is the *looser* gate — so a transient provider error could approve past the repo's own blocking tier. Both the review path and the comment-reply path now refuse to merge on that state; the review and the reply still post, and the next push re-fetches.
+- **Classified review failures no longer surface as unhandled errors**, so an operator sees the actionable message (raise the timeout, check credentials) instead of a generic internal-error comment.
+- **A finding whose `line` is `true` rather than a number is no longer posted as an inline comment.** `bool` is a subclass of `int` in Python and `True > 0`, so a JSON `true` passed the line check and reached the provider as an anchor. The carried-finding remapper already rejected it; validation now agrees.
+- **A rebase no longer re-posts findings the developer already resolved.** Incremental review decided what to re-review by hashing each file's raw diff chunk, which carries `@@` hunk headers with absolute line numbers, `index` blob SHAs and the surrounding context lines. A rebase — or a merge from the base branch — rewrites all three for any file the base branch also touched, so a file whose own edits were byte-identical was treated as changed and reviewed from scratch. A regenerated finding carries no `comment_id`, which is what the user-resolved filter matches on, so every resolution on those files was lost. Re-review is now decided by a content hash covering only the added and removed lines. Because a file that merely moved is carried rather than regenerated, its findings are also shifted onto their code's new position — a carried finding would otherwise re-post anchored to whatever the rebase slid into that line. Where the shift can't be proven safe (hunks that no longer match one-to-one, a finding outside every hunk, or surrounding code that is no longer the same code), the file is re-reviewed as before. That last case matters on its own: an author relocating a byte-identical edit elsewhere in the file leaves the content hash equal *and* the hunk geometry intact, so position alone cannot tell it from a rebase — and position is often what makes a line dangerous. Each hunk's surrounding lines are digested (positions excluded, so a genuine rebase still matches) and a change sends the file back for a real review.
+
+  *Diagnosed and first implemented by [@dsrosario](https://github.com/dsrosario) in [GitHub #1](https://github.com/elduty/raven/pull/1) — the content-only hash, its `DIFF_HASH_SCHEME` cache-invalidation token, and the five normalization tests are theirs. The carried-finding line remapping above was added on top, since a stable hash alone leaves a carried finding anchored to whatever the rebase moved into its old line.*
+
+- **Severity scale files are validated and size-bounded.** Tier names are charset-restricted before becoming Prometheus label values, `blocking` is reserved as the notification sentinel, duplicate tiers are rejected after case normalization, and a scale is capped at 24 tiers / 2000 characters per description — the rendered block is prompt text every review of that repo pays for. An invalid file logs a warning, increments `raven_severity_scale_invalid_total`, and falls back to the built-in scale rather than refusing to review the repo.
+
+### Unchanged on purpose
+
+Auto-merge is not widened by the above. The no-changes skip — the path that can send a cached approval straight to a merge with no fresh review — still compares raw chunk hashes, so it only fires for a byte-identical head. A push that only rebases reviews nothing and merges nothing; the next real push takes the incremental path as usual.
+
+### Upgrading
+
+The findings cache invalidates itself on first start after this upgrade (the hash scheme is folded into `review_config_hash`), so every open PR gets one full re-review. Subsequent pushes are incremental as usual.
+
+**No action is required to upgrade.** The severity scale is opt-in per repository: with no `severities.json`, behaviour is identical to v0.5.1. `REVIEW_APPROVE_MAX_SEVERITY` keeps its meaning for repos on the built-in scale, and is simply not consulted for a repo that defines its own `blocks_at_or_above`.
+
+New metrics: `raven_severity_scale_invalid_total{repo}`, `raven_severity_scale_fetch_failed_total{repo}`, `raven_unknown_severity_total`, `raven_severity_mismatch_total`, `raven_notify_threshold_fallback_total{repo}`. The last three are the ones to watch after adopting a custom scale — a non-zero `raven_unknown_severity_total` means the model is emitting names outside the scale, and a non-zero `raven_notify_threshold_fallback_total` means a channel's `min_severity` names a tier that repo doesn't have.
+
+### Stats
+
+1350 tests across 19 test files (up from 1119).
+
 ## v0.5.1 — 2026-08-03
 
 Correctness and safety release. Two of these fixes close paths where Raven could approve or merge code the model never fully saw; two more close paths where real findings were silently discarded before reaching the PR. No new features.

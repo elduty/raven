@@ -71,6 +71,8 @@ _METRIC_HELP: dict[str, str] = {
     "raven_revision_submit_errors_total": "Verdict-revision submit failures.",
     "raven_user_resolved_findings_dropped_total": "User-resolved findings dropped from carry-forward.",
     "raven_carried_findings_dropped_total": "Carried findings dropped by re-validation (model-reported as resolved by the push).",
+    "raven_unknown_severity_total": "Findings whose severity name Raven does not recognise; treated as the most severe tier (fail closed).",
+    "raven_severity_mismatch_total": "Reviews where the model's stated top-level severity disagreed with the highest severity among its own findings; the derived value is used.",
     "raven_ungrounded_findings_dropped_total": "Fresh findings dropped for naming a file the model was never shown (evidence-grounding backstop).",
     "raven_findings_capped_total": "Findings dropped by the per-PR cap on chunked reviews in repos with no rules/CLAUDE.md.",
     "raven_cached_merge_dispatch_total": "Auto-merge dispatches attempted from a cached approve verdict, by outcome (dispatched / declined_<reason>).",
@@ -80,6 +82,8 @@ _METRIC_HELP: dict[str, str] = {
     "raven_ai_tokens_total": "AI tokens consumed, by kind (input/output).",
     "raven_ai_cost_usd_total": "AI cost in USD (provider-reported, or estimated from the price table).",
     "raven_ai_calls_total": "AI completion calls.",
+    "raven_severity_scale_invalid_total": "severities.json files rejected by validation; the default scale was used instead.",
+    "raven_notify_threshold_fallback_total": "Channel min_severity names not found in the review's severity scale; fell back to gate semantics ('notify when the review blocks').",
 }
 
 

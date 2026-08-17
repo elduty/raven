@@ -14,6 +14,8 @@ from raven.reviewer import (
     _parse_response,
     _strip_lockfiles_and_binaries,
     _unquote_git_path,
+    diff_hash,
+    hunk_positions,
     MAX_FINDINGS,
     respond_to_comment,
     review_diff,
@@ -48,66 +50,73 @@ class TestParseResponse:
     def test_json_in_markdown_fence(self):
         raw = '```json\n{"severity": "high", "summary": "XSS risk", "findings": []}\n```'
         result = _parse_response(raw)
-        assert result["severity"] == "high"
+        # Assert on `summary`: it identifies WHICH object was extracted,
+        # which is what this test is about. `severity` is derived from the
+        # findings (empty here), so it says nothing about the parse.
+        assert result["summary"] == "XSS risk"
 
     def test_malformed_json_returns_fallback(self):
         result = _parse_response("This is not JSON at all.")
         assert result["severity"] == "high"
         assert result["_parse_error"] is True
 
+    def test_malformed_output_fallback_carries_scale_fields(self):
+        """PR #216 review, 3rd pass, Finding 3 (the 13th instance of this
+        defect class): every OTHER review-dict return path in this module
+        carries severity_scale_names / severity_blocks_at — this was the
+        one exception. Without them, notifier._scale_from_review silently
+        reconstructs default_scale() for the parse-failure notification,
+        and on a custom-scale repo _passes_threshold can suppress exactly
+        the alert telling the operator their review could not be parsed
+        (see TestParseFailureNotificationReachesTheOperator below for the
+        end-to-end consequence, not just this shape check)."""
+        from raven.severity import SeverityScale
+        scale = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                              blocks_at_or_above="bug")
+        result = _parse_response("This is not JSON at all.", scale=scale)
+        assert result["_parse_error"] is True
+        assert result["severity_scale_names"] == ["blocker", "bug", "nit"]
+        assert result["severity_blocks_at"] == "bug"
+
     def test_invalid_json_syntax(self):
         result = _parse_response("{severity: bad json}")
         assert result["_parse_error"] is True
 
-    def test_unknown_severity_normalised_to_low(self):
+    def test_unrecognised_top_level_severity_is_ignored(self):
+        """The top-level severity is derived from the findings, so an
+        unrecognised value there is simply not consulted — with no
+        findings the review is the least-severe tier."""
         raw = json.dumps({"severity": "critical", "summary": "Bad", "findings": []})
         result = _parse_response(raw)
         assert result["severity"] == "low"
 
-    def test_findings_with_unknown_severity(self):
+    def test_findings_with_unknown_severity_fail_closed(self):
+        """An unrecognised finding severity becomes the MOST severe tier,
+        not the least — see TestUnknownSeverityFailsClosed for why."""
         raw = json.dumps({
             "severity": "low",
             "summary": "ok",
             "findings": [{"severity": "extreme", "message": "oops"}],
         })
         result = _parse_response(raw)
-        assert result["findings"][0]["severity"] == "low"
+        assert result["findings"][0]["severity"] == "high"
 
     def test_empty_findings_list(self):
         raw = json.dumps({"severity": "low", "summary": "LGTM", "findings": []})
         result = _parse_response(raw)
         assert result["findings"] == []
 
-    def test_findings_with_file_and_line(self):
-        raw = json.dumps({
-            "severity": "high",
-            "summary": "Bug",
-            "findings": [{"severity": "high", "message": "Issue", "file": "server.py", "line": 42}],
-        })
-        result = _parse_response(raw)
-        assert result["findings"][0]["file"] == "server.py"
-        assert result["findings"][0]["line"] == 42
-
-    def test_findings_without_file_line_omits_fields(self):
-        raw = json.dumps({
-            "severity": "low",
-            "summary": "ok",
-            "findings": [{"severity": "low", "message": "General"}],
-        })
-        result = _parse_response(raw)
-        assert "file" not in result["findings"][0]
-        assert "line" not in result["findings"][0]
 
     def test_json_with_trailing_text(self):
         raw = 'Here is my review: {"severity": "high", "summary": "XSS", "findings": []} and some more text'
         result = _parse_response(raw)
-        assert result["severity"] == "high"
+        assert result["summary"] == "XSS"
         assert result.get("_parse_error") is not True
 
     def test_greedy_trap_multiple_braces(self):
         raw = 'The code uses {key: value} syntax. {"severity": "medium", "summary": "Bug", "findings": []}'
         result = _parse_response(raw)
-        assert result["severity"] == "medium"
+        assert result["summary"] == "Bug"
 
     def test_findings_is_string_does_not_crash(self):
         """AI sometimes emits {"findings": "high"} (a string) instead of a
@@ -116,9 +125,17 @@ class TestParseResponse:
         cryptic chunk-failure message."""
         raw = '{"severity": "high", "summary": "x", "findings": "weird-string"}'
         result = _parse_response(raw)
-        assert result["severity"] == "high"
-        assert result["findings"] == []
+        assert result["summary"] == "x"
         assert result.get("_parse_error") is not True
+        # No model-supplied finding survives the coercion — nothing is
+        # salvaged out of the string. Since 2026-08-17 the stated `high`
+        # still gates (a claim can no longer be discarded just because the
+        # findings array was unusable), and that block explains itself
+        # with one synthetic PR-wide finding.
+        assert result["severity"] == "high"
+        assert [f for f in result["findings"] if "weird-string" in f.get("message", "")] == []
+        assert len(result["findings"]) == 1
+        assert "no finding" in result["findings"][0]["message"].lower()
 
     def test_findings_with_non_dict_entries_are_skipped(self):
         """Mixed findings list — bare strings, ints, dicts. Only the dicts
@@ -166,9 +183,295 @@ class TestParseResponse:
             assert "dropped_carried" not in result, f"shape {bad} leaked through"
 
 
+class TestParseFailureNotificationReachesTheOperator:
+    """PR #216 review, 3rd pass, Finding 3: the shape check in
+    TestParseResponse (severity_scale_names / severity_blocks_at present)
+    is necessary but not sufficient — a test asserting only the dict shape
+    would keep passing if notifier logic changed underneath it and the
+    suppression bug came back some other way. This drives the parse-failure
+    dict through the REAL notifier.notify() consumer and asserts the alert
+    actually fires, which is the consequence that matters: on a custom-
+    scale repo, "your review could not be parsed" is precisely the
+    notification that went missing.
+
+    Deliberately does NOT use the scale's most-severe tier as the
+    discriminator — SeverityScale.emoji()/normalize() fail closed to
+    most-severe for an unrecognised name, so a colour-based assertion
+    passes whether or not the scale fields arrived (this exact trap
+    already produced a passing-against-broken-code test earlier on this
+    branch). The discriminator here is send/no-send, driven by a channel
+    min_severity set to a BUILT-IN vocabulary name absent from the custom
+    scale — the realistic operator case (channel config predates the
+    custom scale) and the one that empirically flips outcome:
+      * fields missing -> names=[] -> _passes_threshold's legacy branch
+        (severity_gte, built-in 3-tier ranks) -> the custom tier name
+        ranks 0 like any unrecognised value -> suppressed.
+      * fields present -> "high" isn't one of this repo's tier names ->
+        gate-semantics fallback -> scale.blocks(severity) -> True (this
+        repo's most severe tier always blocks) -> sent.
+    """
+
+    def _custom_scale(self):
+        from raven.severity import SeverityScale
+        return SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                             blocks_at_or_above="bug")
+
+    def test_parse_failure_alert_fires_on_custom_scale_repo(self, mocker):
+        import raven.notifier as notifier
+
+        review = _parse_response("This is not JSON at all.",
+                                 repo_name="acme/repo", scale=self._custom_scale())
+        assert review["_parse_error"] is True
+
+        send = mocker.patch.object(notifier, "_send_slack")
+        mocker.patch.object(notifier, "_load_channels", return_value=[
+            {"type": "slack", "min_severity": "high", "webhook": "u"}])
+        notifier.notify("acme/repo", "PR #1", review, "link", "review_failed")
+        assert send.called, (
+            "parse-failure notification was suppressed on a custom-scale "
+            "repo — the operator would never learn the review failed"
+        )
+
+
 # ------------------------------------------------------------------ #
 #  review_diff (with mocked subprocess)                              #
 # ------------------------------------------------------------------ #
+
+class TestTopLevelSeverityIsDerived:
+    """The top-level severity gates the merge (`server.py` compares it to
+    REVIEW_APPROVE_MAX_SEVERITY), so it must reflect the findings actually
+    reported — not a separate number the model writes beside them.
+
+    Previously `_validate_review` took the model's value verbatim and only
+    recomputed when the grounding filter dropped a finding or carried
+    findings were merged. On a PR's first clean review neither fires, so a
+    model that listed a `high` finding while writing `"severity": "low"`
+    auto-merged it.
+    """
+
+    def test_model_understating_severity_is_corrected(self):
+        """The bug: findings say high, the summary field says low."""
+        raw = json.dumps({
+            "severity": "low",
+            "summary": "all good",
+            "findings": [{"severity": "high", "file": "a.py", "line": 1,
+                          "message": "SQL injection"}],
+        })
+        assert _parse_response(raw)["severity"] == "high"
+
+    def test_highest_finding_wins_among_several(self):
+        raw = json.dumps({
+            "severity": "low",
+            "summary": "s",
+            "findings": [
+                {"severity": "low", "message": "nit"},
+                {"severity": "medium", "message": "real"},
+                {"severity": "low", "message": "another nit"},
+            ],
+        })
+        assert _parse_response(raw)["severity"] == "medium"
+
+    def test_model_overstating_severity_blocks_but_stays_actionable(self):
+        """Revised 2026-08-17 (audit MED). This used to assert the claim
+        was corrected DOWN to `low`, on the reasoning that a blocking
+        verdict with nothing to fix is an un-actionable wedge — the author
+        sees 'changes requested' and an empty findings list, and every
+        re-push reproduces it.
+
+        That concern is real but it was answered in the wrong direction.
+        On an instance that auto-merges on approve, correcting DOWN means
+        a review claiming a blocking severity merges silently — and
+        `{"severity": "high", "findings": []}` is exactly what a
+        findings-suppression injection produces, so emptying the array
+        became sufficient on its own even while the model honestly
+        reported the severity.
+
+        The gate now takes the more severe of the two, and the wedge is
+        answered by making the block explain itself: a synthetic
+        file-less finding names the disagreement, so the author sees why
+        the PR is held rather than a bare 'changes requested' with an
+        empty list."""
+        raw = json.dumps({"severity": "high", "summary": "vibes", "findings": []})
+        result = _parse_response(raw)
+        assert result["severity"] == "high"
+        assert len(result["findings"]) == 1, "the block must not be silent"
+        assert result["findings"][0]["severity"] == "high"
+        assert "no finding" in result["findings"][0]["message"].lower()
+        assert "file" not in result["findings"][0], (
+            "the explanation is PR-wide — it must not try to anchor inline"
+        )
+
+    def test_no_findings_is_least_severe(self):
+        raw = json.dumps({"severity": "low", "summary": "LGTM", "findings": []})
+        assert _parse_response(raw)["severity"] == "low"
+
+    def test_agreeing_model_is_unaffected(self):
+        """The common case: a compliant model already sets the max."""
+        raw = json.dumps({
+            "severity": "medium",
+            "summary": "s",
+            "findings": [{"severity": "medium", "message": "m"}],
+        })
+        assert _parse_response(raw)["severity"] == "medium"
+
+    def test_unparseable_severity_on_a_finding_does_not_lower_the_review(self):
+        """An unknown finding severity normalises to `low`; the review
+        severity must still reflect the findings that DID parse."""
+        raw = json.dumps({
+            "severity": "low",
+            "summary": "s",
+            "findings": [
+                {"severity": "extreme", "message": "unknown tier"},
+                {"severity": "high", "message": "real"},
+            ],
+        })
+        assert _parse_response(raw)["severity"] == "high"
+
+    def test_mismatch_is_counted(self):
+        """Disagreement is telemetry — an operator needs to see how often
+        the model's stated severity diverges from its own findings."""
+        from raven import metrics
+        metrics._counters.clear()
+        raw = json.dumps({
+            "severity": "low",
+            "summary": "s",
+            "findings": [{"severity": "high", "message": "m"}],
+        })
+        _parse_response(raw)
+        assert any("raven_severity_mismatch_total" in k for k in metrics._counters)
+
+    def test_agreement_is_not_counted(self):
+        from raven import metrics
+        metrics._counters.clear()
+        raw = json.dumps({
+            "severity": "high",
+            "summary": "s",
+            "findings": [{"severity": "high", "message": "m"}],
+        })
+        _parse_response(raw)
+        assert not any("raven_severity_mismatch_total" in k for k in metrics._counters)
+
+    def test_findings_with_file_and_line(self):
+        raw = json.dumps({
+            "severity": "high",
+            "summary": "Bug",
+            "findings": [{"severity": "high", "message": "Issue", "file": "server.py", "line": 42}],
+        })
+        result = _parse_response(raw)
+        assert result["findings"][0]["file"] == "server.py"
+        assert result["findings"][0]["line"] == 42
+
+    def test_findings_without_file_line_omits_fields(self):
+        raw = json.dumps({
+            "severity": "low",
+            "summary": "ok",
+            "findings": [{"severity": "low", "message": "General"}],
+        })
+        result = _parse_response(raw)
+        assert "file" not in result["findings"][0]
+        assert "line" not in result["findings"][0]
+
+
+class TestUnknownSeverityFailsClosed:
+    """A severity Raven does not recognise must be treated as the MOST
+    severe tier, never the least.
+
+    Coercing an unrecognised name to `low` disarmed the merge gate: a repo
+    whose prompt override defines its own vocabulary (`critical/major/
+    minor`) had every finding silently rewritten to `low`, the derived
+    review severity became `low`, and the PR auto-merged — including a
+    finding the model had labelled `critical`. No error, no warning.
+
+    Failing closed is noisier (a stray value blocks a merge) but the noise
+    is visible and diagnosable, where the old behaviour was neither.
+    """
+
+    MOST_SEVERE = "high"   # top of the built-in scale
+
+    def test_unrecognised_finding_severity_becomes_most_severe(self):
+        raw = json.dumps({
+            "severity": "critical",
+            "summary": "RCE",
+            "findings": [{"severity": "critical", "message": "eval() on user input"}],
+        })
+        assert _parse_response(raw)["findings"][0]["severity"] == self.MOST_SEVERE
+
+    def test_unrecognised_severity_blocks_the_merge(self):
+        """The consequence that matters: the derived review severity is
+        high, so `severity_gte(approve_max, severity)` refuses to approve."""
+        raw = json.dumps({
+            "severity": "critical",
+            "summary": "RCE",
+            "findings": [{"severity": "critical", "message": "eval() on user input"}],
+        })
+        result = _parse_response(raw)
+        assert result["severity"] == self.MOST_SEVERE
+        assert severity_gte("low", result["severity"]) is False
+
+    def test_missing_severity_key_becomes_most_severe(self):
+        """A finding with no severity at all is the same class of contract
+        violation as an unrecognised one, and gets the same treatment."""
+        raw = json.dumps({
+            "severity": "low", "summary": "s",
+            "findings": [{"message": "no severity field"}],
+        })
+        assert _parse_response(raw)["findings"][0]["severity"] == self.MOST_SEVERE
+
+    def test_empty_severity_becomes_most_severe(self):
+        raw = json.dumps({
+            "severity": "low", "summary": "s",
+            "findings": [{"severity": "", "message": "blank"}],
+        })
+        assert _parse_response(raw)["findings"][0]["severity"] == self.MOST_SEVERE
+
+    def test_known_severities_are_untouched(self):
+        """The common case must not move."""
+        raw = json.dumps({
+            "severity": "medium", "summary": "s",
+            "findings": [
+                {"severity": "low", "message": "a"},
+                {"severity": "medium", "message": "b"},
+                {"severity": "high", "message": "c"},
+            ],
+        })
+        got = [f["severity"] for f in _parse_response(raw)["findings"]]
+        assert got == ["low", "medium", "high"]
+
+    def test_case_and_whitespace_are_still_normalised_not_rejected(self):
+        """`HIGH` and ` high ` are the known tier, not unknown names —
+        normalisation must run before the fail-closed check, or ordinary
+        model formatting noise would start blocking merges."""
+        raw = json.dumps({
+            "severity": "low", "summary": "s",
+            "findings": [
+                {"severity": "HIGH", "message": "a"},
+                {"severity": " medium ", "message": "b"},
+            ],
+        })
+        got = [f["severity"] for f in _parse_response(raw)["findings"]]
+        assert got == ["high", "medium"]
+
+    def test_unknown_severity_is_counted(self):
+        from raven import metrics
+        metrics._counters.clear()
+        raw = json.dumps({
+            "severity": "low", "summary": "s",
+            "findings": [{"severity": "critical", "message": "m"}],
+        })
+        _parse_response(raw, "user/repo")
+        key = 'raven_unknown_severity_total{repo="user/repo"}'
+        assert metrics._counters.get(key) == 1
+
+    def test_known_severity_is_not_counted(self):
+        from raven import metrics
+        metrics._counters.clear()
+        raw = json.dumps({
+            "severity": "low", "summary": "s",
+            "findings": [{"severity": "low", "message": "m"}],
+        })
+        _parse_response(raw, "user/repo")
+        assert not any("raven_unknown_severity_total" in k for k in metrics._counters)
+
 
 class TestReviewDiff:
     def _make_backend(self, monkeypatch, return_value):
@@ -476,6 +779,122 @@ class TestStripLockfiles:
         result = _strip_lockfiles_and_binaries(diff)
         assert "logo.png" not in result
         assert "main.py" in result
+
+
+# ------------------------------------------------------------------ #
+#  diff_hash / hunk_positions                                         #
+# ------------------------------------------------------------------ #
+
+class TestDiffHash:
+    """The per-file content hash decides what an incremental pass
+    re-reviews. A rebase must not mark an unchanged edit as changed —
+    that regenerates the file's findings, and a regenerated finding has
+    no comment_id, so the developer's resolutions can never match it."""
+
+    BEFORE = (
+        "diff --git a/a.py b/a.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/a.py\n"
+        "+++ b/a.py\n"
+        "@@ -10,6 +10,7 @@ def f():\n"
+        "     before_one\n"
+        "     before_two\n"
+        "+    added_line\n"
+        "-    removed_line\n"
+        "     before_three\n"
+    )
+
+    def test_rebase_shifts_do_not_change_the_hash(self):
+        # Same edit after a rebase: new blob SHAs, hunk moved down 40
+        # lines, different surrounding context.
+        after = (
+            "diff --git a/a.py b/a.py\n"
+            "index 3333333..4444444 100644\n"
+            "--- a/a.py\n"
+            "+++ b/a.py\n"
+            "@@ -50,6 +50,7 @@ def f():\n"
+            "     after_one\n"
+            "     after_two\n"
+            "+    added_line\n"
+            "-    removed_line\n"
+            "     after_three\n"
+        )
+        assert diff_hash(after) == diff_hash(self.BEFORE)
+
+    def test_a_real_edit_still_changes_the_hash(self):
+        edited = self.BEFORE.replace("+    added_line", "+    added_line_v2")
+        assert diff_hash(edited) != diff_hash(self.BEFORE)
+
+    def test_file_headers_are_not_mistaken_for_added_lines(self):
+        # '+++ b/…' starts with '+' — it must not read as content.
+        renamed = self.BEFORE.replace("b/a.py", "b/renamed.py")
+        assert diff_hash(renamed) == diff_hash(self.BEFORE)
+
+    def test_no_newline_marker_counts_as_content(self):
+        marked = self.BEFORE + "\\ No newline at end of file\n"
+        assert diff_hash(marked) != diff_hash(self.BEFORE)
+
+    def test_context_only_difference_collapses_to_the_same_hash(self):
+        context_only = (
+            "diff --git a/a.py b/a.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            "     wholly different context\n"
+        )
+        empty = "diff --git a/a.py b/a.py\n@@ -1,2 +1,2 @@\n"
+        assert diff_hash(context_only) == diff_hash(empty)
+
+    def test_hunkless_chunks_do_not_all_collapse_together(self):
+        """A chunk with no ``@@`` (pure mode change, pure rename) has no
+        +/- lines at all. Reducing it to "" would make every such chunk
+        compare equal and silently skip re-review; the fallback hashes
+        the whole chunk instead."""
+        mode_change = (
+            "diff --git a/s.sh b/s.sh\n"
+            "old mode 100644\n"
+            "new mode 100755\n"
+        )
+        rename = (
+            "diff --git a/x.py b/y.py\n"
+            "similarity index 100%\n"
+            "rename from x.py\n"
+            "rename to y.py\n"
+        )
+        assert diff_hash(mode_change) != diff_hash(rename)
+        assert diff_hash(mode_change) != diff_hash("")
+
+    def test_hunkless_chunk_ignores_only_the_index_line(self):
+        """Blob SHAs are the one part a rebase rewrites on its own, so
+        they stay out of the hash even on the hunk-less fallback."""
+        a = "diff --git a/x.py b/y.py\nindex 1111111..2222222 100644\nrename to y.py\n"
+        b = "diff --git a/x.py b/y.py\nindex 3333333..4444444 100644\nrename to y.py\n"
+        assert diff_hash(a) == diff_hash(b)
+
+
+class TestHunkPositions:
+    """diff_hash deliberately discards absolute positions, so these are
+    what tells server.py a carried finding's line number has moved."""
+
+    def test_reads_new_side_start_and_length(self):
+        chunk = (
+            "diff --git a/a.py b/a.py\n"
+            "@@ -10,6 +12,7 @@ def f():\n"
+            "+x\n"
+            "@@ -40,3 +43,3 @@ def g():\n"
+            "+y\n"
+        )
+        assert hunk_positions(chunk) == [(12, 7), (43, 3)]
+
+    def test_missing_length_means_one_line(self):
+        assert hunk_positions("@@ -1 +1 @@\n+x\n") == [(1, 1)]
+
+    def test_no_hunks_is_empty(self):
+        assert hunk_positions("diff --git a/a.py b/a.py\nold mode 100644\n") == []
+
+    def test_added_lines_in_the_body_are_not_hunk_headers(self):
+        # A PR editing a .patch file has '@@' lines as *content* — they
+        # arrive prefixed with '+', so the anchored regex skips them.
+        chunk = "@@ -1,2 +1,2 @@\n+@@ -99,9 +99,9 @@\n"
+        assert hunk_positions(chunk) == [(1, 2)]
 
 
 # ------------------------------------------------------------------ #
@@ -1316,6 +1735,31 @@ class TestSeverityGte:
         assert severity_gte("low", "high") is False
         assert severity_gte("medium", "high") is False
 
+    def test_unknown_name_ties_with_low_not_below_it(self):
+        """Regression (fix round 1): SEVERITY_ORDER is now derived from
+        SeverityScale.default_scale() rather than hand-written. Several
+        call sites — severity_gte here, plus reviewer.py:1096/1152 and
+        server.py:1462/1581/1583/3290 — read SEVERITY_ORDER.get(name, 0)
+        directly, so an unrecognised name must resolve to a rank that
+        TIES with "low", not one that sits below it. If the default
+        scale's ranks were ever renumbered so "low" isn't 0 (e.g. spaced
+        by 10 like a repo-authored severities.json), this would silently
+        flip severity_gte("typo", "low") from True to False — turning an
+        operator's typo'd REVIEW_APPROVE_MAX_SEVERITY from "approve at
+        the strictest tier" into "block every merge" with no test
+        failure elsewhere to catch it.
+        """
+        assert severity_gte("typo", "low") is True
+        assert severity_gte("low", "typo") is True
+
+    def test_severity_order_raw_values_are_byte_identical_to_pre_refactor(self):
+        """Pin the exact rank ints, not just their order. See the module
+        docstring on ``_DEFAULT_RANKS`` in raven/severity.py for the full
+        list of call sites relying on the ``0`` default tying with
+        "low"."""
+        from raven.reviewer import SEVERITY_ORDER
+        assert SEVERITY_ORDER == {"low": 0, "medium": 1, "high": 2}
+
 
 # ------------------------------------------------------------------ #
 #  respond_to_comment — file/line context                             #
@@ -1813,7 +2257,7 @@ class TestUngroundedFindingFilter:
         self._backend(monkeypatch, json.dumps(
             {"severity": "low", "summary": "s", "findings": []}))
 
-        def _fake_parse(_text):
+        def _fake_parse(_text, _repo="", *args, **kwargs):
             return {
                 "severity": "high", "summary": "s",
                 "findings": [{"severity": "high", "file": "unseen_gap.py",
@@ -1837,7 +2281,7 @@ class TestUngroundedFindingFilter:
         self._backend(monkeypatch, json.dumps(
             {"severity": "low", "summary": "s", "findings": []}))
 
-        def _fake_parse(_text):
+        def _fake_parse(_text, _repo="", *args, **kwargs):
             return {
                 "severity": "medium", "summary": "s",
                 "findings": [{"severity": "medium", "file": "   ",
@@ -2989,3 +3433,611 @@ class TestDiffParsersHandleSpacedPaths:
             "raven_ungrounded_findings_dropped_total" in k
             for k in metrics._counters
         )
+
+
+class TestHelpersAcceptAScale:
+    """PR 1: the severity helpers take a scale; omitting it reproduces
+    today's behaviour exactly."""
+
+    def test_recompute_severity_uses_supplied_scale(self):
+        from raven.severity import SeverityScale
+        from raven.reviewer import _recompute_severity
+
+        scale = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                              blocks_at_or_above="bug")
+        findings = [{"severity": "nit"}, {"severity": "bug"}]
+        assert _recompute_severity(findings, scale) == "bug"
+
+    def test_recompute_severity_empty_is_least_severe_of_scale(self):
+        from raven.severity import SeverityScale
+        from raven.reviewer import _recompute_severity
+
+        scale = SeverityScale(ranks={"nit": 10, "blocker": 30},
+                              blocks_at_or_above="blocker")
+        assert _recompute_severity([], scale) == "nit"
+
+    def test_recompute_severity_defaults_to_builtin_scale(self):
+        from raven.reviewer import _recompute_severity
+
+        assert _recompute_severity([{"severity": "high"}]) == "high"
+        assert _recompute_severity([]) == "low"
+
+    def test_recompute_severity_matches_pre_scale_behavior_for_unknown(self):
+        """Unrecognised or missing severities must rank LOWEST, not most
+        severe — this is NOT scale.normalize() territory (that fails
+        CLOSED for model-emitted severities elsewhere, e.g.
+        _validate_review). Reproduces the pre-scale
+        SEVERITY_ORDER.get(f.get("severity", "low"), 0) behaviour
+        exactly, same as _cap_findings and
+        server._max_severity_from_findings."""
+        from raven.reviewer import _recompute_severity
+
+        assert _recompute_severity([{"message": "no severity key"}]) == "low"
+        assert _recompute_severity([{"severity": ""}]) == "low"
+        assert _recompute_severity([{"severity": None}]) == "low"
+        assert _recompute_severity([{"severity": "critical"}]) == "low"
+        # A recognised finding still wins the max over an unrecognised one.
+        assert _recompute_severity(
+            [{"severity": "critical"}, {"severity": "medium"}]) == "medium"
+
+    def test_recompute_severity_strips_and_lowercases_known_names(self):
+        """Deliberate exception to matching main byte-for-byte: names are
+        stripped/lowercased before lookup (matching _validate_review
+        post-#211), so a whitespace/case variant of a known tier still
+        resolves to that tier rather than being treated as unknown.
+        Reproducing main's un-normalized lookup here would reintroduce
+        the exact whitespace bug #211 fixed."""
+        from raven.reviewer import _recompute_severity
+
+        assert _recompute_severity([{"severity": "  HIGH  "}]) == "high"
+
+    def test_coverage_gap_floor_is_the_blocking_tier(self, monkeypatch):
+        from raven.severity import SeverityScale
+        from raven.reviewer import _coverage_gap_floor
+
+        scale = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                              blocks_at_or_above="bug")
+        assert _coverage_gap_floor(scale) == "bug"
+
+    def test_coverage_gap_floor_default_matches_today(self, monkeypatch):
+        from raven.reviewer import _coverage_gap_floor
+
+        monkeypatch.setenv("REVIEW_APPROVE_MAX_SEVERITY", "low")
+        assert _coverage_gap_floor() == "medium"
+        monkeypatch.setenv("REVIEW_APPROVE_MAX_SEVERITY", "high")
+        assert _coverage_gap_floor() == "high"
+
+    def test_validate_review_fails_closed_on_scale_vocabulary(self):
+        from raven.severity import SeverityScale
+        from raven.reviewer import _validate_review
+
+        scale = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                              blocks_at_or_above="bug")
+        data = {"severity": "nit", "summary": "s",
+                "findings": [{"severity": "critical", "message": "m"}]}
+        result = _validate_review(data, "acme/repo", scale)
+        assert result["findings"][0]["severity"] == "blocker"
+        assert result["severity"] == "blocker"
+
+
+class TestCoverageGapFloorOnCustomScales:
+    def test_floor_is_the_blocking_tier_on_a_five_tier_scale(self):
+        from raven.severity import SeverityScale
+        from raven.reviewer import _coverage_gap_floor
+        s = SeverityScale(
+            ranks={"nit": 10, "low": 20, "medium": 30, "high": 40, "critical": 50},
+            blocks_at_or_above="high")
+        assert _coverage_gap_floor(s) == "high"
+
+    def test_floor_is_top_tier_when_nothing_blocks(self):
+        from raven.severity import SeverityScale
+        from raven.reviewer import _coverage_gap_floor
+        s = SeverityScale(ranks={"a": 1, "b": 2}, blocks_at_or_above=None)
+        assert _coverage_gap_floor(s) == "b"
+
+    def test_gap_marker_finding_gets_the_floor_severity(self, mocker):
+        from raven.severity import SeverityScale
+        from raven import reviewer
+        s = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                          blocks_at_or_above="bug")
+        markers = reviewer._coverage_gap_markers(["big.py"], s)
+        assert markers[0]["severity"] == "bug"
+        assert markers[0]["file"] == "big.py"
+        assert "line" not in markers[0]
+
+
+class TestScaleThreading:
+    def test_review_diff_accepts_a_scale(self, mocker):
+        from raven.severity import SeverityScale
+        from raven import reviewer
+
+        scale = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                              blocks_at_or_above="bug")
+        mocker.patch.object(reviewer, "_complete_with_retry", return_value=mocker.Mock(
+            text='{"severity": "bug", "summary": "s", '
+                 '"findings": [{"severity": "blocker", "file": "a.py", '
+                 '"line": 1, "message": "m"}]}',
+            usage=None,
+        ))
+        result = reviewer.review_diff(
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n+x\n",
+            "acme/repo", scale=scale,
+        )
+        assert result["severity"] == "blocker"
+
+    def test_concurrent_reviews_do_not_share_a_scale(self, mocker):
+        """Regression guard for the 'parameter, never global' decision: two
+        reviews with different vocabularies in flight must not contaminate
+        each other."""
+        import concurrent.futures
+        from raven.severity import SeverityScale
+        from raven import reviewer
+
+        a = SeverityScale(ranks={"nit": 10, "bug": 20}, blocks_at_or_above="bug")
+        b = SeverityScale(ranks={"trivial": 10, "fatal": 20},
+                          blocks_at_or_above="fatal")
+
+        def fake_complete(*args, **kwargs):
+            return mocker.Mock(
+                text='{"severity": "x", "summary": "s", '
+                     '"findings": [{"severity": "nope", "file": "a.py", '
+                     '"line": 1, "message": "m"}]}',
+                usage=None,
+            )
+
+        mocker.patch.object(reviewer, "_complete_with_retry", side_effect=fake_complete)
+        diff = "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n+x\n"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            fa = ex.submit(reviewer.review_diff, diff, "acme/a", scale=a)
+            fb = ex.submit(reviewer.review_diff, diff, "acme/b", scale=b)
+            ra, rb = fa.result(), fb.result()
+
+        # Each unknown severity fails closed onto ITS OWN scale's top tier.
+        assert ra["severity"] == "bug"
+        assert rb["severity"] == "fatal"
+
+
+class TestUnknownSeveritiesAreReported:
+    def _scale(self):
+        from raven.severity import SeverityScale
+        return SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                             blocks_at_or_above="bug")
+
+    def test_collects_the_offending_names(self):
+        from raven.reviewer import _validate_review
+        data = {"severity": "x", "summary": "s", "findings": [
+            {"severity": "critical", "message": "a"},
+            {"severity": "major", "message": "b"},
+            {"severity": "critical", "message": "c"},
+            {"severity": "bug", "message": "d"},
+        ]}
+        result = _validate_review(data, "acme/repo", self._scale())
+        assert result["unknown_severities"] == ["critical", "major"]
+
+    def test_empty_when_every_name_is_known(self):
+        from raven.reviewer import _validate_review
+        data = {"severity": "bug", "summary": "s",
+                "findings": [{"severity": "bug", "message": "a"}]}
+        result = _validate_review(data, "acme/repo", self._scale())
+        assert result["unknown_severities"] == []
+
+
+class TestChunkedSeverityUsesTheScale:
+    """Regression: the chunked path's running-max accumulator and its two
+    synthesized-failure severities used the literal "low"/"high" instead
+    of the scale's own tier names. On a scale without a "low"/"high" tier
+    (e.g. nit/bug/blocker), scale.rank()/normalize() fail CLOSED for an
+    out-of-vocabulary name — resolving to the MOST severe tier, not the
+    least. That made the "low"-seeded max_severity accumulator start
+    ABOVE every real finding a chunk could report, so it could never
+    advance: every chunked review on a custom scale silently reported
+    "low" (an out-of-vocabulary literal) no matter what was actually
+    found."""
+
+    def _scale(self):
+        from raven.severity import SeverityScale
+        return SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                             blocks_at_or_above="bug")
+
+    def _big_diff(self):
+        return (
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + "+l\n" * 200 +
+            "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n" + "+l\n" * 200
+        )
+
+    def _run_chunked(self, monkeypatch, chunk_json_for_file):
+        import raven.reviewer as rev
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = lambda prompt, **kw: _cr(
+            chunk_json_for_file("a.py" if "a/a.py" in prompt else "b.py")
+        )
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            return rev.review_diff(self._big_diff(), "acme/repo", scale=self._scale())
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+    def test_chunked_review_reports_the_findings_tier_not_low(self, monkeypatch):
+        scale = self._scale()
+
+        def chunk_json(fn):
+            return json.dumps({
+                "severity": "bug", "summary": f"rev {fn}",
+                "findings": [{"severity": "bug", "file": fn, "message": "m"}],
+            })
+
+        result = self._run_chunked(monkeypatch, chunk_json)
+        assert result["chunked"] is True
+        assert result["severity"] == "bug"
+        assert result["severity"] != "low"
+        assert result["severity"] in scale.ordered()
+
+    def test_chunked_review_with_no_findings_is_least_severe(self, monkeypatch):
+        scale = self._scale()
+
+        def chunk_json(fn):
+            return json.dumps({"severity": "nit", "summary": f"clean {fn}", "findings": []})
+
+        result = self._run_chunked(monkeypatch, chunk_json)
+        assert result["chunked"] is True
+        assert result["severity"] == scale.least_severe
+
+    def test_all_chunks_failed_uses_scale_most_severe(self, monkeypatch):
+        import raven.reviewer as rev
+        scale = self._scale()
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = RuntimeError("boom")
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            result = rev.review_diff(self._big_diff(), "acme/repo", scale=scale)
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+        assert result["_parse_error"] is True
+        assert result["severity"] == scale.most_severe
+
+    def test_unparseable_output_uses_scale_most_severe(self):
+        from raven.reviewer import _parse_response
+        scale = self._scale()
+        result = _parse_response("not json at all, sorry", "acme/repo", scale)
+        assert result["_parse_error"] is True
+        assert result["severity"] == scale.most_severe
+
+    def test_review_diff_severity_is_always_in_scale_vocabulary(self, monkeypatch):
+        """Invariant that catches the whole class of bug: whatever path
+        review_diff returns through for a custom scale, the top-level
+        severity must be a member of THAT scale — never a literal
+        ("low"/"high") borrowed from the built-in vocabulary."""
+        scale = self._scale()
+
+        def chunk_json(fn):
+            return json.dumps({"severity": "nit", "summary": f"clean {fn}", "findings": []})
+
+        clean = self._run_chunked(monkeypatch, chunk_json)
+        assert clean["severity"] in scale.ordered()
+
+        import raven.reviewer as rev
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = RuntimeError("boom")
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 100
+        try:
+            failed = rev.review_diff(self._big_diff(), "acme/repo", scale=scale)
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+        assert failed["severity"] in scale.ordered()
+
+
+class TestUnknownSeveritiesPropagateThroughChunking:
+    """review_diff's chunked path (raw-merge, consolidated, and
+    all-chunks-failed returns) must carry unknown_severities /
+    severity_scale_names through — Task 8 added these to the
+    single-chunk / _validate_review path with test coverage, but the
+    three chunked-path assembly points had none. A mutation pass
+    confirmed all three could be silently broken without moving the
+    suite: dropping the chunk-loop union, dropping the union on the
+    consolidated return, or dropping both keys entirely from either the
+    consolidated or the all-chunks-failed return all left 1227 passed
+    unchanged."""
+
+    def _scale(self):
+        from raven.severity import SeverityScale
+        return SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                             blocks_at_or_above="bug")
+
+    def _big_diff(self):
+        return (
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + "+l\n" * 10 +
+            "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n" + "+l\n" * 10
+        )
+
+    def _chunk_json(self, fn):
+        # a.py emits an out-of-vocabulary severity; b.py emits a known one.
+        if fn == "a.py":
+            return json.dumps({
+                "severity": "critical", "summary": "sa",
+                "findings": [{"severity": "critical", "file": "a.py", "message": "m1"}],
+            })
+        return json.dumps({
+            "severity": "bug", "summary": "sb",
+            "findings": [{"severity": "bug", "file": "b.py", "message": "m2"}],
+        })
+
+    def test_raw_merge_path_unions_chunk_level_unknowns(self, monkeypatch):
+        """Kills: (1) dropping unknown_severities.update() in the chunk
+        loop, and (4) stripping both keys from the raw-merge final
+        return — no rules/claude_md, so consolidation is skipped."""
+        import raven.reviewer as rev
+        scale = self._scale()
+
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = lambda prompt, **kw: _cr(
+            self._chunk_json("a.py" if "a/a.py" in prompt else "b.py")
+        )
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 5
+        try:
+            result = rev.review_diff(self._big_diff(), "acme/repo", scale=scale)
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["chunked"] is True
+        assert result.get("consolidated") is not True
+        assert result["unknown_severities"] == ["critical"]
+        assert result["severity_scale_names"] == scale.ordered()
+
+    def test_consolidated_path_unions_chunk_and_consolidation_unknowns(self, monkeypatch):
+        """Kills: (1) dropping the chunk-loop union (would lose
+        "critical"), and (3) stripping the union line on the
+        consolidated return (KeyError, or losing the chunk-level half
+        of the union). claude_md is set so the consolidation pass runs;
+        its own response emits a THIRD unknown name ("weird") on top of
+        what the chunks already found, proving the union covers both
+        sources, not just one."""
+        import raven.reviewer as rev
+        scale = self._scale()
+
+        consolidation_json = json.dumps({
+            "severity": "bug", "summary": "consolidated",
+            "findings": [
+                {"severity": "weird", "file": "a.py", "message": "m1"},
+                {"severity": "bug", "file": "b.py", "message": "m2"},
+            ],
+        })
+
+        def _complete(prompt, **kw):
+            if "Consolidation" in prompt:
+                return _cr(consolidation_json)
+            return _cr(self._chunk_json("a.py" if "a/a.py" in prompt else "b.py"))
+
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = _complete
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 5
+        try:
+            result = rev.review_diff(self._big_diff(), "acme/repo", scale=scale,
+                                     claude_md="# policy")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["chunked"] is True
+        assert result.get("consolidated") is True
+        assert result["unknown_severities"] == ["critical", "weird"]
+        assert result["severity_scale_names"] == scale.ordered()
+
+    def test_all_chunks_failed_path_has_both_keys(self, monkeypatch):
+        """Kills: (2) stripping both keys from the all-chunks-failed
+        return. No chunk succeeds, so the union is empty by
+        construction — the point is the KEYS survive (direct dict
+        index, not .get), not that they carry any names."""
+        import raven.reviewer as rev
+        scale = self._scale()
+
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = RuntimeError("boom")
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 5
+        try:
+            result = rev.review_diff(self._big_diff(), "acme/repo", scale=scale)
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["_parse_error"] is True
+        assert result["unknown_severities"] == []
+        assert result["severity_scale_names"] == scale.ordered()
+
+
+class TestSeverityBlocksAtPropagatesThroughReviewDiff:
+    """notifier._passes_threshold's gate-semantics fallback needs
+    review['severity_blocks_at'] (the scale's blocking tier) alongside
+    severity_scale_names — without it a repo's own scale can't answer
+    "does this review block the merge?" for a channel threshold outside
+    that scale's vocabulary. Task 8 gave severity_scale_names test
+    coverage at all four dict-construction sites (single-chunk /
+    _validate_review, chunked raw-merge, chunked consolidated, chunked
+    all-failed) after a mutation pass found the chunked ones silently
+    uncovered; severity_blocks_at rides the same four sites and gets the
+    same coverage here rather than repeating that gap."""
+
+    def _scale(self):
+        from raven.severity import SeverityScale
+        return SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                             blocks_at_or_above="bug")
+
+    def _big_diff(self):
+        return (
+            "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + "+l\n" * 10 +
+            "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n" + "+l\n" * 10
+        )
+
+    def _chunk_json(self, fn):
+        return json.dumps({
+            "severity": "bug", "summary": f"s{fn}",
+            "findings": [{"severity": "bug", "file": fn, "message": "m"}],
+        })
+
+    def test_single_chunk_path_carries_blocks_at(self):
+        from raven.reviewer import _validate_review
+        scale = self._scale()
+        data = {"severity": "bug", "summary": "s",
+                "findings": [{"severity": "bug", "message": "a"}]}
+        result = _validate_review(data, "acme/repo", scale)
+        assert result["severity_blocks_at"] == "bug"
+
+    def test_raw_merge_chunked_path_carries_blocks_at(self, monkeypatch):
+        import raven.reviewer as rev
+        scale = self._scale()
+
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = lambda prompt, **kw: _cr(
+            self._chunk_json("a.py" if "a/a.py" in prompt else "b.py")
+        )
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 5
+        try:
+            result = rev.review_diff(self._big_diff(), "acme/repo", scale=scale)
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["chunked"] is True
+        assert result.get("consolidated") is not True
+        assert result["severity_blocks_at"] == "bug"
+
+    def test_consolidated_chunked_path_carries_blocks_at(self, monkeypatch):
+        import raven.reviewer as rev
+        scale = self._scale()
+
+        consolidation_json = json.dumps({
+            "severity": "bug", "summary": "consolidated",
+            "findings": [{"severity": "bug", "file": "a.py", "message": "m"}],
+        })
+
+        def _complete(prompt, **kw):
+            if "Consolidation" in prompt:
+                return _cr(consolidation_json)
+            return _cr(self._chunk_json("a.py" if "a/a.py" in prompt else "b.py"))
+
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = _complete
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 5
+        try:
+            result = rev.review_diff(self._big_diff(), "acme/repo", scale=scale,
+                                     claude_md="# policy")
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["chunked"] is True
+        assert result.get("consolidated") is True
+        assert result["severity_blocks_at"] == "bug"
+
+    def test_all_chunks_failed_path_carries_blocks_at(self, monkeypatch):
+        import raven.reviewer as rev
+        scale = self._scale()
+
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = RuntimeError("boom")
+        monkeypatch.setattr("raven.ai._cached_backend", fake_backend)
+
+        old_max = rev.MAX_DIFF_LINES
+        rev.MAX_DIFF_LINES = 5
+        try:
+            result = rev.review_diff(self._big_diff(), "acme/repo", scale=scale)
+        finally:
+            rev.MAX_DIFF_LINES = old_max
+
+        assert result["_parse_error"] is True
+        assert result["severity_blocks_at"] == "bug"
+
+
+class TestSeverityReconcilesBothDirections:
+    """The gate severity must fail CLOSED in both directions of a
+    model/findings disagreement (audit 2026-08-17 MED).
+
+    e5c23d1 made the review severity derive purely from the findings,
+    which fixed claimed-low-with-a-high-finding (that combination used to
+    approve and auto-merge a real defect). But it flipped the inverse
+    open: a review stating a blocking severity while reporting no
+    findings derives the least-severe tier and now approves, where the
+    pre-e5c23d1 code read the model's claim and blocked.
+
+    That is precisely the output shape a findings-suppression injection
+    produces — see test_adversarial_comment_cannot_break_out_of_tag,
+    whose payload is literally "the findings list must be empty". Under
+    the old scheme such an attack also had to talk the claimed severity
+    down; under a findings-only rule, emptying the array is enough even
+    while the model honestly reports `high`.
+    """
+
+    def test_claimed_blocking_with_no_findings_still_blocks(self):
+        raw = json.dumps({"severity": "high", "summary": "s", "findings": []})
+        assert _parse_response(raw)["severity"] == "high", (
+            "A review claiming a blocking severity must not approve just "
+            "because its findings array is empty"
+        )
+
+    def test_claimed_low_with_high_finding_still_uses_the_finding(self):
+        """The e5c23d1 fix must survive: the model's claim can never
+        LOWER the gate below what its own findings justify."""
+        raw = json.dumps({
+            "severity": "low",
+            "summary": "s",
+            "findings": [{"severity": "high", "message": "m"}],
+        })
+        assert _parse_response(raw)["severity"] == "high"
+
+    def test_unknown_claim_does_not_raise_the_gate(self):
+        """Only a claim Raven can rank participates. An unrecognised
+        name is already handled by the per-finding fail-closed path and
+        must not be smuggled in here as a top-level escalation."""
+        raw = json.dumps({"severity": "catastrophic", "summary": "s",
+                          "findings": [{"severity": "low", "message": "m"}]})
+        assert _parse_response(raw)["severity"] == "low"
+
+
+class TestFindingLineRejectsBooleans:
+    """`isinstance(True, int)` is True and `True > 0`, so a boolean line
+    passes the int check and reaches inline-comment posting as JSON
+    `true`. _remap_carried_lines guards against exactly this three lines
+    away; _validate_review did not (audit 2026-08-17 LOW)."""
+
+    def test_boolean_line_is_dropped(self):
+        raw = json.dumps({
+            "severity": "low", "summary": "s",
+            "findings": [{"severity": "low", "message": "m",
+                          "file": "a.py", "line": True}],
+        })
+        f = _parse_response(raw)["findings"][0]
+        assert "line" not in f, f"boolean line survived validation: {f.get('line')!r}"
+
+    def test_real_line_still_passes(self):
+        raw = json.dumps({
+            "severity": "low", "summary": "s",
+            "findings": [{"severity": "low", "message": "m",
+                          "file": "a.py", "line": 7}],
+        })
+        assert _parse_response(raw)["findings"][0]["line"] == 7

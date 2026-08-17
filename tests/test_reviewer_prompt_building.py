@@ -1839,3 +1839,143 @@ class TestGroundingTailReminder:
         lowered = captured["prompt"].lower()
         assert "ground your reply in the provided evidence" in lowered
         assert "don't assert code or behavior you weren't shown" in lowered
+
+
+def _captured_prompt(mocker, **kw):
+    """Assemble a real prompt and return it. _complete_with_retry takes the
+    prompt as its second positional arg."""
+    from raven import reviewer
+    from raven.ai.base import CompletionResult
+
+    spy = mocker.patch.object(
+        reviewer, "_complete_with_retry",
+        return_value=CompletionResult(
+            text='{"severity": "x", "summary": "s", "findings": []}'),
+    )
+    reviewer.review_diff("diff --git a/a.py b/a.py\n@@ -1 +1 @@\n+x\n",
+                         "acme/repo", **kw)
+    return spy.call_args[0][1]
+
+
+class TestPromptRenderedFromScale:
+    def _scale(self):
+        from raven.severity import SeverityScale
+        return SeverityScale(
+            ranks={"nit": 10, "bug": 20, "blocker": 30},
+            blocks_at_or_above="bug",
+            descriptions={"blocker": "Ship-stopper.", "nit": "Cosmetic."},
+        )
+
+    def test_block_lists_tiers_most_severe_first(self):
+        from raven.severity import render_severity_block
+        block = render_severity_block(self._scale())
+        assert block.index("blocker") < block.index("bug") < block.index("nit")
+
+    def test_block_includes_descriptions(self):
+        from raven.severity import render_severity_block
+        assert "Ship-stopper." in render_severity_block(self._scale())
+
+    def test_block_marks_the_blocking_tier(self):
+        from raven.severity import render_severity_block
+        block = render_severity_block(self._scale())
+        assert "blocks the merge" in block
+
+    def test_block_states_the_schema_enum(self):
+        from raven.severity import render_severity_block
+        assert "blocker|bug|nit" in render_severity_block(self._scale())
+
+    def test_builtin_prompt_contains_repo_tiers_not_defaults(self, mocker):
+        prompt = _captured_prompt(mocker, scale=self._scale())
+        assert "blocker" in prompt and "nit" in prompt
+        assert "low|medium|high" not in prompt
+
+    def test_placeholder_is_fully_substituted(self, mocker):
+        prompt = _captured_prompt(mocker, scale=self._scale())
+        assert "{{severity_scale}}" not in prompt
+
+    def test_grounding_tail_names_the_scales_least_severe_tier(self):
+        from raven import reviewer
+        tail = reviewer._grounding_tail_reminder(False, self._scale())
+        assert "`nit`" in tail
+        assert "`low`" not in tail
+
+    def test_consolidation_prompt_reflects_custom_scale(self, mocker):
+        """The consolidation pass (`_consolidate_chunked_review`) builds its
+        own ``effective_template`` independently of the single-chunk path —
+        a missing ``_apply_scale_to_template`` call there would ship the
+        literal ``{{severity_scale}}`` placeholder, or the built-in
+        low/medium/high vocabulary, to the model on every large PR that has
+        repo rules configured. Drive ``review_diff`` through the real
+        chunked+consolidation path (diff over ``MAX_DIFF_LINES``, with
+        rules present so consolidation isn't skipped for lack of policy)
+        and inspect the LAST ``_complete_with_retry`` call — consolidation
+        only runs once every chunk-level call has completed, so it is
+        always the final call regardless of chunk completion order."""
+        from raven import reviewer
+        from raven.ai.base import CompletionResult
+
+        scale = self._scale()
+        spy = mocker.patch.object(
+            reviewer, "_complete_with_retry",
+            return_value=CompletionResult(
+                text='{"severity": "bug", "summary": "s", '
+                     '"findings": [{"severity": "bug", "message": "issue"}]}'),
+        )
+        old_max = reviewer.MAX_DIFF_LINES
+        reviewer.MAX_DIFF_LINES = 50
+        try:
+            big_diff = (
+                "diff --git a/a.py b/a.py\n" + "+line\n" * 60
+                + "diff --git a/b.py b/b.py\n" + "+line\n" * 60
+            )
+            reviewer.review_diff(
+                big_diff, "acme/repo",
+                rules={"r.md": "RULE TEXT"},
+                scale=scale,
+            )
+        finally:
+            reviewer.MAX_DIFF_LINES = old_max
+
+        # >=2 chunk calls + 1 consolidation call.
+        assert spy.call_count >= 3
+        consolidation_prompt = spy.call_args_list[-1][0][1]
+        assert "blocker" in consolidation_prompt and "nit" in consolidation_prompt
+        assert "{{severity_scale}}" not in consolidation_prompt
+        assert "low|medium|high" not in consolidation_prompt
+
+
+class TestOverrideIsTotal:
+    """An override means an override: Raven injects NO severity instruction."""
+
+    def _scale(self):
+        from raven.severity import SeverityScale
+        return SeverityScale(ranks={"nit": 10, "blocker": 30},
+                             blocks_at_or_above="blocker")
+
+    def test_override_gets_no_injected_severity_block(self, mocker):
+        override = "REVIEW THIS DIFF. Use severities: trivial, fatal."
+        prompt = _captured_prompt(mocker, prompt_override=override,
+                                  scale=self._scale())
+        assert override in prompt
+        assert "blocks the merge" not in prompt
+        assert "blocker|nit" not in prompt
+
+    def test_override_gets_no_severity_grounding_sentence(self, mocker):
+        """Vestigial since #209 derives the top-level severity from the
+        findings — dropping it removes a contradiction and changes nothing."""
+        prompt = _captured_prompt(mocker, prompt_override="REVIEW THIS.",
+                                  scale=self._scale())
+        assert "Set the top-level `severity`" not in prompt
+
+    def test_override_still_gets_non_severity_scaffolding(self, mocker):
+        prompt = _captured_prompt(mocker, prompt_override="REVIEW THIS.",
+                                  rules={"r.md": "RULE TEXT"},
+                                  scale=self._scale())
+        assert "RULE TEXT" in prompt
+
+    def test_opt_in_placeholder_is_substituted_in_an_override(self, mocker):
+        prompt = _captured_prompt(
+            mocker, prompt_override="MY PROMPT\n{{severity_scale}}\nEND",
+            scale=self._scale())
+        assert "{{severity_scale}}" not in prompt
+        assert "blocker|nit" in prompt

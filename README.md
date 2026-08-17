@@ -274,6 +274,64 @@ Each finding with a file and line number is also posted as an inline comment on 
 
 On **Bitbucket DC** — which has no single-call review API — the summary comment is posted **after** the inline anchors so it sorts on top of them in the PR activity. If the summary post fails, the inline anchors that already posted are rolled back (deleted) so a retry can't duplicate them. Gitea posts the whole review in one call, so ordering there is whatever the platform renders.
 
+## Severity scale
+
+By default every review uses three severity tiers — `low`, `medium`, `high` — and `REVIEW_APPROVE_MAX_SEVERITY` (see Configuration below) picks the highest tier that still approves; anything above it blocks the merge. A repo can replace that vocabulary entirely with its own tiers, own names, and own blocking threshold.
+
+Add `.claude/rules/raven/severities.json` at the repo root (path is `{RAVEN_RULES_DIR}/raven/severities.json`, default `.claude/rules/raven/severities.json`). Like `CLAUDE.md` and `.claude/rules/*.md`, it's **fetched from the PR's base branch** — a scale change has to land through its own review cycle, reviewed under the OLD scale, so a hostile PR can't widen its own merge gate on the same PR that ships the change. Setting `RAVEN_RULES_DIR=""` disables it along with rule injection and prompt overrides.
+
+Shape:
+
+```json
+{
+  "severities": {"name": rank, "...": "..."},
+  "blocks_at_or_above": "name",
+  "descriptions": {"name": "...", "...": "..."}
+}
+```
+
+- **`severities`** maps each tier name to an integer rank — higher rank means more severe. Ranks don't need to be contiguous; gap-spacing (e.g. multiples of 10) leaves room to insert a tier later without renumbering the rest.
+- **`blocks_at_or_above`** names the least-severe tier that blocks the merge. **Omit it and nothing blocks on severity alone** — the merge is then gated only by the other safety checks (sole reviewer, CI, force-push protection, etc.). This is the same configuration `REVIEW_APPROVE_MAX_SEVERITY=high` produces on the built-in scale today, and `REVIEW_APPROVE_MAX_SEVERITY` continues to control the blocking threshold for any repo that has no `severities.json`.
+- **`descriptions`** is optional but strongly recommended: each tier's description is rendered into the review prompt directly under that tier's name, and a tier with no description invites the model to classify findings against it inconsistently.
+
+Worked example — a five-tier scale for a repo that wants finer granularity than low/medium/high:
+
+```json
+{
+  "severities": {
+    "nit": 0,
+    "minor": 10,
+    "major": 20,
+    "critical": 30,
+    "blocker": 40
+  },
+  "blocks_at_or_above": "critical",
+  "descriptions": {
+    "nit": "Style or personal preference, no functional impact. Safe to leave for a follow-up.",
+    "minor": "A real but contained issue — unclear naming, a missing edge-case comment, minor duplication. Doesn't change behavior.",
+    "major": "A bug that produces incorrect output under some inputs, or a design flaw that will need revisiting. Contained: no data-integrity or security impact.",
+    "critical": "Data corruption, a crash in normal use, or a security vulnerability. Blocks the merge.",
+    "blocker": "An active exploit, a leaked credential, or an irrecoverable data-loss path. Fix before anything else."
+  }
+}
+```
+
+`nit`, `minor`, and `major` never block the merge; `critical` and `blocker` do.
+
+**Validation.** A `severities.json` must define at least two tiers (after case/whitespace normalization), no two tiers may share a name or a rank, every rank must be an integer (`true`/`false` are rejected even though `bool` is technically an `int` subclass), `blocks_at_or_above` must name a tier that's actually defined, and every tier name must match `^[a-z][a-z0-9_-]{0,31}$` — lowercase start, then letters/digits/underscore/hyphen, 32 characters max. The charset is strict on purpose: tier names become Prometheus label values and get interpolated into the review prompt, so a stray quote, brace, or newline in a tier name could break metrics exposition or the prompt itself.
+
+**Size limits.** A scale is capped at **24 tiers**, and each description at **2000 characters**. The rendered severity block is substituted into the review prompt template itself, so every review of that repo carries it — an oversized scale spends the model's attention on vocabulary instead of on the diff. The limits are generous enough that no honest scale reaches them; exceeding either one is a validation failure and falls back to the built-in scale like any other.
+
+**Fallback.** A missing or empty file falls back silently to the built-in `low`/`medium`/`high` scale — no log line, since not having a `severities.json` is the normal case for most repos and warning on every review would be noise. A file that exists but can't be fetched, or exists but fails a validation rule above, also falls back to the built-in scale, but Raven logs a warning; a file that fails validation additionally increments `raven_severity_scale_invalid_total{repo}`. Either way, one repo's typo (or a temporarily unreachable file) never stops that repo from being reviewed — it just reviews under the default vocabulary until the file is fixed or reachable again. If you're debugging why a `severities.json` isn't taking effect: no warning in the logs means the file wasn't found at that path on the base ref, not that it was rejected — a rejected file always logs.
+
+**A file that can't be *fetched* also blocks auto-merge for that pass.** The distinction matters: a missing file means the repo genuinely has no scale, but a fetch failure means it may well have a *stricter* one that Raven simply couldn't read. Falling back to the built-in scale is the right call for reviewing — it's a defined, conservative vocabulary — but it would be the wrong call for merging, because a repo that reuses the `low`/`medium`/`high` names with a tighter `blocks_at_or_above` has a **stricter** gate than the default. Approving under the substituted scale could merge past the repo's own blocking tier. So on a fetch failure Raven still posts the review (and still replies to comments), but refuses to auto-merge until a later push fetches the file successfully. A validation failure does *not* trigger this — a file Raven could read and rejected is a known quantity, already surfaced by its warning and `raven_severity_scale_invalid_total`. Fetch failures are counted separately in `raven_severity_scale_fetch_failed_total{repo}`.
+
+**Prompt overrides.** A `.claude/rules/raven/prompts/review.md` override (see "Customising the review prompt" below) replaces the built-in prompt **wholesale**, and Raven injects no severity instruction into it automatically. An override author who wants the rendered vocabulary block (tier names, descriptions, and which tiers block) opts in by including the `{{severity_scale}}` placeholder anywhere in the override text. If the model still emits a severity name outside the resolved scale — a stale override, an override that teaches a different vocabulary, or a plain model mistake — that name is treated as the scale's most severe tier (fails closed, so nothing merges on a vocabulary Raven doesn't recognise), and the posted review carries a config-error line naming the exact offending name(s) plus the scale's known tiers. Counted in `raven_unknown_severity_total`.
+
+**The review's severity comes from its findings, not from the model's claim about itself.** A response can state `"severity": "low"` at the top level while listing a finding at a blocking tier — and taken at face value that approves and auto-merges. Raven gates on the **more severe** of the two — the model's claim can neither lower the bar below what its findings justify, nor be thrown away when it is the more alarming of the two. That second direction matters because `{"severity": "high", "findings": []}` is exactly the shape a findings-suppression prompt injection produces. A blocking claim with nothing listed under it posts one PR-wide finding naming the disagreement, so the hold explains itself instead of showing a bare "changes requested" over an empty list. Counted in `raven_severity_mismatch_total`. A non-zero counter isn't necessarily a problem, but a persistently rising one means the model is misjudging its own output on that repo, which is worth looking at alongside the prompt.
+
+**Notification channels.** A channel's `min_severity` (see "Notification channels" below) names a tier, but `NOTIFY_CHANNELS` is instance-wide while severity scales are per-repo — a channel watching several repos can't assume they all share one vocabulary. If `min_severity` names a tier that isn't in a given repo's scale, Raven falls back to "notify when the review blocks the merge," logs a warning once per repo, and increments `raven_notify_threshold_fallback_total{repo}`. Set `"min_severity": "blocking"` to select that behavior explicitly — it's the only threshold value that means the same thing in every repo's vocabulary, and the recommended setting for any channel watching more than one repo.
+
 ## Customising the review prompt
 
 Edit `prompts/review.md` to tune review quality. The prompt is loaded at container startup — restart the container to pick up changes, no rebuild needed.
@@ -326,7 +384,7 @@ entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start
    - Dismisses previous Raven reviews (after submitting new one)
    - Submits formal review (APPROVED/REQUEST_CHANGES) with inline comments
    - Adds the `raven-reviewed` label
-   - Caches findings to disk (persists across restarts, invalidated on model/prompt change)
+   - Caches findings to disk (persists across restarts, invalidated on any review-config change — see "Cache invalidation" below)
    - Auto-merge decision: when Raven is sole reviewer and consolidated verdict approves
    - On a transient AI failure (timeout / rate-limit / backend 5xx): retries once (configurable) before giving up
    - On unhandled error: clears dedup entry, posts a **classified** failure comment naming the cause + next step
@@ -343,9 +401,10 @@ entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start
 - **Force-push protection**: verifies head SHA hasn't changed before merging
 - **PR dedup**: 30 s in-memory cache keyed on `(repo, pr_number, head_sha)` absorbs webhook redelivery storms without dropping legitimate new pushes (a new SHA is treated as a fresh event, not a duplicate)
 - **Consolidated incremental reviews**: findings from unchanged files are re-validated by the model (explicit-drop contract — a malformed answer keeps everything) and included in the verdict; drops apply to the cache only after the review posts, and resolve their inline threads
+- **Rebase tolerance**: "has this file changed?" is decided by a hash of the added and removed lines only — `@@` hunk headers, `index` blob SHAs, and context lines are excluded, because a rebase (or a merge from the base branch) rewrites all three without touching what the PR actually changed. Without this, every touched file re-reviewed from scratch after a rebase, and since a resolution is tracked per `comment_id`, regenerated findings lost every resolution the developer had already made. Findings on a file that merely *moved* are carried and shifted onto their code's new position; where that shift can't be proven safe, the file is re-reviewed as before. "Proven safe" includes the surrounding code being the *same* code: an author relocating a byte-identical edit elsewhere in the file leaves both the content hash and the hunk geometry unchanged, so position alone can't tell it from a rebase — and position is often what makes a line dangerous. Each hunk's context is digested (positions excluded, so a genuine rebase still matches) and a change forces a real re-review The scheme name is folded into the cache key, so changing how the hash is computed wipes the cache once, deliberately, instead of silently mismatching every stored hash
 - **Coverage-gap guard**: oversized or failed review chunks set a sticky per-file gap — the verdict is forced to `needs_work` and both merge paths refuse auto-merge until the gap files are re-reviewed cleanly (or leave the PR)
 - **Stale review dismissal**: previous Raven reviews dismissed after new review is posted
-- **Cache invalidation**: findings cache wiped automatically when the review config changes — AI backend, model, effort, prompt, **or the verdict-gating settings** (`REVIEW_APPROVE_MAX_SEVERITY`, `RAVEN_REVIEW_MODE`) — so a cached approve can't outlive the policy that produced it and auto-merge under a stricter one
+- **Cache invalidation**: findings cache wiped automatically when the review config changes — AI backend, model, effort, prompt, the diff-hash scheme, **or the verdict-gating settings** (`REVIEW_APPROVE_MAX_SEVERITY`, `RAVEN_REVIEW_MODE`) — so a cached approve can't outlive the policy that produced it and auto-merge under a stricter one
 - **Classified failure handling**: failures are classified (`timeout` / `rate_limit` / `backend_5xx` / `usage_limit` / `auth` / `diff_truncated` / `diff_unverifiable` / `unknown`); transient classes retry once (`RAVEN_AI_RETRY`) and the posted comment names the cause and the actionable next step (e.g. "raise `RAVEN_AI_TIMEOUT`", "resets on the next push") instead of an opaque "internal error". Counted in `raven_review_failures_total{reason,repo}`. Comment text is static per-reason — no exception detail is interpolated, so credential-bearing error strings can't leak. Dedup entry is cleared so a webhook retry can re-attempt.
 - **Always 200**: all webhook responses return HTTP 200 to prevent retry loops
 - **Graceful shutdown**: on SIGTERM, queued reviews and CI-wait tasks are cancelled and in-flight Claude CLI subprocesses are SIGTERMed so gunicorn's graceful-shutdown window isn't consumed by discarded work
@@ -376,6 +435,13 @@ entrypoint.sh              Writes OAuth credentials, updates Claude CLI on start
 - `raven_carried_findings_dropped_total{repo}` — carried findings the model reported as resolved by the latest push
 - `raven_retractions_total{repo,result}` — comment-driven finding retractions
 - `raven_verdict_revisions_total{repo,from,to}` — comment-driven verdict revisions
+
+**Severity scale**
+- `raven_severity_scale_invalid_total{repo}` — `severities.json` files rejected by validation; the built-in scale was used instead
+- `raven_severity_scale_fetch_failed_total{repo}` — `severities.json` present but unreadable; the built-in scale was substituted **and auto-merge was refused for that pass**
+- `raven_unknown_severity_total` — findings whose severity name isn't in the resolved scale, treated as the most severe tier (fails closed). Non-zero on a repo with a custom scale usually means a prompt override is teaching a different vocabulary
+- `raven_severity_mismatch_total` — reviews where the model's stated top-level severity disagreed with the highest severity among its own findings; the derived value is used
+- `raven_notify_threshold_fallback_total{repo}` — a channel's `min_severity` named a tier absent from that repo's scale, so the filter fell back to gate semantics
 
 **Comment replies**
 - `raven_responses_total{repo}` — comment responses
@@ -438,7 +504,7 @@ RAVEN_AI_EFFORT=max  RAVEN_LIVE_AI_TESTS=1 CLAUDE_CODE_OAUTH_TOKEN=<token> \
     pytest -m slow tests/golden/ -s -q
 ```
 
-~1125 tests across 23 test files (including the offline golden-review scorer/corpus suite above) covering webhook handling (BB DC `pr:comment:added`/`:edited` version-aware dedup, `pr:reviewer:approved`/`:changes_requested` parity with Gitea, activities-endpoint pagination cap with WARNING), review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), two-tier prompt trust model (`<repo_policy>` for CLAUDE.md + rules at base ref vs `<untrusted_input>` for diff + comments), chunked-review consolidation pass that re-applies repo policy to aggregated findings, three-mode review engagement (`all` / `gap` / `advisory`), three-way review output channels (`both` / `summary` / `inline`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
+1350 tests across 19 test files (including the offline golden-review scorer/corpus suite above) covering webhook handling (BB DC `pr:comment:added`/`:edited` version-aware dedup, `pr:reviewer:approved`/`:changes_requested` parity with Gitea, activities-endpoint pagination cap with WARNING), review parsing, inline comments, notification dispatch, metrics with bearer-token auth, SHA-aware PR dedup, incremental reviews, findings cache persistence (`CacheEntry` dataclass with verdict + summary), conversational follow-up (mention, thread, reply-in-Raven-thread, active-thread context with `[id=N]` + `[YOU]` markers, BB DC activities-based thread discovery, line-windowed truncation, code-snippet injection), comment-driven verdict revision and finding retraction (with atomic race guards + Raven-authorship filter + auto-flip backstop + in-memory thread-root walk-up + same-thread dedupe), user-resolved findings dropped from carry-forward (BB DC threadResolved + state=RESOLVED, Gitea ≥1.24 resolver-field), two-tier prompt trust model (`<repo_policy>` for CLAUDE.md + rules at base ref vs `<untrusted_input>` for diff + comments), chunked-review consolidation pass that re-applies repo policy to aggregated findings, three-mode review engagement (`all` / `gap` / `advisory`), three-way review output channels (`both` / `summary` / `inline`), Claude subprocess tracking and graceful-shutdown termination, PR conversation context in reviews, repo-supplied rules injection, per-repo prompt overrides, both git providers, the AI backend interface (claude_cli + openai_compatible), backend auto-selection, and the full PR flow including CI gating.
 
 ## CI
 

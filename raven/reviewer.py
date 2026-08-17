@@ -13,6 +13,12 @@ from pathlib import Path
 from raven import metrics
 from raven.ai import get_backend, pricing
 from raven.ai.base import AIError
+from raven.severity import (
+    SCALE_PLACEHOLDER,
+    SeverityScale,
+    default_scale,
+    render_severity_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,8 +130,11 @@ def _load_respond_prompt() -> str:
 
 _RESPOND_PROMPT_TEMPLATE = _load_respond_prompt()
 
-SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
-_SEVERITY_NAME = {rank: name for name, rank in SEVERITY_ORDER.items()}
+# Back-compat aliases over the built-in scale. server.py and notifier.py
+# still import these; Phase B removes them once every consumer takes a
+# scale explicitly. Derived, not hand-written, so they cannot drift.
+_DEFAULT_SCALE = default_scale()
+SEVERITY_ORDER = dict(_DEFAULT_SCALE.ranks)
 
 # Per-PR finding cap. MIRRORS prompts/review.md ("Maximum 10 findings") —
 # tests/test_config_consistency.py pins the two together. Enforced in code
@@ -138,22 +147,56 @@ _SEVERITY_NAME = {rank: name for name, rank in SEVERITY_ORDER.items()}
 MAX_FINDINGS = 10
 
 
-def _coverage_gap_floor() -> str:
-    """Severity floor applied when chunks went unreviewed: one level
-    above the configured approve threshold (``REVIEW_APPROVE_MAX_SEVERITY``,
-    default ``low`` — the same env var server.py's approve decision
-    reads), capped at ``high``. Read at call time, not import time, so
-    it tracks operator config the same way server.py does.
+def _coverage_gap_floor(scale: SeverityScale | None = None) -> str:
+    """The severity floor for coverage-gap marker findings: the scale's
+    blocking tier (``blocks_at_or_above``), or its most severe tier when
+    nothing on the scale blocks.
 
-    Note the cap: with a threshold of ``high`` the floor is also
-    ``high``, which is still approvable — the floor alone cannot block
-    the merge there. That's why ``review_diff`` additionally sets
-    ``coverage_gap: True`` on the result; server.py's merge gates key
-    off the flag, the floor is for operator visibility.
+    Note: when the scale blocks nothing (``REVIEW_APPROVE_MAX_SEVERITY``
+    at the top tier) the floor is the most severe tier, which is still
+    approvable — the floor alone cannot block the merge there. That's why
+    ``review_diff`` additionally sets ``coverage_gap: True``; server.py's
+    merge gates key off the flag, the floor is for operator visibility.
     """
-    approve_sev = os.environ.get("REVIEW_APPROVE_MAX_SEVERITY", "low").lower()
-    rank = min(SEVERITY_ORDER.get(approve_sev, 0) + 1, SEVERITY_ORDER["high"])
-    return _SEVERITY_NAME[rank]
+    scale = scale or default_scale()
+    return scale.blocks_at_or_above or scale.most_severe
+
+
+def _coverage_gap_markers(
+    gap_files: list[str],
+    scale: SeverityScale | None = None,
+    messages: dict[str, str] | None = None,
+) -> list[dict]:
+    """⚠️ marker findings for files the model never saw.
+
+    Severity is floored at the blocking tier (``_coverage_gap_floor``) so
+    the gap is visible; the actual merge block comes from
+    ``coverage_gap: True`` on the result, not from this severity. No
+    ``line`` key — that keeps markers out of inline comments (see
+    ``_is_inline_postable``).
+
+    ``messages`` optionally supplies a specific per-file message (e.g.
+    ``review_diff``'s "skipped (too large: N lines)" / classified
+    failure-reason text for the file it names); a file without an entry
+    falls back to a generic "not reviewed" message.
+    """
+    scale = scale or default_scale()
+    floor = _coverage_gap_floor(scale)
+    messages = messages or {}
+    return [
+        {
+            "severity": floor,
+            "file": f,
+            "gap_marker": True,
+            "message": messages.get(f) or (
+                f"⚠️ `{f}` was not reviewed — it exceeded the size "
+                "limit or its review failed. Findings in it, if any, "
+                "were not seen."
+            ),
+        }
+        for f in gap_files
+    ]
+
 
 # Two delimited block families:
 #
@@ -493,14 +536,19 @@ _GROUNDING_TAIL_CARRIED_CARVEOUT = (
 
 # The one-line severity reminder always comes LAST so it is the final
 # instruction the model reads.
-_GROUNDING_TAIL_SEVERITY = (
-    " Set the top-level `severity` to the highest finding's severity, or "
-    "`low` when there are none."
-)
+def _grounding_tail_severity(scale: SeverityScale | None = None) -> str:
+    # Same `scale or default_scale()` guard as every other scale-aware
+    # helper. Without it, a caller relying on the default raises
+    # AttributeError: 'NoneType' object has no attribute 'least_severe'.
+    scale = scale or default_scale()
+    return (" Set the top-level `severity` to the highest finding's severity, "
+            f"or `{scale.least_severe}` when there are none.")
 
 
-def _grounding_tail_reminder(has_carried_findings: bool = False) -> str:
-    """Return the tail grounding+severity reminder for the single-chunk
+def _grounding_tail_reminder(has_carried_findings: bool = False,
+                              scale: SeverityScale | None = None,
+                              include_severity: bool = True) -> str:
+    """Return the tail grounding(+severity) reminder for the single-chunk
     review path (see the module constants).
 
     When ``has_carried_findings`` is True the prompt also holds the
@@ -510,15 +558,47 @@ def _grounding_tail_reminder(has_carried_findings: bool = False) -> str:
     carried findings on the wrong basis and bias the verdict toward
     approve. The severity reminder always stays last.
 
+    ``include_severity`` is False on the override path: an override means
+    an override, and Raven injects no severity instruction of any kind —
+    not even this grounding tail's severity sentence. That's costless:
+    since PR #209 Raven computes the top-level severity from the findings
+    and ignores what the model claims, so the sentence is already
+    vestigial for the gate.
+
     A thin builder so callers read intent at the assembly site and the
     text stays defined once; tests assert it lands after the diff marker
     in the fully assembled prompt.
     """
+    scale = scale or default_scale()
     parts = [_GROUNDING_TAIL_GROUND]
     if has_carried_findings:
         parts.append(_GROUNDING_TAIL_CARRIED_CARVEOUT)
-    parts.append(_GROUNDING_TAIL_SEVERITY)
+    if include_severity:
+        parts.append(_grounding_tail_severity(scale))
     return "".join(parts)
+
+
+def _apply_scale_to_template(template: str, scale: SeverityScale,
+                              is_override: bool) -> str:
+    """Fill the severity placeholder in a review-prompt template.
+
+    The built-in template always carries ``{{severity_scale}}`` and always
+    gets the rendered block — that is what keeps the prompt and the gate
+    reading the same object.
+
+    An override means an override: Raven injects nothing it did not ask
+    for. The placeholder is the opt-in escape hatch for an override author
+    who WANTS the rendered block instead of restating tier names (which
+    they would then have to keep in sync with severities.json by hand).
+    """
+    if SCALE_PLACEHOLDER in template:
+        return template.replace(SCALE_PLACEHOLDER, render_severity_block(scale))
+    if is_override:
+        return template
+    # Built-in template with no placeholder means someone edited
+    # prompts/review.md and removed it — append rather than silently ship a
+    # prompt with no severity vocabulary at all.
+    return template + "\n\n" + render_severity_block(scale)
 
 
 def _build_pr_context_section(pr_title: str, pr_description: str,
@@ -660,7 +740,7 @@ def review_config_hash() -> str:
     review_mode = os.environ.get("RAVEN_REVIEW_MODE", "").strip().lower() or "all"
     content = (
         f"{get_backend().name}:{RAVEN_AI_MODEL}:{RAVEN_AI_EFFORT}:"
-        f"{approve_max}:{review_mode}:{_REVIEW_PROMPT_TEMPLATE}"
+        f"{approve_max}:{review_mode}:{DIFF_HASH_SCHEME}:{_REVIEW_PROMPT_TEMPLATE}"
     )
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
@@ -919,6 +999,122 @@ def split_diff_by_file(diff: str) -> list[tuple[str, str]]:
     return chunks
 
 
+# Bump when the normalization below changes shape — it feeds
+# review_config_hash so a scheme change wipes the findings cache
+# deliberately (one logged full re-review) instead of silently
+# mismatching every cached per-file content hash.
+DIFF_HASH_SCHEME = "v1-content-only"
+
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def diff_hash_content(chunk: str) -> str:
+    """Reduce a per-file diff chunk to just its added/removed lines.
+
+    The chunk a rebase produces is not the chunk it replaced even when
+    the PR's own edits are byte-identical: ``@@`` hunk headers carry
+    absolute line numbers, ``index`` headers carry blob SHAs, and the
+    surrounding context lines move with the base branch. Hashing the raw
+    chunk therefore marks such a file as changed after a rebase, which
+    re-reviews it from scratch and re-posts findings the developer
+    already resolved (resolution is tracked per ``comment_id``, and a
+    regenerated finding has none).
+
+    Keeping only ``+``/``-`` bodies and the ``\\ No newline`` marker makes
+    the hash depend on what the PR actually changes. ``+++``/``---`` file
+    headers are excluded structurally: they precede the first ``@@``, and
+    nothing before that is kept.
+
+    This is the *re-review* question ("did the PR's own edits to this
+    file change?"), NOT the "is this literally the same diff?" question —
+    ``server`` keeps a raw chunk hash for the latter, because a cached
+    approve may only skip straight to a merge when nothing at all moved.
+    """
+    kept: list[str] = []
+    seen_hunk = False
+    for line in chunk.splitlines():
+        if line.startswith("@@"):
+            seen_hunk = True
+            continue
+        if seen_hunk and line[:1] in ("+", "-", "\\"):
+            kept.append(line)
+    if not seen_hunk:
+        # No hunks at all — a pure mode change, a pure rename, or a diff
+        # shape we don't model. "Just the +/- lines" is the empty string
+        # for every such chunk, which would make them all compare equal
+        # and skip re-review on a real edit. Fall back to the whole chunk
+        # minus the ``index`` line (blob SHAs, the one part a rebase
+        # rewrites on its own).
+        return "\n".join(l for l in chunk.splitlines()
+                         if not l.startswith("index "))
+    return "\n".join(kept)
+
+
+def diff_hash(chunk: str) -> str:
+    """Rebase-stable SHA256 of a per-file diff chunk."""
+    return hashlib.sha256(diff_hash_content(chunk).encode()).hexdigest()
+
+
+def hunk_context_digests(chunk: str) -> list[str]:
+    """Per-hunk SHA256 of the CONTEXT lines, in hunk order.
+
+    ``diff_hash`` ignores context on purpose, so that a rebase — which
+    moves the PR's edit without changing it — still reads as unchanged.
+    That same blindness cannot distinguish a rebase from the author
+    RELOCATING a byte-identical edit to a different part of the file, and
+    position is often what makes a line dangerous: the same statement is
+    inert in a dead branch and live on a hot path. Left undetected, the
+    relocated code is carried rather than re-reviewed and is never seen
+    in its new home.
+
+    Context content is the discriminator. A rebase whose base edits landed
+    elsewhere leaves the lines around this hunk byte-identical while their
+    absolute position moves; a relocation drops the same edit among
+    different lines. Positions are deliberately excluded from the digest,
+    so the rebase case still matches and stays tolerant.
+
+    A hunk with no context at all (a whole-file rewrite, or an edit at a
+    file boundary) digests to the empty marker and cannot be told apart
+    this way — the hunk-geometry checks in ``server._remap_carried_lines``
+    remain the only guard there.
+    """
+    out: list[str] = []
+    current: list[str] | None = None
+    for line in chunk.splitlines():
+        if line.startswith("@@"):
+            if current is not None:
+                out.append(hashlib.sha256("\n".join(current).encode()).hexdigest())
+            current = []
+            continue
+        # Context lines only: '+'/'-' bodies are already covered by
+        # diff_hash, and '\ No newline' is content, not surroundings.
+        if current is not None and line.startswith(" "):
+            current.append(line)
+    if current is not None:
+        out.append(hashlib.sha256("\n".join(current).encode()).hexdigest())
+    return out
+
+
+def hunk_positions(chunk: str) -> list[tuple[int, int]]:
+    """New-side ``(start, length)`` of every hunk in a per-file chunk.
+
+    ``diff_hash`` deliberately discards absolute positions, so a file can
+    be "unchanged" for re-review purposes while its findings' line
+    numbers have all shifted. These positions are what
+    ``server._remap_carried_lines`` uses to move a carried finding onto
+    the line its code actually occupies now.
+
+    A hunk header with no explicit length (``@@ -1 +1 @@``) means a
+    one-line range, per the unified-diff format.
+    """
+    out: list[tuple[int, int]] = []
+    for line in chunk.splitlines():
+        m = _HUNK_HEADER_RE.match(line)
+        if m:
+            out.append((int(m.group(1)), int(m.group(2) or 1)))
+    return out
+
+
 def review_diff(diff: str, repo_name: str, claude_md: str = "",
                 file_contents: dict[str, str] | None = None,
                 omitted_files: list[str] | None = None,
@@ -930,7 +1126,8 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
                 prompt_override: str | None = None,
                 is_incremental: bool = False,
                 unchanged_files: list[str] | None = None,
-                carried_findings: list[dict] | None = None) -> dict:
+                carried_findings: list[dict] | None = None,
+                scale: SeverityScale | None = None) -> dict:
     """Run claude CLI against the diff and return a structured review dict.
 
     For large diffs (> MAX_DIFF_LINES), splits by file and reviews each chunk
@@ -989,6 +1186,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
     Raises:
         RuntimeError if claude exits non-zero or output cannot be parsed.
     """
+    scale = scale or default_scale()
     clean_diff = _strip_lockfiles_and_binaries(diff)
     line_count = clean_diff.count("\n")
 
@@ -1001,6 +1199,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
             prompt_override=prompt_override,
             is_incremental=is_incremental, unchanged_files=unchanged_files,
             carried_findings=carried_findings,
+            scale=scale,
         )
         result["chunked"] = False
         result["chunks_reviewed"] = 1
@@ -1026,8 +1225,20 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
     )
 
     all_findings: list[dict] = []
-    max_severity = "low"
+    # Scale-relative, not the literal "low": on a scale without a "low"
+    # tier (e.g. nit/bug/blocker), scale.rank("low") fails CLOSED to
+    # most-severe (normalize()'s contract for unrecognised names), which
+    # made this accumulator start ABOVE every real severity a chunk could
+    # report — max_severity then never advanced past its seed value, so
+    # every chunked review on a custom scale silently reported the
+    # out-of-vocabulary literal "low" regardless of actual findings.
+    max_severity = scale.least_severe
     summaries: list[str] = []
+    # Union of the RAW offending severity names across every chunk (plus,
+    # below, the consolidation pass's own call) — each chunk runs its own
+    # _validate_review, and a name unknown to the scale in ONE chunk must
+    # still surface in the whole-PR result server.py renders.
+    unknown_severities: set[str] = set()
     # (filename, message) per unreviewed chunk — the filename is kept
     # structurally (not just inside the formatted message) so server.py
     # can clear a gap once that specific file changes and re-reviews.
@@ -1063,6 +1274,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
                 bot_user=bot_user, rules=rules,
                 prompt_override=prompt_override,
                 is_incremental=is_incremental, unchanged_files=unchanged_files,
+                scale=scale,
             )
             if result.get("_parse_error"):
                 return filename, None, f"`{filename}` review output could not be parsed"
@@ -1087,7 +1299,8 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
                 continue
             reviewed_count += 1
             all_findings.extend(chunk_result["findings"])
-            if SEVERITY_ORDER.get(chunk_result["severity"], 0) > SEVERITY_ORDER.get(max_severity, 0):
+            unknown_severities.update(chunk_result.get("unknown_severities") or [])
+            if scale.rank(chunk_result["severity"]) > scale.rank(max_severity):
                 max_severity = chunk_result["severity"]
             if chunk_result["summary"]:
                 summaries.append(f"`{filename}`: {chunk_result['summary']}")
@@ -1111,10 +1324,10 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
     #    and re-reviews cleanly (a bare bool would stick to the PR for
     #    its whole lifetime); filenames use the same diff-split keys as
     #    server.py's per-file hashes, so membership tests line up.
-    # 3. The final severity is floored one level above the configured
-    #    approve threshold (see ``_coverage_gap_floor``) so the review
-    #    still posts with its partial findings but doesn't read as
-    #    approvable. ``_parse_error`` is deliberately NOT used here:
+    # 3. The final severity is floored at the scale's blocking tier (see
+    #    ``_coverage_gap_floor``) so the review still posts with its
+    #    partial findings but doesn't read as approvable.
+    #    ``_parse_error`` is deliberately NOT used here:
     #    server.py treats it as "review unusable" and skips posting
     #    entirely, which would throw away the chunks that DID review fine.
     # Each marker carries its gap filename in 'file' (but no 'line':
@@ -1128,7 +1341,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
     # incremental pass: one gap event would pin the merged severity at
     # the marker's floor forever and re-post the stale marker on every
     # push, even after the oversized file was fixed.
-    floor_sev = _coverage_gap_floor()
+    floor_sev = _coverage_gap_floor(scale)
     # 'gap_marker': True identifies markers STRUCTURALLY — server.py's
     # carried-findings re-validation must exclude them from the model's
     # drop-or-keep set, and a shape heuristic (⚠️-prefix + no line)
@@ -1136,14 +1349,13 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
     # the findings cache; server._is_coverage_gap_marker checks it
     # first and falls back to the shape heuristic only for markers
     # cached before the flag existed.
-    error_findings = [
-        {"severity": floor_sev, "file": fn, "gap_marker": True, "message": f"⚠️ {msg}"}
-        for fn, msg in errors
-    ]
     gap_files = sorted({fn for fn, _ in errors})
+    error_findings = _coverage_gap_markers(
+        gap_files, scale, messages={fn: f"⚠️ {msg}" for fn, msg in errors},
+    )
 
     def _floor_severity(severity: str) -> str:
-        if errors and SEVERITY_ORDER.get(severity, 0) < SEVERITY_ORDER[floor_sev]:
+        if errors and scale.rank(severity) < scale.rank(floor_sev):
             return floor_sev
         return severity
 
@@ -1155,7 +1367,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
     if reviewed_count == 0 and file_chunks:
         logger.warning("All %d chunks failed for %s — flagging as parse error", len(file_chunks), repo_name)
         return {
-            "severity": "high",
+            "severity": scale.most_severe,
             "summary": "All review chunks failed — no files could be reviewed.",
             "findings": all_findings + error_findings,
             "chunked": True,
@@ -1163,6 +1375,9 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
             "_parse_error": True,
             "coverage_gap": bool(errors),
             "coverage_gap_files": gap_files,
+            "unknown_severities": sorted(unknown_severities),
+            "severity_scale_names": scale.ordered(),
+            "severity_blocks_at": scale.blocks_at_or_above,
         }
 
     # Consolidation pass — applies any whole-PR rules from the repo's
@@ -1184,6 +1399,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
         prompt_override=prompt_override,
         is_incremental=is_incremental,
         unchanged_files=unchanged_files,
+        scale=scale,
     )
     if consolidated is not None:
         # Re-filter the consolidation output. The consolidation pass is a
@@ -1207,7 +1423,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
         # When nothing is dropped, keep the consolidation AI's stated
         # severity (still floored), rather than silently replacing it.
         consolidated_severity = (
-            _recompute_severity(consolidated_findings)
+            _recompute_severity(consolidated_findings, scale)
             if len(consolidated_findings) != consolidated_before
             else consolidated["severity"]
         )
@@ -1220,6 +1436,11 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
             "consolidated": True,
             "coverage_gap": bool(errors),
             "coverage_gap_files": gap_files,
+            "unknown_severities": sorted(
+                unknown_severities | set(consolidated.get("unknown_severities") or [])
+            ),
+            "severity_scale_names": scale.ordered(),
+            "severity_blocks_at": scale.blocks_at_or_above,
         }
 
     # Consolidation was skipped (no rules, no CLAUDE.md), so the review
@@ -1230,7 +1451,7 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
     # repo's own rules govern and may legitimately raise or remove the cap.
     # Gap markers are appended AFTER the cap — the coverage-gap signal is
     # operator safety state and never competes with findings for cap space.
-    capped, n_dropped = _cap_findings(all_findings, repo_name)
+    capped, n_dropped = _cap_findings(all_findings, repo_name, scale=scale)
     summary = merged_summary or "Multi-file review completed."
     if n_dropped:
         # Disclose rather than silently shrink, mirroring the
@@ -1247,6 +1468,9 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
         "chunks_reviewed": reviewed_count,
         "coverage_gap": bool(errors),
         "coverage_gap_files": gap_files,
+        "unknown_severities": sorted(unknown_severities),
+        "severity_scale_names": scale.ordered(),
+        "severity_blocks_at": scale.blocks_at_or_above,
     }
 
 
@@ -1260,6 +1484,7 @@ def _consolidate_chunked_review(
     prompt_override: str | None = None,
     is_incremental: bool = False,
     unchanged_files: list[str] | None = None,
+    scale: SeverityScale | None = None,
 ) -> dict | None:
     """Apply repo-level review policy (rules + CLAUDE.md) to the
     aggregated findings from a chunked review.
@@ -1287,6 +1512,7 @@ def _consolidate_chunked_review(
         / parses to ``_parse_error``. Caller falls back to the raw
         merge on ``None``.
     """
+    scale = scale or default_scale()
     # No policy to apply → caller's raw merge is the right answer.
     if not rules and not claude_md:
         return None
@@ -1325,6 +1551,10 @@ def _consolidate_chunked_review(
     effective_template = (
         prompt_override if (prompt_override and prompt_override.strip())
         else _REVIEW_PROMPT_TEMPLATE
+    )
+    effective_template = _apply_scale_to_template(
+        effective_template, scale,
+        is_override=bool(prompt_override and prompt_override.strip()),
     )
 
     instructions = (
@@ -1390,7 +1620,7 @@ def _consolidate_chunked_review(
         return None
 
     _record_ai_usage(backend.name, RAVEN_AI_MODEL, repo_name, completion)
-    result = _parse_response(completion.text)
+    result = _parse_response(completion.text, repo_name, scale)
     if result.get("_parse_error"):
         logger.warning("Consolidation pass parse error for %s — falling back to raw merge",
                        repo_name)
@@ -1409,8 +1639,10 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
                           prompt_override: str | None = None,
                           is_incremental: bool = False,
                           unchanged_files: list[str] | None = None,
-                          carried_findings: list[dict] | None = None) -> dict:
+                          carried_findings: list[dict] | None = None,
+                          scale: SeverityScale | None = None) -> dict:
     """Review a single diff chunk with claude CLI."""
+    scale = scale or default_scale()
     file_context = f" (file: `{filename_hint}`)" if filename_hint else ""
 
     # User-controlled content (diff, CLAUDE.md, file contents, PR
@@ -1528,6 +1760,10 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
     # Pick effective prompt template: override (when non-empty) else the
     # module-level default.
     effective_template = prompt_override if (prompt_override and prompt_override.strip()) else _REVIEW_PROMPT_TEMPLATE
+    is_override = bool(prompt_override and prompt_override.strip())
+    effective_template = _apply_scale_to_template(
+        effective_template, scale, is_override=is_override,
+    )
     # Rules are placed AFTER the prompt template so they are the last
     # guidance the model reads before the diff. Together with the
     # "take precedence" header, this makes rules beat any conflicting
@@ -1539,9 +1775,14 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
     # are present (single-chunk incremental), the reminder carries a
     # carve-out so its "drop what you weren't shown" rule doesn't push the
     # model to over-drop carried findings whose unchanged-file code is
-    # intentionally not in the delta.
+    # intentionally not in the delta. On the override path the reminder
+    # drops its severity sentence too — an override means an override, and
+    # Raven injects no severity instruction of any kind (see
+    # _grounding_tail_reminder / _apply_scale_to_template).
     tail_reminder = _grounding_tail_reminder(
-        has_carried_findings=bool(carried_findings)
+        has_carried_findings=bool(carried_findings),
+        scale=scale,
+        include_severity=not is_override,
     )
     if effective_template:
         prompt = (
@@ -1585,7 +1826,7 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
         purpose="review",
     )
     _record_ai_usage(backend.name, RAVEN_AI_MODEL, repo_name, completion)
-    review = _parse_response(completion.text)
+    review = _parse_response(completion.text, repo_name, scale)
 
     # Evidence-grounding backstop. A FRESH finding whose ``file`` names
     # code that was never put in front of the model — not in this chunk's
@@ -1609,7 +1850,7 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
     # chunked path re-derives severity from surviving chunk findings;
     # the single-chunk path must do the same here.
     if len(review["findings"]) != before:
-        review["severity"] = _recompute_severity(review["findings"])
+        review["severity"] = _recompute_severity(review["findings"], scale)
     return review
 
 
@@ -1745,7 +1986,8 @@ def _drop_ungrounded_findings(
 
 
 def _cap_findings(findings: list[dict], repo_name: str,
-                  limit: int = MAX_FINDINGS) -> tuple[list[dict], int]:
+                  limit: int = MAX_FINDINGS,
+                  scale: SeverityScale | None = None) -> tuple[list[dict], int]:
     """Cap ``findings`` at ``limit``, keeping the highest severities.
 
     Returns ``(kept, dropped_count)``.
@@ -1767,13 +2009,24 @@ def _cap_findings(findings: list[dict], repo_name: str,
     Unknown/missing severities rank lowest, so a malformed finding is
     dropped before a well-formed high one.
     """
+    scale = scale or default_scale()
     if len(findings) <= limit:
         return findings, 0
 
+    # NOTE: deliberately NOT scale.rank() here. rank()/normalize() fail
+    # CLOSED (unknown -> most severe) for MODEL-EMITTED severities, where
+    # silently under-reacting to a malformed finding is the unsafe
+    # direction (see SeverityScale.normalize). Capping is the opposite
+    # case: an already-validated finding with a missing/unknown severity
+    # here is a malformed-data bug, and the safe direction is to drop it
+    # first, not let it crowd out a well-formed high finding for cap
+    # space. Falling back to the least-severe tier's rank reproduces the
+    # pre-scale behavior exactly (unknown tied with the bottom tier).
+    least_rank = scale.ranks[scale.least_severe]
     ranked = sorted(
         findings,
-        key=lambda f: SEVERITY_ORDER.get(
-            str(f.get("severity", "") or "").strip().lower(), 0),
+        key=lambda f: scale.ranks.get(
+            str(f.get("severity", "") or "").strip().lower(), least_rank),
         reverse=True,
     )
     kept = ranked[:limit]
@@ -1787,8 +2040,23 @@ def _cap_findings(findings: list[dict], repo_name: str,
     return kept, dropped
 
 
-def _recompute_severity(findings: list[dict]) -> str:
-    """Highest severity among ``findings`` (``low`` if none).
+def _recompute_severity(findings: list[dict],
+                        scale: SeverityScale | None = None) -> str:
+    """Highest severity among ``findings`` (the least severe tier if none
+    or none recognised).
+
+    Deliberately NOT scale.normalize() — same reasoning as
+    ``_cap_findings``, ``server._max_severity_from_findings``, and the
+    carried-candidates cap in ``server._process_pr``. ``normalize()``
+    fails CLOSED (unknown -> most severe) for model-emitted severities;
+    this reproduces the pre-scale
+    ``SEVERITY_ORDER.get(f.get("severity", "low"), 0)`` behaviour, where
+    an unrecognised or missing severity ranked LOWEST. The one deliberate
+    exception: names are stripped and lowercased before lookup (matching
+    ``_validate_review`` post-#211), so a whitespace/case variant of a
+    known name (e.g. ``"  HIGH  "``) still resolves to that tier instead
+    of being treated as unknown — reproducing the old un-normalized
+    lookup here would reintroduce the exact whitespace bug #211 fixed.
 
     Used to keep a review's top-level ``severity`` honest after the
     grounding filter drops findings — otherwise dropping the only high
@@ -1799,19 +2067,32 @@ def _recompute_severity(findings: list[dict]) -> str:
     provided set (diff/file_contents/omitted/unchanged, with a basename
     fallback), so it survives and still drives the recomputed value.
     """
-    rank = max((SEVERITY_ORDER.get(f.get("severity", "low"), 0)
-                for f in findings), default=0)
-    return _SEVERITY_NAME.get(rank, "low")
+    scale = scale or default_scale()
+    if not findings:
+        return scale.least_severe
+    least_rank = scale.ranks[scale.least_severe]
+    best = max(
+        (scale.ranks.get(
+            str(f.get("severity", "") or "").strip().lower(), least_rank)
+         for f in findings),
+        default=least_rank,
+    )
+    for name, rank in scale.ranks.items():
+        if rank == best:
+            return name
+    return scale.least_severe
 
 
-def _parse_response(output: str) -> dict:
+def _parse_response(output: str, repo_name: str = "",
+                    scale: SeverityScale | None = None) -> dict:
     """Extract and validate the JSON review from claude's output."""
+    scale = scale or default_scale()
     # Try markdown fence first
     json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", output, re.DOTALL)
     if json_match:
         try:
             data = json.loads(json_match.group(1))
-            return _validate_review(data)
+            return _validate_review(data, repo_name, scale)
         except json.JSONDecodeError:
             pass
 
@@ -1821,20 +2102,23 @@ def _parse_response(output: str) -> dict:
         if ch == '{':
             try:
                 data, _ = decoder.raw_decode(output, i)
-                return _validate_review(data)
+                return _validate_review(data, repo_name, scale)
             except json.JSONDecodeError:
                 continue
 
     logger.warning("No JSON found in claude output: %s", output[:300])
     return {
-        "severity": "high",
+        "severity": scale.most_severe,
         "summary": "Review could not be parsed from Claude output.",
         "findings": [],
         "_parse_error": True,
+        "severity_scale_names": scale.ordered(),
+        "severity_blocks_at": scale.blocks_at_or_above,
     }
 
 
-def _validate_review(data: dict) -> dict:
+def _validate_review(data: dict, repo_name: str = "",
+                     scale: SeverityScale | None = None) -> dict:
     """Normalise and validate a parsed review JSON object.
 
     Defensive against AI returning unexpected types — a model that emits
@@ -1843,33 +2127,120 @@ def _validate_review(data: dict) -> dict:
     cryptic ``AttributeError: 'str' object has no attribute 'get'``
     caught by the chunk-failure wrapper. Coerce non-list to empty list
     and skip non-dict entries so the parse-error path stays clean.
-    """
-    severity = str(data.get("severity", "low")).lower()
-    if severity not in SEVERITY_ORDER:
-        severity = "low"
 
+    **The top-level severity is DERIVED from the findings, not read from
+    the model.** It is what gates the merge — ``server.py`` compares it to
+    ``REVIEW_APPROVE_MAX_SEVERITY`` — so it must reflect the findings
+    actually reported. Reading the model's own value made the gate depend
+    on a number written *beside* the findings rather than computed from
+    them, and the two could disagree: a review listing a ``high`` finding
+    while stating ``"severity": "low"`` was approved and auto-merged. The
+    recomputes elsewhere (grounding-filter drops, carried-finding merges)
+    are both conditional and neither fires on a PR's first clean review.
+
+    The model is still asked for the field (``prompts/review.md``), and it
+    is still parsed — but only to compare against the derived value, so a
+    drifting model is measurable via ``raven_severity_mismatch_total``
+    rather than silent.
+    """
+    scale = scale or default_scale()
     findings_raw = data.get("findings") or []
     if not isinstance(findings_raw, list):
         findings_raw = []
     findings = []
+    unknown: list[str] = []
     for f in findings_raw:
         if not isinstance(f, dict):
             continue
-        sev = str(f.get("severity", "low")).lower()
-        if sev not in SEVERITY_ORDER:
-            sev = "low"
+        # Strip before the membership test: " Medium " is the known tier
+        # with formatting noise, not an unknown name. Without this,
+        # ordinary model whitespace would trip the fail-closed path below
+        # and start blocking merges on a formatting quirk.
+        sev = str(f.get("severity", "")).strip().lower()
+        if not scale.is_known(sev):
+            logger.warning(
+                "Unrecognised finding severity %r for %s — treating as %r (known: %s)",
+                sev, repo_name or "unknown", scale.most_severe,
+                ", ".join(scale.ordered()),
+            )
+            metrics.inc("raven_unknown_severity_total", {"repo": repo_name or "unknown"})
+            # Record the RAW offending name (already stripped/lowered)
+            # before it's overwritten below — this is the empirical
+            # signal server._format_comment reports to the operator, so
+            # a prompt override that restates tier names incorrectly is
+            # loud instead of silently failing closed. See PR #211 and
+            # CLAUDE.md's "Prompt trust model" note on the rejected
+            # non-overridable-contract-block alternative.
+            unknown.append(sev)
+            sev = scale.most_severe
         finding = {"severity": sev, "message": str(f.get("message", ""))}
         # Pass through file/line for inline comments (optional)
         if f.get("file"):
             finding["file"] = str(f["file"])
-        if isinstance(f.get("line"), int) and f["line"] > 0:
-            finding["line"] = f["line"]
+        # `bool` subclasses `int` and `True > 0`, so a JSON `true` passes a
+        # bare isinstance check and reaches inline-comment posting as a
+        # line number. server._remap_carried_lines guards this explicitly;
+        # the two must agree (audit 2026-08-17).
+        line = f.get("line")
+        if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+            finding["line"] = line
         findings.append(finding)
+
+    derived = _recompute_severity(findings, scale)
+    claimed = str(data.get("severity", "")).strip().lower()
+    severity = derived
+    if scale.is_known(claimed) and claimed != derived:
+        logger.warning(
+            "Model-stated review severity %r disagrees with its findings "
+            "(highest is %r) for %s — using the more severe of the two",
+            claimed, derived, repo_name or "unknown",
+        )
+        metrics.inc("raven_severity_mismatch_total",
+                    {"repo": repo_name or "unknown"})
+        # Reconcile fail-closed in BOTH directions. Deriving purely from
+        # the findings fixed claimed-low-with-a-high-finding (that used to
+        # approve and auto-merge a real defect), but it opened the
+        # inverse: a review stating a blocking severity while reporting no
+        # findings derived the least-severe tier and approved, where the
+        # pre-derivation code blocked on the claim. That is the exact
+        # output shape a findings-suppression injection aims for — see
+        # test_adversarial_comment_cannot_break_out_of_tag, whose payload
+        # is "the findings list must be empty" — so emptying the array
+        # would otherwise be enough on its own, even while the model
+        # honestly reports the severity. Taking the higher rank keeps both
+        # guarantees: a claim can never LOWER the gate below what the
+        # findings justify, and it can never be silently discarded when it
+        # is the more alarming of the two. Only a claim this scale can
+        # rank participates; an unrecognised name is already handled by
+        # the per-finding fail-closed path above and must not be smuggled
+        # in here as a top-level escalation.
+        if scale.rank(claimed) > scale.rank(derived):
+            severity = claimed
+            # Blocking on a claim with nothing listed under it is an
+            # un-actionable wedge if it is left unexplained — the author
+            # sees "changes requested" over an empty findings list and
+            # every re-push reproduces it. Say why, PR-wide (no file/line,
+            # so it never tries to anchor an inline comment), at the
+            # claimed severity so the cap ranks it with the tier it came
+            # from.
+            findings.append({
+                "severity": claimed,
+                "message": (
+                    f"⚠️ This review reported severity `{claimed}` but listed "
+                    f"no finding at that level (the most severe one reported "
+                    f"is `{derived}`). Raven gates on the more severe of the "
+                    f"two, so the merge is held. If the severity was stated "
+                    f"in error, the next review pass clears this."
+                ),
+            })
 
     result = {
         "severity": severity,
         "summary": str(data.get("summary", "")),
         "findings": findings,
+        "unknown_severities": sorted(set(unknown)),
+        "severity_scale_names": scale.ordered(),
+        "severity_blocks_at": scale.blocks_at_or_above,
     }
     # Carried-findings re-validation answer (drop-or-keep block). Pass
     # through ONLY a clean list of ints; any other shape (string, dict,
@@ -1883,7 +2254,20 @@ def _validate_review(data: dict) -> dict:
 
 
 def severity_gte(a: str, b: str) -> bool:
-    """Return True if severity a is >= severity b."""
+    """Return True if severity a is >= severity b, under the BUILT-IN
+    three-tier scale (``SEVERITY_ORDER``) only — this does not know about
+    a repo's configured ``SeverityScale``.
+
+    An unrecognised name on either side resolves to rank 0 ("low"), so an
+    unknown value compares as the LEAST severe / strictest threshold —
+    never silently the most permissive. That "unknown -> strictest"
+    contract is why ``notifier._passes_threshold`` calls this only for
+    the no-scale (legacy/cached review, or operator config with no repo
+    vocabulary to resolve against) case: a review carrying its own
+    ``severity_scale_names`` must never be compared here, since an
+    operator's tier name from one vocabulary would be silently matched
+    against ``SEVERITY_ORDER``'s ranks from another.
+    """
     return SEVERITY_ORDER.get(a, 0) >= SEVERITY_ORDER.get(b, 0)
 
 
