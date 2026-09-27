@@ -129,7 +129,7 @@ services:
   # ── Observability (opt-in) ──────────────────────────────────────────────
   # Only starts with:  docker compose --profile observability up -d
   # Plain `docker compose up -d` runs Raven alone (no profile = excluded).
-  # See observability/README.md and docs/superpowers/specs/2026-05-29-observability-stack-design.md
+  # See observability/README.md
   prometheus:
     image: prom/prometheus:v3.1.0
     container_name: raven-prometheus

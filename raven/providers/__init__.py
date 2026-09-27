@@ -251,6 +251,19 @@ class GitProvider(ABC):
         """
         return {}
 
+    def get_pr_diff_head_sha(self, repo: str, pr_number: int) -> str:
+        """The commit ``fetch_pr_diff`` currently describes.
+
+        Anything that binds a verdict to a head needs the head the DIFF
+        was computed from, which is not always the PR head the API
+        reports: Gitea's ``.diff`` reads ``refs/pull/N/head``, updated
+        asynchronously after a push, while its PR ``head.sha`` is the
+        branch tip — for a moment after a push they disagree. Default:
+        the PR head (true for BB DC, whose diff is computed from
+        ``fromRef.latestCommit``). Raises on fetch error.
+        """
+        return self.get_pr_head_sha(repo, pr_number)
+
     def get_resolved_comment_ids(self, repo: str, pr_number: int) -> set[int]:
         """Return the set of comment IDs the developer has marked
         resolved on this PR (via the platform UI's "Resolve thread" /

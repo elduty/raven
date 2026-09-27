@@ -4,8 +4,6 @@ Permanent metrics storage + a pre-built dashboard for Raven, as an opt-in
 Docker Compose profile. Prometheus scrapes Raven's `/metrics`, retains ~5
 years of history, and Grafana serves a provisioned dashboard.
 
-Design: [`docs/superpowers/specs/2026-05-29-observability-stack-design.md`](../docs/superpowers/specs/2026-05-29-observability-stack-design.md).
-
 ## Quick start
 
 ```bash

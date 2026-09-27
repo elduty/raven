@@ -84,6 +84,29 @@ class GiteaProvider(GitProvider):
             raise RuntimeError(f"Gitea returned empty head SHA for PR #{pr_number}")
         return sha
 
+    def get_pr_diff_head_sha(self, repo_full_name: str, pr_number: int) -> str:
+        """The commit ``refs/pull/N/head`` points at — what ``.diff`` reads.
+
+        Gitea updates that ref from a background task after a push, while
+        ``get_pr_head_sha`` (the PR's ``head.sha``) is the head branch tip,
+        so right after a push the two can differ. Raises if the ref is
+        missing. The refs endpoint may answer with a list of matching refs
+        or a single object; both are handled, matching the ref exactly.
+        """
+        owner, repo = _split_repo(repo_full_name)
+        want = f"refs/pull/{pr_number}/head"
+        url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/git/{want}"
+        resp = self.session.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        refs = data if isinstance(data, list) else [data]
+        for ref in refs:
+            if isinstance(ref, dict) and ref.get("ref") == want:
+                sha = (ref.get("object") or {}).get("sha", "")
+                if sha:
+                    return sha
+        raise RuntimeError(f"Gitea returned no {want} for PR #{pr_number}")
+
     def get_pr_base_ref(self, repo_full_name: str, pr_number: int) -> str:
         """Return the PR's base branch name. Raises if missing."""
         owner, repo = _split_repo(repo_full_name)

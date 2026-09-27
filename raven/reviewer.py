@@ -740,7 +740,8 @@ def review_config_hash() -> str:
     review_mode = os.environ.get("RAVEN_REVIEW_MODE", "").strip().lower() or "all"
     content = (
         f"{get_backend().name}:{RAVEN_AI_MODEL}:{RAVEN_AI_EFFORT}:"
-        f"{approve_max}:{review_mode}:{DIFF_HASH_SCHEME}:{_REVIEW_PROMPT_TEMPLATE}"
+        f"{approve_max}:{review_mode}:{DIFF_HASH_SCHEME}:"
+        f"{_VERDICT_LOGIC_VERSION}:{_REVIEW_PROMPT_TEMPLATE}"
     )
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
@@ -1004,6 +1005,30 @@ def split_diff_by_file(diff: str) -> list[tuple[str, str]]:
 # deliberately (one logged full re-review) instead of silently
 # mismatching every cached per-file content hash.
 DIFF_HASH_SCHEME = "v1-content-only"
+
+# Bump whenever a change alters HOW a verdict is reached, or what it was
+# computed from:
+#   * severity derivation and the approve gate;
+#   * what counts as reviewed (diff parsing and stripping, coverage gaps,
+#     the incremental delta, carried findings);
+#   * when a cached approve may merge (every _maybe_dispatch_cached_merge
+#     caller, the comment flow's revision/retraction path);
+#   * prompt construction and trust-boundary wrapping (_build_trust_preamble,
+#     _wrap_untrusted, _wrap_repo_policy, the scope/grounding sections) —
+#     built in code, so _REVIEW_PROMPT_TEMPLATE does not cover them, yet a
+#     hardening fix there changes the input every cached verdict came from.
+# It feeds review_config_hash, so the deploy wipes every cached verdict
+# instead of leaving ones computed by superseded code merge-actionable
+# through the cached-merge path: nothing in the config tuple moves when only
+# the code does (observed 2026-08-04, when 18 entries survived a
+# verdict-logic deploy).
+#
+# Use a token UNIQUE to the change — date plus a short slug, never a bare
+# date. Two branches that set the same value merge without a conflict (git
+# accepts an identical edit from both sides), and the second deploy would
+# then not wipe anything; distinct tokens make concurrent bumps conflict.
+# The server.py trigger sites carry a one-line pointer back here.
+_VERDICT_LOGIC_VERSION = "2026-09-27-rebase-retrigger-review"
 
 _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 

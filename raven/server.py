@@ -31,6 +31,25 @@ from .ai.base import AIError
 from .severity import SeverityScale, default_scale, from_json, InvalidScale
 
 
+class DiffHeadUnverifiedError(RuntimeError):
+    """The PR diff could not be shown to describe the head under review.
+
+    Gitea builds ``.diff`` from ``refs/pull/N/head``, which a background
+    task moves after a push, so for a while the diff can describe an
+    older commit than the PR head. Reviewing or merging on that pairing
+    would put one commit's verdict on another (audit 2026-09-27 #21).
+    """
+
+
+class HeadUnverifiedError(RuntimeError):
+    """The PR head could not be re-read before posting an APPROVE.
+
+    An approval has to name the commit it covers, and branch protection
+    may count a bot APPROVE, so nothing is posted or cached; the user
+    re-triggers the review instead.
+    """
+
+
 def _review_failure_reason(exc: Exception) -> str:
     """Classify an unhandled review exception into a failure reason.
 
@@ -39,6 +58,10 @@ def _review_failure_reason(exc: Exception) -> str:
     truncated/partial diff — too large for the platform's diff limit) maps
     to ``"diff_truncated"``. Anything else (a non-AI bug in the flow, an
     out-of-tree backend raising plain ``RuntimeError``) is ``"unknown"``.
+    A :class:`DiffHeadUnverifiedError` (the diff never came to describe
+    the head under review) is ``"diff_head_unverified"``.
+    A :class:`HeadUnverifiedError` (the head could not be re-read before
+    an APPROVE) is ``"head_unverified"``.
 
     ``DiffUnverifiableError`` is checked FIRST because it subclasses
     ``DiffTruncatedError`` — the two need different operator advice
@@ -48,6 +71,10 @@ def _review_failure_reason(exc: Exception) -> str:
     """
     if isinstance(exc, AIError):
         return exc.reason
+    if isinstance(exc, DiffHeadUnverifiedError):
+        return "diff_head_unverified"
+    if isinstance(exc, HeadUnverifiedError):
+        return "head_unverified"
     if isinstance(exc, DiffUnverifiableError):
         return "diff_unverifiable"
     if isinstance(exc, DiffTruncatedError):
@@ -108,6 +135,19 @@ _FAILURE_MESSAGES = {
         "with the PR: the Bitbucket instance needs to serve "
         "`/pull-requests/{id}/diff` as `application/json`. Splitting the PR "
         "will not help."
+    ),
+    "diff_head_unverified": (
+        "🔄 Raven could not get a diff of the latest commit: the git host "
+        "still served the diff of an older commit (or its head could not be "
+        "read) after waiting, so reviewing it could put one commit's verdict "
+        "on another. Nothing was reviewed or merged. Push a commit or "
+        "re-request the review to retry."
+    ),
+    "head_unverified": (
+        "🔁 Raven finished the review but could not confirm the PR's latest "
+        "commit before posting its approval, so it posted nothing: an "
+        "approval has to name the commit it covers. Push a commit or "
+        "re-request the review to retry."
     ),
     "unknown": (
         "⚠️ Internal error — review could not be completed. Check the service "
@@ -282,6 +322,15 @@ _recent_prs: dict[str, float] = {}
 _recent_prs_lock = threading.Lock()
 DEDUP_WINDOW = 30  # seconds
 
+# How long _process_pr waits for the PR diff to describe the head it is
+# about to review: Gitea moves refs/pull/N/head, which ``.diff`` reads, in a
+# background task after a push (see _await_diff_head).
+_DIFF_HEAD_POLLS = 30
+_DIFF_HEAD_POLL_INTERVAL = 1.0  # seconds
+# Tries for a single head read outside that wait (after the diff fetch, or
+# for a payload with no SHA): enough to ride out one API blip.
+_HEAD_READ_TRIES = 3
+
 # ── Per-PR reply circuit breaker ───────────────────────────────────── #
 # Backstop against unbounded comment-reply loops the bot-author name
 # heuristic misses (e.g. a second Raven, or an auto-responder under a
@@ -303,7 +352,8 @@ REPLY_BUDGET_WINDOW = 3600  # seconds (sliding 1-hour window)
 # running, both threads race on the findings cache, the submit_review
 # API, and the merge decision. _in_progress_prs tracks keys currently
 # being processed by _process_pr; a second concurrent review on the
-# same PR exits immediately.
+# same PR exits immediately and parks its payload in _rerun_requested, so
+# the running review re-runs it when it finishes (latest push wins).
 _in_progress_prs: set[str] = set()
 # Separate set for comment-driven mutations: gives push priority (push
 # webhooks check ONLY _in_progress_prs and never wait on a comment-flow)
@@ -313,6 +363,18 @@ _in_progress_prs: set[str] = set()
 # review).
 _comment_mutating_prs: set[str] = set()
 _in_progress_lock = threading.Lock()
+# A push that hits the in-progress guard is not dropped: its payload is
+# parked here (latest wins — three pushes during one review collapse into
+# one re-run of the newest) and _process_pr's finally resubmits it once the
+# running review ends. Without this the newer commit stayed unreviewed
+# until some later event, while the PR showed Raven's verdict on the older
+# head (audit 2026-09-27 #7). Guarded by _in_progress_lock, so a push can't
+# slip between "review finished" and "re-run scheduled".
+_rerun_requested: dict[str, tuple[GitProvider, dict]] = {}
+# The head each in-flight _process_pr run is reviewing. Lets the guard tell
+# a stale event for that head (a redelivery, an out-of-order delivery)
+# from a newer push, so the stale one can't displace the push it follows.
+_in_progress_heads: dict[str, str] = {}
 
 # ── Comment response history window ──────────────────────────────── #
 COMMENT_HISTORY = int(os.environ.get("RAVEN_COMMENT_HISTORY", "20"))
@@ -409,6 +471,13 @@ class CacheEntry:
     #     the comparison — the same degrade-to-previous-behaviour rule the
     #     two fields above follow.
     hunk_context: dict[str, list] = field(default_factory=dict)
+    # The raw chunks of a head the rebase-only shortcut recorded WITHOUT a
+    # review (hashes keeps the reviewed head's). A later trigger for that
+    # same head — a re-requested review, a reopen — is someone asking
+    # again, so it gets a full review instead of the shortcut; otherwise
+    # the head would stay unreviewed, and the comment flow unbound, until
+    # a content push. Every review write starts a fresh entry, clearing it.
+    unreviewed_hashes: dict[str, str] = field(default_factory=dict)
 
 
 def _entry_config_hash(scale: SeverityScale, prompt_override: str | None) -> str:
@@ -480,6 +549,7 @@ def _load_cache() -> None:
                             k: [str(h) for h in v]
                             for k, v in (entry.get("hunk_context") or {}).items()
                         },
+                        unreviewed_hashes=dict(entry.get("unreviewed_hashes") or {}),
                     )
                 except (KeyError, TypeError, ValueError, IndexError) as e:
                     logger.warning("Skipping malformed cache entry %s: %s", key, e)
@@ -1101,6 +1171,7 @@ def _approve_from_severity(severity: str, scale: SeverityScale) -> bool:
     an unrecognised value fails closed here exactly as it does in
     ``_validate_review`` (PR #211).
     """
+    # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
     return not scale.blocks(severity)
 
 
@@ -1109,7 +1180,9 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
                                  head_sha: str | None = None,
                                  current_hashes: dict[str, str] | None = None,
                                  expected_config_hash: str | None = None,
-                                 scale: SeverityScale | None = None) -> bool:
+                                 scale: SeverityScale | None = None,
+                                 source: str = "no_changes",
+                                 *, scale_fetch_failed: bool) -> bool:
     """Dispatch auto-merge from a CACHED approve verdict, without a fresh
     AI review pass. Returns True when a merge was dispatched to the
     CI-wait pool, False on any decline.
@@ -1127,6 +1200,15 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
     force-push head-SHA recheck still apply downstream. Gates, in order:
 
       * advisory mode never merges (matches both existing dispatch paths);
+      * ``scale_fetch_failed`` (keyword-only, no default: a caller that
+        forgot it would otherwise skip this gate silently) — the caller's
+        severities.json read failed,
+        so ``scale`` is a fallback (``default_scale()``, or a legacy-path
+        scale) standing in for the repo's real one. The config-hash gate
+        below can't catch that for an entry recorded under the same
+        fallback (the hashes agree), while the repo may by now gate on a
+        stricter scale, so it declines outright — the same fail-closed
+        call as the review path;
       * ``head_sha`` must be usable — when the caller supplies one it must
         predate the diff that produced ``current_hashes`` (the webhook
         payload SHA qualifies); when absent AND the helper is about to
@@ -1162,8 +1244,9 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
       * PR must be open (mirrors _process_comment's fail-closed state gate);
       * Raven must be the sole reviewer (shared ``_is_sole_reviewer`` gate).
 
-    Outcomes land in ``raven_cached_merge_dispatch_total{outcome,repo}``
-    as ``dispatched`` / ``declined_<reason>``.
+    Outcomes land in ``raven_cached_merge_dispatch_total{outcome,repo,source}``
+    as ``dispatched`` / ``declined_<reason>``; ``source`` names the caller
+    (``no_changes`` — the push-flow skip — or ``comment``).
 
     ``scale`` is the repo's resolved severity scale, used only to render
     the synthesized notify payload's ``severity`` field correctly for a
@@ -1175,9 +1258,11 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
     outside Task 14's assigned scope, fixed as part of it per team-lead
     ruling — same file, same shape).
     """
+    # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
     def _decline(reason: str) -> bool:
         inc("raven_cached_merge_dispatch_total",
-            {"outcome": f"declined_{reason}", "repo": repo_full_name})
+            {"outcome": f"declined_{reason}", "repo": repo_full_name,
+             "source": source})
         return False
 
     scale = scale or default_scale()
@@ -1187,6 +1272,11 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
         logger.info("PR #%d: advisory mode — cached merge dispatch does not apply",
                     pr_number)
         return _decline("advisory_mode")
+
+    if scale_fetch_failed:
+        logger.warning("PR #%d: severities.json could not be read — declining "
+                       "cached merge dispatch (fail-closed)", pr_number)
+        return _decline("scale_fetch_failed")
 
     if not head_sha or head_sha == "HEAD":
         if current_hashes is not None:
@@ -1207,17 +1297,26 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
             return _decline("no_head_sha")
 
     if current_hashes is None:
+        # The diff fetched here must describe head_sha, before and after the
+        # fetch — Gitea's diff ref lags the head after a push (09-27 #21).
+        if _diff_head_mismatch(provider, repo_full_name, pr_number,
+                               head_sha, "diff_ref_lag") is not None:
+            logger.info("PR #%d: diff does not describe head %s — declining "
+                        "cached merge dispatch (fail-closed)", pr_number, head_sha[:8])
+            return _decline("diff_head_unbound")
         try:
             clean_diff = _strip_lockfiles_and_binaries(
                 provider.fetch_pr_diff(repo_full_name, pr_number))
-            current_hashes = {
-                f: hashlib.sha256(c.encode()).hexdigest()
-                for f, c in split_diff_by_file(clean_diff)
-            }
+            current_hashes = _diff_chunk_hashes(clean_diff)
         except Exception as e:
             logger.warning("PR #%d: could not fetch diff for cached merge "
                            "dispatch: %s — declining (fail-closed)", pr_number, e)
             return _decline("diff_fetch_failed")
+        if _diff_head_mismatch(provider, repo_full_name, pr_number,
+                               head_sha, "head_moved") is not None:
+            logger.info("PR #%d: diff ref moved during the fetch — declining "
+                        "cached merge dispatch (fail-closed)", pr_number)
+            return _decline("diff_head_unbound")
 
     with _previous_diffs_lock:
         entry = _previous_diffs.get(pr_key)
@@ -1282,7 +1381,7 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
     logger.info("PR #%d: dispatching auto-merge from cached approve verdict "
                 "(head %s)", pr_number, head_sha[:8])
     inc("raven_cached_merge_dispatch_total",
-        {"outcome": "dispatched", "repo": repo_full_name})
+        {"outcome": "dispatched", "repo": repo_full_name, "source": source})
     fut = ci_wait_executor.submit(_safe_do_merge, provider, repo_full_name,
                                   pr_number, pr_title, pr_url, synthetic_review,
                                   head_sha, merge_strategy)
@@ -1405,6 +1504,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
     repo_full_name = None
     pr_number = None
     pr_key = None
+    posted_head = None   # the head this run posted a review for, if any
     try:
         repo_full_name = payload["repo"]
         pr_number = payload["pr_number"]
@@ -1419,11 +1519,22 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         pr_key = f"{provider.name}:{repo_full_name}#{pr_number}"
         with _in_progress_lock:
             if pr_key in _in_progress_prs:
-                logger.info("PR %s already being reviewed — skipping concurrent run", pr_key)
+                # Latest push wins — except that an event for the head
+                # already under review never displaces a parked NEWER head:
+                # it would be dropped as "just reviewed" and the newer push
+                # would never re-run.
+                parked = _rerun_requested.get(pr_key)
+                running = _in_progress_heads.get(pr_key)
+                if not (parked is not None and head_sha == running
+                        and parked[1].get("head_sha") != running):
+                    _rerun_requested[pr_key] = (provider, payload)
+                logger.info("PR %s already being reviewed — re-running for %s "
+                            "when it finishes", pr_key, head_sha[:8])
                 inc("raven_reviews_skipped_total", {"reason": "in_progress", "repo": repo_full_name})
                 pr_key = None  # don't clear the entry in finally
                 return
             _in_progress_prs.add(pr_key)
+            _in_progress_heads[pr_key] = head_sha
 
         # Auto-add Raven as a reviewer only when there are no other
         # reviewers or requested reviewers on the PR — the "fill the
@@ -1484,8 +1595,63 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                     inc("raven_reviews_skipped_total", {"reason": "not_reviewer", "repo": repo_full_name})
                     return
 
-        # Fetch diff
-        diff = provider.fetch_pr_diff(repo_full_name, pr_number)
+        # Fetch diff — only once it describes head_sha, and check it still
+        # did after the fetch. On Gitea the diff is built from a ref that
+        # lags the head for a moment after a push; paired with head B, a
+        # diff of A put A's verdict on B, and with a cached approve of A
+        # the no-changes skip merged B unreviewed (audit 2026-09-27 #21).
+        # A head that moved on is a newer push: park a re-run for it (its
+        # own event may never come — a bot author, a lost webhook) and stop
+        # without a failure; a re-run needs a real head change each time,
+        # so this can't spin. Anything else fails closed as a classified
+        # failure. A payload with no SHA is bound to the head read here.
+        # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
+        if head_sha == "HEAD":
+            read_head = None
+            for attempt in range(_HEAD_READ_TRIES):
+                if attempt:
+                    time.sleep(_DIFF_HEAD_POLL_INTERVAL)
+                try:
+                    read_head = provider.get_pr_head_sha(repo_full_name, pr_number)
+                except Exception as e:
+                    logger.warning("get_pr_head_sha for PR #%s failed: %s", pr_number, e)
+                    read_head = None
+                if isinstance(read_head, str) and read_head:
+                    break
+            if not (isinstance(read_head, str) and read_head):
+                raise DiffHeadUnverifiedError(f"PR #{pr_number}: no head SHA to bind the diff to")
+            head_sha = read_head
+            with _in_progress_lock:
+                _in_progress_heads[pr_key] = head_sha
+        unbound, moved_to = _await_diff_head(provider, repo_full_name, pr_number, head_sha)
+        if unbound is None:
+            diff = provider.fetch_pr_diff(repo_full_name, pr_number)
+            # A failed read is retried briefly; a mismatch never is — the
+            # diff may then describe either commit. A check that never ran
+            # counts as unverified.
+            unbound = "head_unknown"
+            for attempt in range(_HEAD_READ_TRIES):
+                if attempt:
+                    time.sleep(_DIFF_HEAD_POLL_INTERVAL)
+                unbound = _diff_head_mismatch(provider, repo_full_name, pr_number,
+                                              head_sha, "diff_ref_lag")
+                if unbound in (None, "diff_ref_lag"):
+                    break
+            if unbound is not None:
+                moved_to = _moved_head(provider, repo_full_name, pr_number, head_sha)
+                if moved_to is not None:
+                    unbound = "head_moved"
+        if unbound == "head_moved":
+            logger.info("PR #%s: head moved %s -> %s before its diff could be "
+                        "read — re-running for the new head",
+                        pr_number, head_sha[:8], moved_to[:8])
+            inc("raven_reviews_skipped_total",
+                {"reason": "head_moved", "repo": repo_full_name})
+            _park_rerun(pr_key, provider, payload, moved_to)
+            return
+        if unbound is not None:
+            raise DiffHeadUnverifiedError(
+                f"PR #{pr_number}: diff does not describe {head_sha[:8]} ({unbound})")
 
         # Fetch repo context — both CLAUDE.md and the .claude/rules/
         # directory (if either exist). Each is optional; any fetch
@@ -1532,8 +1698,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # skip and the cached-merge dispatch under it;
         # ``current_content_hashes`` is "did the PR's own edits to this
         # file change?" and picks the incremental delta.
-        current_hashes = {f: hashlib.sha256(c.encode()).hexdigest()
-                          for f, c in file_chunks.items()}
+        current_hashes = _diff_chunk_hashes(clean_diff)
         current_content_hashes = {f: diff_hash(c) for f, c in file_chunks.items()}
         current_hunks = {f: hunk_positions(c) for f, c in file_chunks.items()}
         current_hunk_context = {f: hunk_context_digests(c)
@@ -1599,7 +1764,15 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             # path to record a real hash and re-warm it, so it is refused
             # exactly like any other mismatch (see CacheEntry.config_hash's
             # and _maybe_dispatch_cached_merge's docstrings).
-            no_changes_scale = _fetch_severity_scale(provider, repo_full_name, base_ref)
+            no_changes_scale_fetch_failed = False
+
+            def _mark_no_changes_scale_fetch_failed() -> None:
+                nonlocal no_changes_scale_fetch_failed
+                no_changes_scale_fetch_failed = True
+
+            no_changes_scale = _fetch_severity_scale(
+                provider, repo_full_name, base_ref,
+                on_fetch_failed=_mark_no_changes_scale_fetch_failed)
             no_changes_override = _fetch_prompt_override(
                 provider, repo_full_name, base_ref, "review")
             _maybe_dispatch_cached_merge(
@@ -1607,7 +1780,8 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 pr_title, pr_url, head_sha=head_sha,
                 current_hashes=current_hashes,
                 expected_config_hash=_entry_config_hash(no_changes_scale, no_changes_override),
-                scale=no_changes_scale)
+                scale=no_changes_scale,
+                scale_fetch_failed=no_changes_scale_fetch_failed)
             return
 
         # Line remap for the files the rebase only slid around: content
@@ -1677,6 +1851,34 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             unchanged_files = sorted(set(current_hashes) - changed_files)
             review_diff_text = "".join(file_chunks[f] for f in sorted(changed_files))
             logger.info("PR #%d incremental review: %d/%d files changed", pr_number, len(changed_files), len(current_hashes))
+        elif (previous_hashes and cached is not None and cached.verdict == "approve"
+              and RAVEN_REVIEW_MODE != "advisory"):
+            # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
+            # An APPROVED PR whose diff moved without changing its own edits
+            # (a rebase or base merge) gets a full review of the rebased
+            # head. The shortcut below would leave the approve standing
+            # against a head no review saw (audit 2026-09-27 #6). Costs one
+            # review per rebase of an approved-but-unmerged PR, and
+            # regenerates its (non-blocking) findings, so resolutions on
+            # them are lost — and a blocking finding the author argued away
+            # through the comment flow can come back, as can an approve the
+            # comment flow granted. Advisory mode never merges, so it keeps
+            # the shortcut.
+            logger.info("PR #%d: approved PR rebased — full review of the new head",
+                        pr_number)
+            inc("raven_rebase_full_reviews_total",
+                {"repo": repo_full_name, "reason": "approved"})
+            review_diff_text = clean_diff
+        elif (previous_hashes and cached is not None
+              and cached.unreviewed_hashes == current_hashes):
+            # The shortcut below already skipped this exact head once; a
+            # second trigger for it is someone asking again. Review it —
+            # nothing else would until a content push.
+            logger.info("PR #%d: re-triggered on a rebased head the shortcut "
+                        "skipped — full review", pr_number)
+            inc("raven_rebase_full_reviews_total",
+                {"repo": repo_full_name, "reason": "retrigger"})
+            review_diff_text = clean_diff
         elif previous_hashes:
             # The diff moved but the PR's own edits did not — a rebase or
             # a merge from the base branch, nothing else. There is no new
@@ -1685,11 +1887,13 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             # resolutions (which match on comment_id). Record the new
             # positions, shift the carried findings onto them, and stop.
             #
-            # Deliberately NOT the no-changes skip above: that path can
-            # dispatch a cached approve straight to a merge, and this head
-            # is not the head that approval was computed on. Merging a
-            # rebased branch stays gated behind a real review — the next
-            # push takes the incremental path as usual.
+            # entry.hashes is deliberately NOT advanced: it means "the raw
+            # chunks of the head a review covered", and both the comment
+            # flow's binding and the cached merge rely on that. Writing the
+            # rebased hashes here let a comment flip approve and merge a
+            # head no review saw, even from needs_work (audit 2026-09-27
+            # #6). Positions and context are advanced so the next push
+            # remaps from the right place; the next content push reviews.
             logger.info(
                 "PR #%d: diff moved without changing the PR's own edits "
                 "(rebase or base merge) — no re-review, no merge dispatch",
@@ -1697,14 +1901,15 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             inc("raven_reviews_skipped_total",
                 {"reason": "rebase_only", "repo": repo_full_name})
             # The finding lines were already shifted above; record the new
-            # chunk identity so the next push diffs against this head.
+            # positions and context so the next push remaps from this head.
+            # entry.hashes keeps the reviewed head's raw chunks (see above).
             with _previous_diffs_lock:
                 live_entry = _previous_diffs.get(pr_key)
                 if live_entry is not None:
-                    live_entry.hashes = current_hashes
                     live_entry.content_hashes = current_content_hashes
                     live_entry.hunks = current_hunks
                     live_entry.hunk_context = current_hunk_context
+                    live_entry.unreviewed_hashes = current_hashes
             _save_cache()
             return
         else:
@@ -2048,6 +2253,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # _approve_from_severity) normalizes unknown names to the most
         # severe tier instead, failing closed like _validate_review
         # (PR #211).
+        # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
         approve = _approve_from_severity(review["severity"], scale)
         # Coverage gap forces needs_work: a formal APPROVE is externally
         # visible (branch protection counts bot approvals; humans trust
@@ -2142,6 +2348,44 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         advisory_kwargs = (
             {"comment_only": True} if RAVEN_REVIEW_MODE == "advisory" else {}
         )
+        # Never post APPROVE for a head that moved while this review ran:
+        # the verdict describes the code this run fetched, not the new
+        # commit. Park a re-run for the current head instead (it also
+        # replaces any parked webhook payload for the same push). A head
+        # that can't be re-read — an API error, or anything but a SHA —
+        # posts NOTHING: branch protection may count a bot APPROVE, which
+        # must never land on a head that may have moved, and a stand-in
+        # comment would still cache an approve that a later trigger merges.
+        # It parks nothing either (re-running on an API error could loop
+        # paid reviews); the classified failure comment asks for a
+        # re-trigger. The read itself is retried briefly first: the review
+        # is already paid for, and one API blip shouldn't discard it.
+        if approve and head_sha != "HEAD":
+            current_head = None
+            for attempt in range(_HEAD_READ_TRIES):
+                if attempt:
+                    time.sleep(_DIFF_HEAD_POLL_INTERVAL)
+                try:
+                    current_head = provider.get_pr_head_sha(repo_full_name, pr_number)
+                except Exception as e:
+                    logger.warning("PR #%d: could not re-check the head before "
+                                   "approving: %s", pr_number, e)
+                    current_head = None
+                if isinstance(current_head, str) and current_head:
+                    break
+            if not (isinstance(current_head, str) and current_head):
+                raise HeadUnverifiedError(
+                    f"PR #{pr_number}: head could not be re-read before approving")
+            if current_head != head_sha:
+                logger.info("PR #%d: head moved %s -> %s during the review — "
+                            "not posting; re-running for the new head",
+                            pr_number, head_sha[:8], current_head[:8])
+                inc("raven_reviews_skipped_total",
+                    {"reason": "head_moved", "repo": repo_full_name})
+                # Park for the CURRENT head — replacing, e.g., a stale event
+                # for this run's own head.
+                _park_rerun(pr_key, provider, payload, current_head)
+                return
         try:
             new_review = provider.submit_review(repo_full_name, pr_number, body,
                                                 approve=approve, inline_comments=inline_comments,
@@ -2153,6 +2397,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                    link=pr_url, action="review_submit_failed")
             inc("raven_errors_total", {"type": "review_submit_failed", "repo": repo_full_name})
             return
+        posted_head = head_sha
 
         # Resolve the platform threads of carried findings the model
         # dropped — mirrors _process_comment's AI-driven retraction.
@@ -2399,6 +2644,48 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         if pr_key is not None:
             with _in_progress_lock:
                 _in_progress_prs.discard(pr_key)
+                _in_progress_heads.pop(pr_key, None)
+                rerun = _rerun_requested.pop(pr_key, None)
+            # A parked event for the head this run just reviewed and posted
+            # (a re-requested review, a late redelivery) has nothing left to
+            # do; re-running it would take the no-changes skip and dispatch
+            # the merge a second time, whose failure alerts on a merged PR.
+            # Re-read the head for ANY parked event: delivery order is not
+            # push order (a redelivered older push can displace a newer one),
+            # so the re-run targets the current head. Drop it when the
+            # current head is the one this run just reviewed and posted — a
+            # re-run would only take the no-changes skip and dispatch the
+            # merge a second time, whose failure alerts on a merged PR. An
+            # unreadable head leaves the event as parked, unless the event
+            # is for the head just posted (same reason).
+            if rerun is not None:
+                try:
+                    current_head = provider.get_pr_head_sha(repo_full_name, pr_number)
+                except Exception:
+                    current_head = None
+                if isinstance(current_head, str) and current_head:
+                    if posted_head is not None and current_head == posted_head:
+                        logger.info("PR %s: the current head is the one just "
+                                    "reviewed (%s) — dropping the parked event "
+                                    "for %s", pr_key, posted_head[:8],
+                                    (rerun[1].get("head_sha") or "?")[:8])
+                        rerun = None
+                    elif rerun[1].get("head_sha") != current_head:
+                        rerun = (rerun[0], {**rerun[1], "head_sha": current_head})
+                elif (posted_head is not None
+                      and rerun[1].get("head_sha") == posted_head):
+                    rerun = None
+            if rerun is not None:
+                logger.info("PR %s: re-running review for a push that landed "
+                            "during the previous one", pr_key)
+                try:
+                    # _process_pr catches its own exceptions, like the webhook
+                    # submits. After shutdown the pool refuses new work; the
+                    # re-run is lost then, which is unavoidable, but it must
+                    # not escape this finally as an unhandled error.
+                    executor.submit(_process_pr, *rerun)
+                except RuntimeError as e:
+                    logger.warning("PR %s: not re-running (%s)", pr_key, e)
 
 
 # ------------------------------------------------------------------ #
@@ -2520,9 +2807,58 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # Fetch context (truncate diff to avoid token bloat on large PRs).
         # For diff comments on a specific file, bias the truncation so that
         # file's hunk is kept even when the rest of the diff doesn't fit.
+        #
+        # The head is pinned BEFORE the diff is fetched, and checked against
+        # the commit the diff is actually built from (below), so the pinned
+        # SHA is the head these hashes describe. Every state change below
+        # (retraction, verdict revision, merge) is bound to that one head:
+        # it proceeds only while the cached review's per-file hashes equal
+        # pinned_hashes. Without the binding, a push
+        # whose review failed or was dropped left the cache describing an
+        # older head, and an ordinary reply approved and merged code no
+        # review ever saw (audit 2026-09-27 #1).
+        #
+        # "The diff" is only as current as the ref it is built from: on
+        # Gitea that is refs/pull/N/head, which lags the head branch for a
+        # moment after a push. So the pin must also be the commit the diff
+        # describes, read on both sides of the fetch — otherwise a stale
+        # diff of the reviewed head A would bind a comment to head B.
+        # Why the head ends up unbound, when it does — one metric reason
+        # per cause, so API errors and the Gitea ref lag are visible apart
+        # from a genuinely unreviewed head.
+        unbound_reason: str | None = None
+        try:
+            pinned_head = provider.get_pr_head_sha(repo_full_name, pr_number) or None
+        except Exception as e:
+            logger.warning("get_pr_head_sha for PR #%s failed — reply only, "
+                           "no verdict or finding changes: %s", pr_number, e)
+            pinned_head = None
+        # The head as read, independent of whether the binding holds — the
+        # code snippet shows the PR head either way.
+        read_head = pinned_head
+        if pinned_head is None:
+            unbound_reason = "head_unknown"
+        else:
+            # Anything but the pinned SHA itself — a lagging ref, None, any
+            # non-SHA from a provider — fails closed.
+            unbound_reason = _diff_head_mismatch(
+                provider, repo_full_name, pr_number, pinned_head, "diff_ref_lag")
+            if unbound_reason is not None:
+                logger.info("PR #%s: diff does not describe head %s (%s) — reply "
+                            "only, no verdict or finding changes",
+                            pr_number, pinned_head[:8], unbound_reason)
+                pinned_head = None
         raw_diff = provider.fetch_pr_diff(repo_full_name, pr_number)
-        diff = _strip_lockfiles_and_binaries(raw_diff)
-        diff = _truncate_diff_for_comment(diff, file_path, line)
+        if pinned_head is not None:
+            # The ref matched before the fetch, so a change now is a push
+            # landing mid-fetch, not ref lag.
+            unbound_reason = _diff_head_mismatch(
+                provider, repo_full_name, pr_number, pinned_head, "head_moved")
+            if unbound_reason is not None:
+                pinned_head = None
+        clean_diff = _strip_lockfiles_and_binaries(raw_diff)
+        pinned_hashes = _diff_chunk_hashes(clean_diff)
+        diff = _truncate_diff_for_comment(clean_diff, file_path, line)
         # Fetch CLAUDE.md from the PR's BASE ref (matches _process_pr's
         # post-trust-tier behavior). CLAUDE.md is repo-policy content and
         # the reviewer renders it in the trusted ``<repo_policy_TAGID>``
@@ -2574,13 +2910,6 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             provider, repo_full_name, comment_base_ref,
             on_fetch_failed=_mark_comment_scale_fetch_failed,
             on_legacy_path=_note_comment_legacy_config_path)
-        # Fetch the PR head SHA up-front for the code-snippet block below.
-        try:
-            cmd_head_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
-        except Exception as e:
-            logger.debug("get_pr_head_sha for PR #%s snippet fetch failed (falling back to HEAD): %s",
-                         pr_number, e)
-            cmd_head_sha = "HEAD"
         claude_md = ""
         try:
             claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref=comment_base_ref)
@@ -2611,6 +2940,11 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         if cache_entry is not None:
             prior_verdict = cache_entry.verdict
             prior_body = cache_entry.summary
+        head_bound = (pinned_head is not None and cache_entry is not None
+                      and cache_entry.hashes == pinned_hashes)
+        if not head_bound and unbound_reason is None:
+            unbound_reason = ("no_cache_entry" if cache_entry is None
+                              else "head_not_reviewed")
 
         # For inline diff comments, fetch the FULL modified file (capped at
         # MAX_FILE_LINES, mirroring the review flow's _fetch_changed_files)
@@ -2633,9 +2967,8 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         context_fetch_failed = False
         if file_path and line > 0:
             try:
-                snippet_ref = cmd_head_sha
-                if snippet_ref == "HEAD":
-                    snippet_ref = provider.get_pr_head_sha(repo_full_name, pr_number)
+                snippet_ref = read_head or provider.get_pr_head_sha(
+                    repo_full_name, pr_number)
                 fetched = provider.fetch_file(repo_full_name, file_path, ref=snippet_ref)
                 code_snippet = _extract_code_snippet(fetched, line)
                 if fetched:
@@ -2659,14 +2992,15 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # Reuse the base ref already fetched above for CLAUDE.md when
         # available; only re-call if that initial fetch failed.
         respond_prompt_override = None
+        override_base_ref = comment_base_ref
         try:
-            base_ref = (
+            override_base_ref = (
                 comment_base_ref
                 if comment_base_ref != "HEAD"
                 else provider.get_pr_base_ref(repo_full_name, pr_number)
             )
             respond_prompt_override = _fetch_prompt_override(
-                provider, repo_full_name, base_ref, "respond",
+                provider, repo_full_name, override_base_ref, "respond",
                 on_legacy_path=_note_comment_legacy_config_path,
             )
         except Exception as e:
@@ -2730,6 +3064,12 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             body = f"\U0001f985 **Re: {location}**\n\n{response}"
         else:
             body = f"\U0001f985 {response}"
+        wants_change = bool(retract_findings) or (
+            revise is not None and revise.get("verdict") != prior_verdict)
+        if wants_change and not head_bound:
+            body += ("\n\n_No verdict or finding changes made: Raven's last "
+                     "review doesn't cover the latest commit. Push a commit "
+                     "or re-request review, and it will be re-evaluated._")
         legacy_lines = _legacy_config_path_lines(
             {"legacy_config_paths": comment_legacy_config_paths})
         if legacy_lines:
@@ -2742,6 +3082,15 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # ── Retraction + verdict revision + auto-merge dispatch ────── #
         # Skip if nothing to do.
         if revise is None and not retract_findings:
+            return
+        if not head_bound:
+            logger.info(
+                "PR #%s: cached review does not cover head %s (%s) — reply "
+                "only, no retraction / revision / merge", pr_number,
+                (pinned_head or "<unknown>")[:8], unbound_reason)
+            if wants_change:
+                inc("raven_comment_mutations_skipped_total",
+                    {"reason": unbound_reason, "repo": repo_full_name})
             return
 
         # Atomic race guard: mirrors _process_pr's pattern at
@@ -2770,18 +3119,28 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
 
         mutated_cache = False
         try:
-            # TOCTOU re-check: re-read prior_verdict from the cache under
-            # the guard. If it moved (because a concurrent _process_pr
-            # landed a fresh review while the AI was thinking), the AI's
-            # decision is on stale context — skip mutations.
+            # TOCTOU re-check: the entry the model reasoned about must still
+            # be the live one AND still cover the pinned head. Comparing the
+            # verdict string alone missed a concurrent review that landed
+            # with the same verdict for a different head: the stale
+            # decision was applied to it (audit 2026-09-27 #1). Identity
+            # catches a replacement (_process_pr's post-submit write builds
+            # a new CacheEntry); the hash comparison catches an in-place
+            # rewrite of the hashes (the rebase-only path); the verdict
+            # comparison catches an in-place revision by a concurrent
+            # comment flow that finished its AI call first.
             with _previous_diffs_lock:
                 current_entry = _previous_diffs.get(pr_key)
-            current_verdict = current_entry.verdict if current_entry else None
-            if current_verdict != prior_verdict:
-                logger.debug(
-                    "Cache verdict changed under us (%s -> %s) — skipping comment-driven mutations for %s",
-                    prior_verdict, current_verdict, pr_key,
-                )
+                still_bound = (current_entry is not None
+                               and current_entry is cache_entry
+                               and current_entry.hashes == pinned_hashes
+                               and current_entry.verdict == prior_verdict)
+            if not still_bound:
+                logger.info(
+                    "Cached review for %s changed during the AI call — "
+                    "skipping comment-driven mutations", pr_key)
+                inc("raven_comment_mutations_skipped_total",
+                    {"reason": "state_changed", "repo": repo_full_name})
                 return
 
             # Server-side defense in depth: the prompt instructs the AI
@@ -2879,7 +3238,6 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                     {"repo": repo_full_name, "result": "ok" if ok else "fail"})
                 if not ok:
                     continue
-                any_retraction_succeeded = True
                 # Drop matching cached finding so the next push-driven
                 # incremental review doesn't carry it forward and re-post
                 # it as a new inline comment, effectively undoing the
@@ -2897,6 +3255,13 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                             entry.findings[fname] = kept
                             entry.timestamp = time.time()  # mark recently active so LRU doesn't evict
                             mutated_cache = True
+                            # Only a retraction that removed a cached
+                            # FINDING counts toward the backstop and the
+                            # retraction-on-approve merge trigger below.
+                            # Resolving Raven's summary or a failure notice
+                            # is a platform action, not a verdict change
+                            # (audit 2026-09-27 #1).
+                            any_retraction_succeeded = True
                             logger.debug("Dropped retracted finding (comment_id=%s) from cache file %s",
                                          cid, fname)
                             break
@@ -2970,6 +3335,7 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                     )
                     revise = None
 
+            # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
             # Verdict revision (only when verdict actually changes).
             do_revision = revise is not None and revise.get("verdict") != prior_verdict
 
@@ -3008,29 +3374,28 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                     new_body = revise["body"]
 
             if do_revision:
-                # Pin the revised review to the current head_sha for
-                # force-push protection, same as _process_pr does at
-                # server.py:739. Fail closed if we can't fetch it —
-                # submitting with commit_id='' silently bypasses Gitea's
-                # force-push guard so a push between the AI call and now
-                # would land the revised verdict on un-inspected commits.
-                # Next push will re-trigger _process_pr and the verdict
-                # can be revised again from there.
+                # The revision is bound to the pinned head: re-check it is
+                # still the PR head right before submitting, and submit
+                # against it. A push during the AI call means the head the
+                # verdict would land on is not the head the cached review
+                # (and this reply) covered — skip, and let that push's own
+                # review decide. Fail closed if the head can't be read.
                 try:
-                    rev_head_sha = provider.get_pr_head_sha(repo_full_name, pr_number)
+                    current_head = provider.get_pr_head_sha(repo_full_name, pr_number)
                 except Exception as e:
                     logger.warning(
-                        "Could not fetch head_sha for revision on PR #%d: %s — "
-                        "skipping revision (fail-closed force-push protection)",
-                        pr_number, e,
-                    )
+                        "Could not re-check head_sha for revision on PR #%d: %s — "
+                        "skipping revision (fail-closed)", pr_number, e)
                     return
-                if not rev_head_sha:
-                    logger.warning(
-                        "Empty head_sha for revision on PR #%d — skipping (fail-closed)",
-                        pr_number,
-                    )
+                if current_head != pinned_head:
+                    logger.info(
+                        "PR #%d: head moved %s -> %s during the AI call — "
+                        "skipping revision", pr_number, (pinned_head or "")[:8],
+                        (current_head or "<none>")[:8])
+                    inc("raven_comment_mutations_skipped_total",
+                        {"reason": "head_moved", "repo": repo_full_name})
                     return
+                rev_head_sha = pinned_head
                 # Pass comment_only conditionally so out-of-tree providers
                 # running in all/gap mode never see the new kwarg.
                 advisory_kwargs = (
@@ -3070,15 +3435,20 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
 
                 # Update cache verdict + summary. Defensive .get() in case
                 # the entry was evicted between the prior read and now.
+                # Same binding as the TOCTOU re-check: a review that replaced
+                # the entry after it (even for the same head) must not have
+                # this comment's stale verdict written over it.
                 with _previous_diffs_lock:
                     existing = _previous_diffs.get(pr_key)
-                    if existing is not None:
+                    if (existing is not None and existing is cache_entry
+                            and existing.hashes == pinned_hashes):
                         existing.verdict = new_verdict
                         existing.summary = new_body
                         existing.timestamp = time.time()  # mark recently active for LRU
                         mutated_cache = True
                     else:
-                        logger.debug("Cache entry for %s evicted between read and write", pr_key)
+                        logger.info("Cache entry for %s changed or was evicted "
+                                    "before the revision write — not recorded", pr_key)
                 inc("raven_verdict_revisions_total",
                     {"repo": repo_full_name,
                      "from": prior_verdict or "none", "to": new_verdict})
@@ -3096,87 +3466,35 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                     or (prior_verdict == "approve" and new_verdict == "approve" and any_retraction_succeeded)
                 )
             )
-            # Same sole-reviewer gate as _process_pr: a comment-driven
-            # verdict flip must not auto-merge past a pending human
-            # reviewer. Checked only when the other conditions already
-            # hold, to avoid two provider calls on every comment.
-            if should_dispatch_merge and not _is_sole_reviewer(
-                    provider, repo_full_name, pr_number):
-                should_dispatch_merge = False
-            # Unreadable severities.json → the verdict above was computed
-            # under the built-in scale standing in for the repo's real
-            # one, which may be the looser of the two. Same fail-closed
-            # call as _process_pr's `if approve and scale_fetch_failed`.
-            # The revision itself still posts; only the merge is blocked,
-            # and the next push re-reviews with a fresh fetch.
-            if should_dispatch_merge and comment_scale_fetch_failed:
-                logger.warning(
-                    "PR #%d: severities.json could not be read — skipping "
-                    "comment-driven auto-merge (fail-closed; the repo's real "
-                    "merge gate is unknown for this pass)", pr_number)
-                should_dispatch_merge = False
-            # Sticky coverage-gap gate (same fail-closed style as
-            # _is_sole_reviewer): if the cached review state says parts
-            # of the diff were never reviewed (oversized/failed chunks),
-            # a comment-driven flip-to-approve or retraction must not
-            # auto-merge — the respond model never saw the unreviewed
-            # files either, so it can't validly clear the gap. The
-            # verdict revision itself still posts above; only the merge
-            # is blocked. Entry missing (evicted between the TOCTOU
-            # check and here) → gap state unverifiable → fail closed.
             if should_dispatch_merge:
-                if entry is None:
-                    logger.warning(
-                        "PR #%d: cache entry missing at merge dispatch — "
-                        "skipping auto-merge (fail-closed)", pr_number)
-                    should_dispatch_merge = False
-                elif entry.coverage_gap_files:
-                    logger.warning(
-                        "PR #%d: cached review has unreviewed files (%s) — "
-                        "skipping comment-driven auto-merge",
-                        pr_number, ", ".join(entry.coverage_gap_files))
-                    should_dispatch_merge = False
-            if should_dispatch_merge:
-                # Fail-closed on metadata fetch failure: dispatching with
-                # head_sha='' would defeat _do_merge's force-push
-                # protection.
-                try:
-                    head_sha = rev_head_sha if rev_head_sha else provider.get_pr_head_sha(
-                        repo_full_name, pr_number,
-                    )
-                except Exception as e:
-                    logger.warning("Could not fetch head_sha for auto-merge of PR #%d: %s — skipping dispatch",
-                                   pr_number, e)
-                    return
-                if not head_sha:
-                    return
+                # One gate set for every merge that reuses a cached verdict:
+                # _maybe_dispatch_cached_merge re-checks advisory mode, a
+                # failed severities.json read (the verdict above was then
+                # computed under a fallback scale that may be looser than
+                # the repo's real one; the revision still posts, only the
+                # merge is declined), the entry and its verdict, the
+                # coverage gap, that the cached hashes describe the pinned
+                # head's diff, the per-entry
+                # review-config hash, PR state and sole reviewer — then
+                # dispatches the same _safe_do_merge (CI wait + head
+                # recheck). The comment path used to carry its own partial
+                # copy of these gates, without the hash or config checks
+                # (audit 2026-09-27 #1).
                 try:
                     meta = provider.get_pr_metadata(repo_full_name, pr_number)
                 except Exception as e:
                     logger.debug("get_pr_metadata for PR #%d failed: %s", pr_number, e)
                     meta = {}
-                pr_title = meta.get("title") or f"PR #{pr_number}"
-                pr_url = meta.get("html_url") or ""
-                merge_strategy = os.environ.get("MERGE_STRATEGY", "squash")
-                # Synthesize a review dict reflecting residual cache state.
-                # entry + remaining_findings were already computed above
-                # before submit_review (single source of truth).
-                synthetic_review = {
-                    "approve": True,
-                    "severity": _max_severity_from_findings(remaining_findings, comment_scale),
-                    "summary": new_body,
-                    "findings": remaining_findings,
-                    "severity_scale_names": comment_scale.ordered(),
-                    "severity_blocks_at": comment_scale.blocks_at_or_above,
-                }
-                fut = ci_wait_executor.submit(
-                    _safe_do_merge, provider, repo_full_name, pr_number,
-                    pr_title, pr_url, synthetic_review,
-                    head_sha, merge_strategy,
-                )
-                fut.add_done_callback(
-                    functools.partial(_log_future_exception, repo=repo_full_name),
-                )
+                review_override = _fetch_prompt_override(
+                    provider, repo_full_name, override_base_ref, "review")
+                _maybe_dispatch_cached_merge(
+                    provider, repo_full_name, pr_number,
+                    meta.get("title") or f"PR #{pr_number}",
+                    meta.get("html_url") or "",
+                    head_sha=pinned_head, current_hashes=pinned_hashes,
+                    expected_config_hash=_entry_config_hash(comment_scale, review_override),
+                    scale=comment_scale, source="comment",
+                    scale_fetch_failed=comment_scale_fetch_failed)
         finally:
             # ``_save_cache()`` catches all exceptions internally (disk
             # full / permission denied are WARNING-logged + counted via
@@ -3405,6 +3723,84 @@ def _wait_for_ci(provider: GitProvider, repo_full_name: str, sha: str, timeout: 
 # ------------------------------------------------------------------ #
 #  Helpers                                                            #
 # ------------------------------------------------------------------ #
+
+def _diff_head_mismatch(provider: GitProvider, repo_full_name: str,
+                        pr_number: int, pinned_head: str,
+                        mismatch_reason: str) -> str | None:
+    """Why the PR diff can't be bound to ``pinned_head``, or None when it can.
+
+    ``mismatch_reason`` names a real SHA that isn't the pin; a read that
+    fails or returns no SHA at all is ``head_unknown`` / ``diff_head_unknown``
+    instead, so an API or provider fault never shows up as ref lag or a push.
+    """
+    try:
+        diff_head = provider.get_pr_diff_head_sha(repo_full_name, pr_number)
+    except Exception as e:
+        logger.warning("get_pr_diff_head_sha for PR #%s failed: %s", pr_number, e)
+        return "head_unknown"
+    if not isinstance(diff_head, str) or not diff_head:
+        return "diff_head_unknown"
+    return None if diff_head == pinned_head else mismatch_reason
+
+
+def _moved_head(provider: GitProvider, repo_full_name: str, pr_number: int,
+                head_sha: str) -> str | None:
+    """The PR head, when it is a real SHA other than ``head_sha``; else None."""
+    try:
+        current = provider.get_pr_head_sha(repo_full_name, pr_number)
+    except Exception as e:
+        logger.debug("get_pr_head_sha for PR #%s failed: %s", pr_number, e)
+        return None
+    if isinstance(current, str) and current and current != head_sha:
+        return current
+    return None
+
+
+def _await_diff_head(provider: GitProvider, repo_full_name: str,
+                     pr_number: int, head_sha: str) -> tuple[str | None, str | None]:
+    """Wait until the PR diff describes ``head_sha``.
+
+    Returns ``(None, None)`` once it does, and ``("head_moved", new_head)``
+    as soon as the PR head itself has moved on. Otherwise it keeps polling
+    — a read fault is retried like a lagging ref — for up to
+    ``_DIFF_HEAD_POLLS`` reads and about as many seconds, then returns the
+    last reason (``diff_ref_lag`` / ``head_unknown`` / ``diff_head_unknown``,
+    see ``_diff_head_mismatch``) with None.
+    """
+    deadline = time.monotonic() + _DIFF_HEAD_POLLS * _DIFF_HEAD_POLL_INTERVAL
+    reason: str | None = None
+    for attempt in range(_DIFF_HEAD_POLLS):
+        reason = _diff_head_mismatch(provider, repo_full_name, pr_number,
+                                     head_sha, "diff_ref_lag")
+        if reason is None:
+            return None, None
+        moved = _moved_head(provider, repo_full_name, pr_number, head_sha)
+        if moved is not None:
+            return "head_moved", moved
+        if attempt == _DIFF_HEAD_POLLS - 1 or time.monotonic() >= deadline:
+            break
+        time.sleep(_DIFF_HEAD_POLL_INTERVAL)
+    return reason, None
+
+
+def _park_rerun(pr_key: str, provider: GitProvider, payload: dict, head: str) -> None:
+    """Park a re-run of ``payload`` for ``head``, started when the review
+    in progress ends. A webhook already parked for that same head is kept
+    (it carries its own title/base_ref); one for any other head is replaced."""
+    with _in_progress_lock:
+        parked = _rerun_requested.get(pr_key)
+        if parked is None or parked[1].get("head_sha") != head:
+            _rerun_requested[pr_key] = (provider, {**payload, "head_sha": head})
+
+
+def _diff_chunk_hashes(clean_diff: str) -> dict[str, str]:
+    """Per-file SHA256 of the raw stripped-diff chunks: the "is this
+    literally the same diff?" identity ``CacheEntry.hashes`` records.
+    One definition shared by every path that compares against it, so the
+    push flow, the cached-merge gate and the comment flow can't drift."""
+    return {f: hashlib.sha256(c.encode()).hexdigest()
+            for f, c in split_diff_by_file(clean_diff)}
+
 
 def _findings_by_file(findings: list[dict], filenames: set[str]) -> dict[str, list[dict]]:
     """Group findings by their 'file' key. File-less findings go under key ''."""
@@ -3914,8 +4310,9 @@ def _fetch_severity_scale(provider: GitProvider, repo_full_name: str,
     refusing to review — unlike a missing file, which is silently and
     correctly the default scale. Keyword-only and optional so every
     existing caller (and every test that calls or mocks this function
-    positionally / by return value) is unaffected; only ``_process_pr``'s
-    fresh-review call site wires it up. See CLAUDE.md "Severity scale".
+    positionally / by return value) is unaffected. ``_process_pr``'s
+    review path and no-changes skip and ``_process_comment`` all wire it
+    up. See CLAUDE.md "Severity scale".
 
     ``on_legacy_path`` — see ``_fetch_repo_config_file``.
 

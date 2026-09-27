@@ -56,3 +56,12 @@ def test_retract_finding_default_returns_false():
 def test_get_pr_metadata_default_returns_empty_dict():
     """Caller falls back to title='PR #N' and empty URL."""
     assert _MinimalProvider().get_pr_metadata("u/r", 1) == {}
+
+
+def test_get_pr_diff_head_sha_default_is_the_pr_head():
+    """Default: the diff describes the PR head (true for BB DC, which
+    computes the diff from fromRef.latestCommit). Providers whose diff
+    endpoint reads a separately-updated ref override it."""
+    class _P(_MinimalProvider):
+        def get_pr_head_sha(self, r, p): return "headsha"
+    assert _P().get_pr_diff_head_sha("u/r", 1) == "headsha"

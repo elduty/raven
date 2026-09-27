@@ -51,6 +51,35 @@ class TestSplitRepo:
 #  Diff fetching                                                      #
 # ------------------------------------------------------------------ #
 
+class TestGetPrDiffHeadSha:
+    """Gitea's .diff endpoint reads refs/pull/N/head, which Gitea updates
+    asynchronously after a push, while the PR API's head.sha is the head
+    BRANCH tip. The diff can therefore lag the head for a moment; this is
+    the commit the diff actually describes."""
+
+    def test_reads_the_pull_ref_list_form(self, client):
+        with _mock_get(client, json_data=[
+                {"ref": "refs/pull/42/head", "object": {"sha": "diffsha", "type": "commit"}}]):
+            assert client.get_pr_diff_head_sha("owner/repo", 42) == "diffsha"
+
+    def test_reads_the_pull_ref_object_form(self, client):
+        with _mock_get(client, json_data={"ref": "refs/pull/42/head",
+                                          "object": {"sha": "diffsha"}}):
+            assert client.get_pr_diff_head_sha("owner/repo", 42) == "diffsha"
+
+    def test_url_is_the_pull_head_ref(self, client):
+        with _mock_get(client, json_data=[
+                {"ref": "refs/pull/42/head", "object": {"sha": "x"}}]) as mock_get:
+            client.get_pr_diff_head_sha("owner/repo", 42)
+        assert mock_get.call_args[0][0].endswith("/api/v1/repos/owner/repo/git/refs/pull/42/head")
+
+    def test_ignores_a_different_ref_and_raises_when_missing(self, client):
+        with _mock_get(client, json_data=[
+                {"ref": "refs/pull/420/head", "object": {"sha": "other"}}]):
+            with pytest.raises(RuntimeError, match="refs/pull/42/head"):
+                client.get_pr_diff_head_sha("owner/repo", 42)
+
+
 class TestGetPrHeadSha:
     def test_returns_sha(self, client):
         with _mock_get(client, json_data={"head": {"sha": "abc123"}}):

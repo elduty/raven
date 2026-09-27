@@ -2,6 +2,43 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## v0.6.2 — 2026-09-27
+
+Patch release. It closes several ways a pull request could be auto-merged at a commit no review had covered. None of them needed anyone to act in bad faith, only ordinary timing: a push landing mid-review, a rebase, a comment reply to an older review, or a git host briefly serving the previous diff. Upgrading wipes the findings cache once (see Upgrading).
+
+### Fixed
+
+- **Comment replies change a verdict only for the commit the last review covered.** Retracting findings, revising the verdict and merging from a comment now happen only while Raven's last review describes the PR's current head. If a later push was never reviewed (its review failed or was skipped), the reply says so and changes nothing. Push a commit or re-request the review. A merge triggered by a comment now passes the same checks as any merge from a cached approval: the cached review must match the current diff exactly, and the severity scale and prompt override it was recorded under must match the ones Raven reads now. Known limitations remain on this path when Raven can't read the repo's severity scale or prompt override. They are tracked for a later release.
+- **A push that lands during a review is no longer dropped.** It is re-run when the review ends, for whatever the head is at that point. A review never posts an approval for a head that moved while it ran. If the head can't be confirmed before approving, Raven posts nothing and asks for a re-trigger, rather than posting an approval that may name the wrong commit.
+- **A rebase no longer carries an old approval onto an unreviewed commit.** When an approved PR is rebased, the new head gets a full review before it can merge. A rebase of a PR that isn't approved still skips the review, so resolved threads survive, and re-requesting the review then reviews the rebased head.
+- **Reviews and merges wait for Gitea's diff to catch up with a push.** Gitea builds a PR's diff from a ref it updates shortly after each push. Raven could pair the new head with the previous commit's diff, and with a standing approval merge the new commit unreviewed. Raven now waits (up to about 30 seconds) until the diff describes the head it is working on. If a newer push arrives, it re-runs for that; otherwise it fails the review with a comment explaining why.
+- **A `severities.json` that can't be read now blocks merges from a cached approval.** Before, a failed read fell back to the built-in scale, and a cached approval recorded under that same scale still matched and could merge. It now declines, as a fresh review already did.
+- **The findings cache now resets when Raven's own verdict logic changes**, not only when its configuration does. Before, cached approvals computed by the previous release's logic stayed able to merge after an upgrade.
+
+### Changed
+
+- **An approved PR costs one review per rebase until it merges.** That review re-judges the PR from scratch, so it can regenerate non-blocking findings (their threads start unresolved again), or bring back a blocking finding that had been argued away in the comments. On Bitbucket DC with an "all comments resolved" merge check, those unresolved threads block the merge the review just approved. This happens again on every rebase, which means every base advance if a branch rule keeps PRs up to date. Resolving the threads does not by itself trigger the merge: once they are resolved, re-request Raven's review and it merges from the cached approval.
+- New failure comments: `diff_head_unverified` (the diff never came to describe the head) and `head_unverified` (the head couldn't be confirmed before approving). Each names the cause and asks for a re-trigger.
+
+### Added
+
+- Metrics:
+  - `raven_comment_mutations_skipped_total{reason,repo}`;
+  - `raven_rebase_full_reviews_total{repo,reason}`;
+  - `raven_review_failures_total` reasons `diff_head_unverified` and `head_unverified`;
+  - `raven_reviews_skipped_total` reason `head_moved`;
+  - `raven_cached_merge_dispatch_total` outcomes `declined_scale_fetch_failed` and `declined_diff_head_unbound`.
+
+### Upgrading
+
+**Nothing to configure.** The first start after the upgrade discards the findings cache, so each open PR gets one full review on its next push or review request. Findings from that review are posted fresh, so earlier resolutions don't carry over. On Bitbucket DC with an "all comments resolved" merge check, an approved PR then won't auto-merge. Resolve its fresh threads and re-request Raven's review.
+
+Raven still requires a single gunicorn worker (`--workers 1`). The re-run queue added here is process-local, like the rest of its state.
+
+### Stats
+
+1468 tests across 19 test files (up from 1386 at v0.6.1).
+
 ## v0.6.1 — 2026-08-17
 
 Housekeeping release. Raven's per-repo configuration moves out of `.claude/`, where every other agent working in a repo was loading it into context. No new features, and existing repos keep working untouched — but **read the Breaking section before deploying if you set `RAVEN_RULES_DIR=""`**: that variable no longer suppresses repo-supplied prompt overrides and severity scales on its own.

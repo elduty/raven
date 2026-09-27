@@ -47,6 +47,18 @@ def _inline_ci_wait_executor():
         _server_mod.ci_wait_executor = original
 
 
+@pytest.fixture(autouse=True)
+def _clear_parked_reruns():
+    """A parked re-run (a push that hit the in-progress guard) is resubmitted
+    to the real review pool when its PR's review finishes; one left behind
+    by a test would run in the background under a later test."""
+    _server_mod._rerun_requested.clear()
+    _server_mod._in_progress_heads.clear()
+    yield
+    _server_mod._rerun_requested.clear()
+    _server_mod._in_progress_heads.clear()
+
+
 @pytest.fixture()
 def app():
     _providers.clear()
@@ -427,6 +439,8 @@ class TestProcessPr:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
+        mc.get_pr_head_sha.return_value = "abc123"  # the payload head
         mc.name = "gitea"
         return mc
 
@@ -896,6 +910,9 @@ class TestProcessPr:
             mock_review.return_value = {"severity": "low", "summary": "Clean", "findings": []}
             _process_pr(mc, self._normalized_payload())
         mc.merge_pr.assert_not_called()
+        # The approve was posted: the reviewer gate, not an earlier failure,
+        # is what kept the merge back.
+        assert mc.submit_review.call_args.kwargs["approve"] is True
 
     def test_not_merged_when_reviewer_requested(self):
         mc = self._make_provider()
@@ -913,6 +930,9 @@ class TestProcessPr:
             mock_review.return_value = {"severity": "low", "summary": "Clean", "findings": []}
             _process_pr(mc, self._normalized_payload())
         mc.merge_pr.assert_not_called()
+        # The approve was posted: the reviewer gate, not an earlier failure,
+        # is what kept the merge back.
+        assert mc.submit_review.call_args.kwargs["approve"] is True
 
     def test_merged_when_only_raven_in_requested_reviewers(self):
         """Regression guard: when Raven auto-adds itself or a human
@@ -1202,7 +1222,9 @@ class TestProcessPr:
     def test_concurrent_process_pr_same_pr_skipped(self):
         """If one thread is already reviewing a PR and a second _process_pr
         fires for the same PR, the second exits without fetching a diff or
-        calling review_diff — prevents cache races and duplicate reviews."""
+        calling review_diff — prevents cache races and duplicate reviews —
+        but parks its payload so the running review re-runs it afterwards
+        (a dropped push stayed unreviewed; audit 2026-09-27 #7)."""
         import raven.server as _srv
         _srv._in_progress_prs.add("gitea:owner/repo#42")
         mc = self._make_provider()
@@ -1213,6 +1235,8 @@ class TestProcessPr:
         mc.add_self_as_reviewer.assert_not_called()
         mc.fetch_pr_diff.assert_not_called()
         mc.submit_review.assert_not_called()
+        parked = _srv._rerun_requested["gitea:owner/repo#42"]
+        assert parked[0] is mc and parked[1]["head_sha"] == "abc123"
 
     def test_in_progress_guard_cleared_after_normal_flow(self):
         """Normal completion clears the in-progress key so a later push
@@ -1388,6 +1412,7 @@ class TestClassifiedFailureComment:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
@@ -1572,6 +1597,7 @@ class TestClassifiedFailureLogNoise:
 
     def _pr_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
@@ -1599,6 +1625,7 @@ class TestClassifiedFailureLogNoise:
         from raven.metrics import _counters
         _counters.clear()
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.return_value = ""
@@ -1948,6 +1975,8 @@ class TestCiWaitDispatch:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
+        mc.get_pr_head_sha.return_value = "abc123"  # the payload head
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/x.py b/x.py\n+line\n"
         mc.fetch_file.return_value = ""
@@ -2077,6 +2106,8 @@ class TestProcessPrAdvisoryMode:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
+        mc.get_pr_head_sha.return_value = "abc123"  # the payload head
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/x.py b/x.py\n+x = 1\n"
         mc.fetch_file.return_value = ""
@@ -2155,6 +2186,7 @@ class TestSafeDoMerge:
 
     def test_wraps_do_merge_on_success(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         review = {"severity": "low", "summary": "ok", "findings": []}
 
@@ -2168,6 +2200,7 @@ class TestSafeDoMerge:
 
     def test_unexpected_exception_posts_user_comment(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         review = {"severity": "low", "summary": "ok", "findings": []}
 
@@ -2194,6 +2227,7 @@ class TestSafeDoMerge:
         the review + merge. Matches the old _process_pr outer handler
         behaviour."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         review = {"severity": "low", "summary": "ok", "findings": []}
         # Simulate a pre-existing dedup entry for this PR (SHA-aware key)
@@ -2209,6 +2243,7 @@ class TestSafeDoMerge:
         outage), the safety wrapper must still return cleanly — the log
         line and metric are already emitted."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.post_pr_comment.side_effect = Exception("API down")
         review = {"severity": "low", "summary": "ok", "findings": []}
@@ -2222,6 +2257,7 @@ class TestSafeDoMerge:
 class TestFetchRules:
     def _provider(self, **kwargs):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         for k, v in kwargs.items():
             getattr(mc, k).return_value = v
         return mc
@@ -2260,6 +2296,7 @@ class TestFetchRules:
     def test_list_directory_error_degrades_to_empty(self):
         """Transport error on directory listing must not block review."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.list_directory.side_effect = Exception("500")
         assert _fetch_rules(mc, "owner/repo", "abc123") == {}
         mc.fetch_file.assert_not_called()
@@ -2267,6 +2304,7 @@ class TestFetchRules:
     def test_individual_file_fetch_failure_is_partial(self):
         """One failing file doesn't break the others — we get a partial map."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.list_directory.return_value = [
             ".claude/rules/a.md",
             ".claude/rules/b.md",
@@ -2285,6 +2323,7 @@ class TestFetchRules:
         _srv.RULES_DIR = ""
         try:
             mc = MagicMock(spec=GitProvider)
+            mc.get_pr_diff_head_sha.return_value = "abc123"
             assert _fetch_rules(mc, "owner/repo", "abc123") == {}
             # Must not even attempt to list when feature is disabled
             mc.list_directory.assert_not_called()
@@ -2521,6 +2560,8 @@ class TestIncrementalReview:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
+        mc.get_pr_head_sha.return_value = "abc123"  # the payload head
         mc.name = "gitea"
         return mc
 
@@ -3025,6 +3066,8 @@ class TestRebaseTolerance:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
+        mc.get_pr_head_sha.return_value = "abc123"  # the payload head
         mc.name = "gitea"
         mc.fetch_file.return_value = ""
         mc.get_pr_description.return_value = ""
@@ -3056,6 +3099,11 @@ class TestRebaseTolerance:
             hunk_context={f: hunk_context_digests(c) for f, c in chunks.items()},
             findings=findings,
             verdict=verdict,
+            # Recorded as a real review write does; without it the cached
+            # merge declines on config_hash_mismatch and a merge assertion
+            # passes vacuously.
+            config_hash=_server_mod._entry_config_hash(
+                __import__("raven.severity", fromlist=["x"]).default_scale(), None),
         )
         return _previous_diffs["gitea:owner/repo#42"]
 
@@ -3246,8 +3294,10 @@ class TestRebaseTolerance:
     def test_rebase_only_push_does_not_dispatch_a_cached_merge(self):
         """The no-changes skip can send a cached approve straight to a
         merge with no fresh review. A rebased head is not the head that
-        approval was computed on, so it must not reach that path — the
-        raw-chunk hash, not the content hash, is what gates it."""
+        approval was computed on, so it must not reach that path — an
+        approved PR's rebase gets a real review instead (audit 2026-09-27
+        #6: the shortcut used to rewrite entry.hashes and keep the
+        approve, so the NEXT unchanged trigger merged it unreviewed)."""
         self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
                    {"a.py": [], "b.py": []}, verdict="approve")
         mc = self._make_provider()
@@ -3257,9 +3307,191 @@ class TestRebaseTolerance:
             patch("raven.server._maybe_dispatch_cached_merge") as mock_dispatch,
         ):
             mc.fetch_pr_diff.return_value = self.A_OLD + self.B_AFTER
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
             _process_pr(mc, self._normalized_payload())
-        mock_review.assert_not_called()
+        mock_review.assert_called_once()
         mock_dispatch.assert_not_called()
+
+    def test_rebase_of_an_approved_pr_reviews_the_whole_diff(self):
+        """Both files go to the model — the rebased head is reviewed as a
+        whole, not as a delta against the pre-rebase approval."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": []}, verdict="approve")
+        _, mock_review = self._run(self.A_OLD + self.B_AFTER)
+        reviewed = mock_review.call_args.args[0]
+        assert "a/a.py" in reviewed and "a/b.py" in reviewed
+        assert not mock_review.call_args.kwargs.get("is_incremental")
+
+    def test_rebase_then_unchanged_trigger_never_merges_unreviewed(self):
+        """The two-event sequence the audit reproduced: rebase-only push,
+        then any trigger with an unchanged diff (redelivery, review
+        request, empty commit). No merge may happen without the model
+        having seen the rebased head."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": []}, verdict="approve")
+        reviewed_before_merge = []
+        mc = self._make_provider()
+        mc.get_pr_reviews.side_effect = None
+        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_state.return_value = "open"
+        mc.get_pr_head_sha.return_value = "abc123"
+        mc.get_commit_status.return_value = "success"
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            mc.merge_pr.side_effect = lambda *a, **k: (
+                reviewed_before_merge.append(mock_review.call_count) or True)
+            mc.fetch_pr_diff.return_value = self.A_OLD + self.B_AFTER
+            _process_pr(mc, self._normalized_payload())            # rebase-only push
+            _recent_prs.clear()
+            _process_pr(mc, self._normalized_payload())            # unchanged re-trigger
+        assert mock_review.call_count >= 1
+        assert reviewed_before_merge, "the merge path must actually be exercised"
+        assert all(n >= 1 for n in reviewed_before_merge)
+
+    def test_needs_work_rebase_keeps_the_shortcut_and_merges_nothing(self):
+        """Roadmap acceptance: needs_work + rebase → no review, no merge, and
+        its findings (with their comment_ids) carry — resolutions survive."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10)]}, verdict="needs_work")
+        mc, mock_review = self._run(self.A_OLD + self.B_AFTER)
+        mock_review.assert_not_called()
+        mc.submit_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        assert _previous_diffs["gitea:owner/repo#42"].findings["b.py"][0]["comment_id"] == 999
+
+    def test_approved_rebase_regenerates_findings_instead_of_carrying_them(self):
+        """The full review of an approved PR's rebase rebuilds the cached
+        findings from the model's answer: a cached finding (and its
+        comment_id) is not carried alongside a regenerated copy."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10, severity="low")]},
+                   verdict="approve")
+        regenerated = {"severity": "low", "file": "b.py", "line": 10,
+                       "message": "regenerated"}
+        self._run(self.A_OLD + self.B_AFTER, review={
+            "severity": "low", "summary": "ok", "findings": [regenerated]})
+        entry = _previous_diffs["gitea:owner/repo#42"]
+        cached = [f for fl in entry.findings.values() for f in fl]
+        assert [f["message"] for f in cached] == ["regenerated"]
+        assert all(f.get("comment_id") != 999 for f in cached)
+
+    def test_a_second_trigger_on_a_skipped_rebased_head_reviews_it(self):
+        """needs_work + rebase takes the shortcut, which leaves the rebased
+        head unreviewed and the comment flow unbound. Nothing but a content
+        push would ever review it, so a second trigger for the same head (a
+        re-requested review, a reopen) reviews it — which is what the
+        comment flow's "re-request the review" note tells the author."""
+        import hashlib
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10)]}, verdict="needs_work")
+        mc = self._make_provider()
+        mc.get_pr_reviews.side_effect = None
+        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "REQUEST_CHANGES"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mock_review.return_value = {"severity": "high", "summary": "bug", "findings": [
+                {"severity": "high", "file": "b.py", "line": 12, "message": "still a bug"}]}
+            mc.fetch_pr_diff.return_value = self.A_OLD + self.B_AFTER
+            _process_pr(mc, self._normalized_payload())            # the rebase push
+            assert mock_review.call_count == 0
+            _recent_prs.clear()
+            _process_pr(mc, self._normalized_payload())            # asked again, same head
+        assert mock_review.call_count == 1
+        assert not mock_review.call_args.kwargs.get("is_incremental")
+        entry = _previous_diffs["gitea:owner/repo#42"]
+        assert entry.hashes["b.py"] == hashlib.sha256(self.B_AFTER.encode()).hexdigest()
+        assert entry.unreviewed_hashes == {}
+
+    def test_a_new_rebase_after_a_skipped_one_takes_the_shortcut_again(self):
+        """Only the SAME skipped head counts as asked-again. A second rebase
+        (a different head) takes the shortcut and records itself, and only
+        a re-trigger on that head reviews it. Testing the field for
+        truthiness would re-review every later rebase; not overwriting it
+        would leave the newer head unreviewed again."""
+        import hashlib
+        b_after2 = (self.B_BEFORE
+                    .replace("index e88160e..b394268", "index 1a2b3c4..5d6e7f8")
+                    .replace("@@ -7,7 +7,7 @@", "@@ -87,7 +87,7 @@"))
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10)]}, verdict="needs_work")
+        mc = self._make_provider()
+        mc.get_pr_reviews.side_effect = None
+        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "REQUEST_CHANGES"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        entry_key = "gitea:owner/repo#42"
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+            patch("raven.server.inc") as mock_inc,
+        ):
+            mock_review.return_value = {"severity": "low", "summary": "ok", "findings": []}
+            mc.fetch_pr_diff.return_value = self.A_OLD + self.B_AFTER
+            _process_pr(mc, self._normalized_payload())            # rebase to H2: skipped
+            _recent_prs.clear()
+            mc.fetch_pr_diff.return_value = self.A_OLD + b_after2
+            _process_pr(mc, self._normalized_payload())            # rebase to H3: skipped too
+            assert mock_review.call_count == 0
+            assert (_previous_diffs[entry_key].unreviewed_hashes["b.py"]
+                    == hashlib.sha256(b_after2.encode()).hexdigest())
+            _recent_prs.clear()
+            _process_pr(mc, self._normalized_payload())            # asked again on H3
+        assert mock_review.call_count == 1
+        reasons = [c.args[1].get("reason") for c in mock_inc.call_args_list
+                   if c.args[0] == "raven_rebase_full_reviews_total"]
+        assert reasons == ["retrigger"]
+
+    def test_approved_rebase_is_counted_with_its_reason(self):
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": []}, verdict="approve")
+        with patch("raven.server.inc") as mock_inc:
+            self._run(self.A_OLD + self.B_AFTER)
+        reasons = [c.args[1].get("reason") for c in mock_inc.call_args_list
+                   if c.args[0] == "raven_rebase_full_reviews_total"]
+        assert reasons == ["approved"]
+
+    def test_needs_work_rebase_does_not_bind_the_comment_flow(self):
+        """The shortcut must not record the rebased head as reviewed:
+        entry.hashes is what the comment flow and the cached merge bind
+        to, so writing the rebased hashes let a comment flip approve and
+        merge a head no review saw."""
+        entry = self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                           {"a.py": [], "b.py": [self._finding(line=10)]},
+                           verdict="needs_work")
+        reviewed_hashes = dict(entry.hashes)
+        self._run(self.A_OLD + self.B_AFTER)
+        assert _previous_diffs["gitea:owner/repo#42"].hashes == reviewed_hashes
+        mp = _binding_provider(self.A_OLD + self.B_AFTER, head="shaR")
+        mp.get_comment_thread.return_value = [
+            {"id": 999, "parent_id": None, "user": {"login": "raven"}, "body": "F",
+             "file_path": "b.py", "line": 50}]
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "ok", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": []}):
+            _process_comment(mp, {"repo": "owner/repo", "pr_number": 42,
+                                  "comment_body": "@raven fine", "comment_id": 5,
+                                  "parent_comment_id": 999, "file_path": "b.py",
+                                  "line": 50, "_is_mention": True})
+        mp.submit_review.assert_not_called()
+        mp.merge_pr.assert_not_called()
+
+    def test_advisory_mode_keeps_the_shortcut_on_approve(self, monkeypatch):
+        """Advisory never merges, so a stored 'approve' can't be re-armed —
+        a full re-review there would only cost money."""
+        monkeypatch.setattr(_server_mod, "RAVEN_REVIEW_MODE", "advisory")
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": []}, verdict="approve")
+        _, mock_review = self._run(self.A_OLD + self.B_AFTER)
+        mock_review.assert_not_called()
 
     def test_untouched_head_still_reaches_the_cached_merge(self):
         """The converse: a byte-identical re-trigger is still the
@@ -3323,6 +3555,7 @@ class TestCarriedFindingsRevalidation:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.get_resolved_comment_ids.return_value = set()
         mc.retract_finding.return_value = True
@@ -3726,6 +3959,7 @@ class TestReviewEvent:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         return mc
 
@@ -3817,6 +4051,7 @@ class TestParseErrorBlocksMerge:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         return mc
 
@@ -3883,6 +4118,7 @@ class TestCoverageGapBlocksMerge:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         return mc
 
@@ -4100,6 +4336,8 @@ class TestCoverageGapBlocksMerge:
             mc.fetch_pr_diff.return_value = diff_pass2
             payload2 = self._normalized_payload()
             payload2["head_sha"] = "def456"  # new push, dodge dedup
+            mc.get_pr_head_sha.return_value = "def456"  # the PR head moved with it
+            mc.get_pr_diff_head_sha.return_value = "def456"  # and the diff with it
             _process_pr(mc, payload2)
 
         body2 = mc.submit_review.call_args.args[2]
@@ -4177,6 +4415,8 @@ class TestCoverageGapBlocksMerge:
             mc.fetch_pr_diff.return_value = diff_pass2
             payload2 = self._normalized_payload()
             payload2["head_sha"] = "def456"  # new push, dodge dedup
+            mc.get_pr_head_sha.return_value = "def456"  # the PR head moved with it
+            mc.get_pr_diff_head_sha.return_value = "def456"  # and the diff with it
             _process_pr(mc, payload2)
 
         body2 = mc.submit_review.call_args.args[2]
@@ -4239,6 +4479,7 @@ class TestUnfetchableScaleBlocksMerge:
 
     def _make_provider(self, fetch_file_side_effect):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_file.side_effect = fetch_file_side_effect
         mc.fetch_pr_diff.return_value = "diff --git a/f b/f\n+line\n"
@@ -4691,6 +4932,7 @@ class TestIssueComment:
 
     def test_process_comment_posts_response(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.return_value = ""
@@ -4708,6 +4950,7 @@ class TestIssueComment:
         providers that support threading (BB DC) post the reply in the same
         thread rather than as a top-level comment."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.return_value = ""
@@ -4722,6 +4965,7 @@ class TestIssueComment:
         """When respond_to_comment raises, the user must see something —
         silent failures look like Raven ignored them."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.return_value = ""
@@ -4743,6 +4987,7 @@ class TestIssueComment:
         from raven.ai.base import AIError
         _counters.clear()
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.return_value = ""
@@ -4757,6 +5002,7 @@ class TestIssueComment:
     def test_process_comment_posts_error_on_empty_response(self):
         """Empty response from Claude should still surface to the user."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.return_value = ""
@@ -4772,6 +5018,7 @@ class TestIssueComment:
         """Raven reacts to the triggering comment before starting the slow
         Claude call, so the user has immediate feedback."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.return_value = ""
@@ -4784,6 +5031,7 @@ class TestIssueComment:
     def test_process_comment_reaction_failure_does_not_break_flow(self):
         """If the reaction call raises, the main response still posts."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.react_to_comment.side_effect = RuntimeError("reactions down")
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
@@ -4801,6 +5049,7 @@ class TestIssueComment:
         to decide whether Raven should engage (authors derived from the
         thread dicts)."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_comment_thread.return_value = [
@@ -4824,6 +5073,7 @@ class TestIssueComment:
         """If the thread doesn't contain Raven, the worker exits quietly
         without posting anything."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_comment_thread.return_value = [
@@ -4841,6 +5091,7 @@ class TestIssueComment:
     def test_process_comment_reply_path_skips_when_thread_lookup_raises(self):
         """Provider error during thread lookup — worker exits quietly."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_comment_thread.side_effect = RuntimeError("503")
@@ -4853,6 +5104,7 @@ class TestIssueComment:
         """When the handler marked the comment as an @mention, the worker
         trusts that signal and doesn't hit the provider thread API."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.return_value = ""
@@ -4875,6 +5127,7 @@ class TestIssueComment:
         file/line context (BB DC sends commentParentId but no anchor on
         the reply; the root carries the anchor)."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.get_authenticated_user.return_value = "Raven"
         # Root comment (id 700) carries the inline anchor; the reply does not.
@@ -4914,6 +5167,7 @@ class TestIssueComment:
         file (not just a ±10-line snippet) so a question about code outside
         the snippet window is answerable."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_comment_thread.return_value = [
@@ -4943,6 +5197,7 @@ class TestIssueComment:
         """A modified file exceeding MAX_FILE_LINES is not attached in full;
         instead the omission is disclosed to the model (file_truncated)."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.get_authenticated_user.return_value = "Raven"
         mc.fetch_pr_diff.return_value = "diff --git a/big.py b/big.py\n+x\n"
@@ -4966,6 +5221,7 @@ class TestIssueComment:
         context couldn't be fetched (context_fetch_failed) so it flags
         uncertainty instead of guessing."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.get_authenticated_user.return_value = "Raven"
         mc.fetch_pr_diff.return_value = "diff --git a/a.py b/a.py\n+x\n"
@@ -4991,6 +5247,7 @@ class TestIssueComment:
         anchor must degrade gracefully — no anchor recovered, no file
         content fetched, the reply still posts."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_comment_thread.return_value = [
@@ -5022,6 +5279,7 @@ class TestIssueComment:
         branch, its contents are passed to respond_to_comment as
         prompt_override."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.get_pr_comments.return_value = [{"user": {"login": "alice"}, "body": "@Raven explain"}]
@@ -5046,6 +5304,7 @@ class TestIssueComment:
     def test_respond_no_override_passes_none(self):
         """When the override file doesn't exist, prompt_override is None."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.side_effect = FileNotFoundError()
@@ -5063,6 +5322,7 @@ class TestIssueComment:
     def test_respond_tolerates_base_ref_fetch_failure(self):
         """If get_pr_base_ref raises, respond still runs with no override."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.return_value = ""
@@ -5135,6 +5395,7 @@ class TestPullRequestComment:
 
     def test_process_diff_comment_passes_file_context(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
         mc.fetch_file.return_value = ""
@@ -5151,6 +5412,7 @@ class TestPullRequestComment:
     def test_diff_comment_response_includes_location_header_on_flat_providers(self):
         """Gitea (no comment threading) keeps the Re: header for context."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.supports_comment_threads = False
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
@@ -5170,6 +5432,7 @@ class TestPullRequestComment:
         passed to respond_to_comment so Claude doesn't have to locate the
         line by parsing hunk headers."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.supports_comment_threads = False
         mc.get_pr_head_sha.return_value = "abc123"
@@ -5199,6 +5462,7 @@ class TestPullRequestComment:
         """If get_pr_head_sha raises, just skip the snippet — the response
         still gets generated using the diff alone."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.supports_comment_threads = False
         mc.get_pr_head_sha.side_effect = RuntimeError("no sha")
@@ -5215,6 +5479,7 @@ class TestPullRequestComment:
         """Threading providers (BB DC) render the thread at the file/line
         already, so the Re: header would duplicate context."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.supports_comment_threads = True
         mc.fetch_pr_diff.return_value = "diff --git a/f\n+line\n"
@@ -5398,6 +5663,22 @@ class TestCachePersistence:
         assert entry.content_hashes == {"a.py": "content1"}
         assert entry.hunks == {"a.py": [(7, 7), (40, 3)]}
 
+    def test_round_trip_restores_unreviewed_hashes(self, tmp_path):
+        """The head a rebase-only shortcut skipped must still be recognised
+        after a restart, or a re-request would take the shortcut again."""
+        from raven.server import CacheEntry
+        cache_file = tmp_path / "raven" / "findings_cache.json"
+        _previous_diffs["owner/repo#1"] = CacheEntry(
+            timestamp=100.0, hashes={"a.py": "raw1"}, findings={"a.py": []},
+            unreviewed_hashes={"a.py": "raw2"},
+        )
+        with patch("raven.server._CACHE_FILE", cache_file), \
+             patch("raven.server._CACHE_DIR", tmp_path / "raven"):
+            _save_cache()
+            _previous_diffs.clear()
+            _load_cache()
+        assert _previous_diffs["owner/repo#1"].unreviewed_hashes == {"a.py": "raw2"}
+
     def test_malformed_hunks_skip_only_that_entry(self, tmp_path):
         """A corrupt hunk row must fail into the per-entry guard, not
         reach _remap_carried_lines and blow up mid-review."""
@@ -5417,6 +5698,25 @@ class TestCachePersistence:
             _load_cache()
         assert "owner/repo#1" not in _previous_diffs
         assert "owner/repo#2" in _previous_diffs
+
+    def test_verdict_logic_bump_discards_cached_verdicts(self, tmp_path, monkeypatch):
+        """A cache written before a verdict-logic change must load empty:
+        its approves were computed by code that no longer runs."""
+        import json as _json
+        from raven import reviewer as rv
+        monkeypatch.setattr(rv, "_VERDICT_LOGIC_VERSION", "1", raising=False)
+        cache_file = tmp_path / "cache.json"
+        cache_file.write_text(_json.dumps({
+            "_config_hash": rv.review_config_hash(),
+            "entries": {
+                "owner/repo#1": {"timestamp": 1.0, "hashes": {"a.py": "h"},
+                                 "findings": {}, "verdict": "approve"},
+            },
+        }), encoding="utf-8")
+        monkeypatch.setattr(rv, "_VERDICT_LOGIC_VERSION", "2", raising=False)
+        with patch("raven.server._CACHE_FILE", cache_file):
+            _load_cache()
+        assert "owner/repo#1" not in _previous_diffs
 
     def test_load_missing_file(self, tmp_path):
         cache_file = tmp_path / "nonexistent" / "cache.json"
@@ -6158,6 +6458,7 @@ class TestShouldAutoAddReviewer:
 
     def _mc(self, raven_user="raven-bot", reviews=None, requested=None):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.get_authenticated_user.return_value = raven_user
         mc.get_pr_reviews.return_value = reviews or []
         mc.get_pr_requested_reviewers.return_value = requested or []
@@ -6224,6 +6525,7 @@ class TestShouldAutoAddReviewer:
         a human reviewer is listed, so long as Raven itself isn't."""
         mocker.patch("raven.server.RAVEN_REVIEW_MODE", "all")
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [{"user": {"login": "alice"}, "state": "COMMENTED"}]
         mc.get_pr_requested_reviewers.return_value = ["bob"]
@@ -6235,6 +6537,7 @@ class TestShouldAutoAddReviewer:
         re-add if Raven is already a reviewer."""
         mocker.patch("raven.server.RAVEN_REVIEW_MODE", "all")
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
         mc.get_pr_requested_reviewers.return_value = []
@@ -6245,6 +6548,7 @@ class TestShouldAutoAddReviewer:
         """Idempotent: if Raven is already in requested reviewers, no add."""
         mocker.patch("raven.server.RAVEN_REVIEW_MODE", "all")
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = []
         mc.get_pr_requested_reviewers.return_value = ["Raven"]
@@ -6256,6 +6560,7 @@ class TestShouldAutoAddReviewer:
         any human reviewer is present."""
         mocker.patch("raven.server.RAVEN_REVIEW_MODE", "gap")
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [{"user": {"login": "alice"}, "state": "COMMENTED"}]
         mc.get_pr_requested_reviewers.return_value = []
@@ -6266,6 +6571,7 @@ class TestShouldAutoAddReviewer:
         """Fill-gap mode: no humans, Raven is welcome."""
         mocker.patch("raven.server.RAVEN_REVIEW_MODE", "gap")
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = []
         mc.get_pr_requested_reviewers.return_value = []
@@ -6282,6 +6588,7 @@ class TestDoMerge:
     def test_sha_recheck_blocks_merge_when_changed(self):
         """Provider-agnostic SHA re-check prevents merge after force-push during CI wait."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.get_commit_status.return_value = "success"
         mc.get_pr_head_sha.return_value = "newsha456"  # Changed during CI wait
@@ -6293,6 +6600,7 @@ class TestDoMerge:
     def test_sha_recheck_fails_closed_on_api_error(self):
         """If SHA re-check API call fails, skip merge (fail closed)."""
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.get_commit_status.return_value = "success"
         mc.get_pr_head_sha.side_effect = Exception("connection refused")
@@ -6303,6 +6611,7 @@ class TestDoMerge:
 
     def test_sha_recheck_allows_merge_when_unchanged(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.get_commit_status.return_value = "success"
         mc.get_pr_head_sha.return_value = "abc123"  # Same as original
@@ -6322,6 +6631,7 @@ class TestGiteaAutoMerge:
 
     def test_auto_merge_passes_merge_when_checks_succeed(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.merge_pr.return_value = True
         review = {"severity": "low", "summary": "ok", "findings": []}
@@ -6334,6 +6644,7 @@ class TestGiteaAutoMerge:
 
     def test_non_gitea_provider_polls_ci(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "bitbucket-dc"
         mc.get_commit_status.return_value = "success"
         mc.get_pr_head_sha.return_value = "abc123"  # Must match for SHA re-check
@@ -6798,6 +7109,7 @@ class TestProcessPrReportsLegacyConfigPaths:
 
     def _provider(self, files):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [
@@ -6872,6 +7184,7 @@ class TestProcessCommentReportsLegacyConfigPaths:
 
     def _provider(self, files):
         mp = MagicMock(spec=GitProvider)
+        mp.get_pr_diff_head_sha.return_value = "abc123"
         mp.name = "gitea"
         mp.fetch_pr_diff.return_value = "diff..."
         mp.get_pr_comments.return_value = []
@@ -6921,6 +7234,7 @@ def mock_provider_for_comment_flow():
     TestProcessCommentRaceGuard). Sibling test classes can't share
     class-scoped fixtures."""
     mp = MagicMock(spec=GitProvider)
+    mp.get_pr_diff_head_sha.return_value = "abc123"
     mp.name = "gitea"
     mp.fetch_pr_diff.return_value = "diff..."
     mp.get_pr_comments.return_value = [
@@ -6936,12 +7250,30 @@ def mock_provider_for_comment_flow():
     ]
     mp.get_pr_state.return_value = "open"
     mp.get_pr_head_sha.return_value = "abc123"
+    mp.get_pr_diff_head_sha.return_value = "abc123"   # the diff describes the head
     mp.get_pr_metadata.return_value = {"title": "Test PR", "html_url": "https://x/u/r/pulls/1"}
-    mp.fetch_file.side_effect = lambda r, p, ref="HEAD": "" if p == "CLAUDE.md" else "code"
+    # Source files read as "code"; Raven's own config (prompt overrides,
+    # severities.json) and CLAUDE.md are absent, as in most repos.
+    mp.fetch_file.side_effect = lambda r, p, ref="HEAD": (
+        "" if p == "CLAUDE.md" or p.startswith((".raven/", ".claude/")) else "code")
     mp.get_pr_base_ref.return_value = "main"
     mp.get_authenticated_user.return_value = "raven"
     mp.supports_comment_threads = True
     return mp
+
+
+@pytest.fixture
+def bound_cache_entry(mock_provider_for_comment_flow):
+    """A cache entry that covers the fixture's diff (the headerless
+    "diff..." hashes to {}), with no verdict. Comment-driven changes are
+    bound to the head Raven's cached review covers (audit 2026-09-27 #1),
+    so retraction-mechanics tests need one; verdict=None keeps them free
+    of the revision/merge path."""
+    from raven.server import CacheEntry, _previous_diffs
+    pr_key = "gitea:u/r#1"
+    _previous_diffs[pr_key] = CacheEntry(timestamp=0.0, hashes={}, findings={})
+    yield
+    _previous_diffs.pop(pr_key, None)
 
 
 @pytest.fixture
@@ -6950,9 +7282,12 @@ def cached_needs_work(mock_provider_for_comment_flow):
     format _process_pr uses: f'{provider.name}:{repo}#{pr}'."""
     from raven.server import CacheEntry, _previous_diffs
     pr_key = "gitea:u/r#1"
+    from raven.server import _entry_config_hash
+    from raven.severity import default_scale
     _previous_diffs[pr_key] = CacheEntry(
         timestamp=0.0, hashes={}, findings={},
         verdict="needs_work", summary="see findings",
+        config_hash=_entry_config_hash(default_scale(), None),
     )
     yield
     _previous_diffs.pop(pr_key, None)
@@ -7018,7 +7353,7 @@ class TestProcessCommentRetraction:
         finally:
             _previous_diffs.pop(pr_key, None)
 
-    def test_retracts_filtered_to_raven_authored_thread_ids(self, mock_provider_for_comment_flow):
+    def test_retracts_filtered_to_raven_authored_thread_ids(self, mock_provider_for_comment_flow, bound_cache_entry):
         """IDs the AI lists are filtered TWO ways:
           - dropped if not in the fetched thread (defense vs hallucination), AND
           - dropped if the thread entry wasn't authored by Raven (defense
@@ -7038,7 +7373,7 @@ class TestProcessCommentRetraction:
         )
         assert called_ids == [10]
 
-    def test_retract_walks_to_thread_root_from_reply(self, mock_provider_for_comment_flow):
+    def test_retract_walks_to_thread_root_from_reply(self, mock_provider_for_comment_flow, bound_cache_entry):
         """When the AI picks a Raven-authored REPLY id (not the original
         finding's id), the server walks up the in-memory thread to the
         root and resolves that. Thread resolution is a thread-root
@@ -7072,7 +7407,7 @@ class TestProcessCommentRetraction:
         # Walked up: 30 → 20 → 10. Resolve root.
         assert called_ids == [10]
 
-    def test_retract_dedupes_when_multiple_replies_share_root(self, mock_provider_for_comment_flow):
+    def test_retract_dedupes_when_multiple_replies_share_root(self, mock_provider_for_comment_flow, bound_cache_entry):
         """If the AI lists multiple Raven-authored replies in the same
         thread, all walk to the same root — call retract_finding once,
         not N times."""
@@ -7093,7 +7428,7 @@ class TestProcessCommentRetraction:
         # Three seeds collapse to a single root.
         assert called_ids == [10]
 
-    def test_retract_drops_when_root_not_raven_authored(self, mock_provider_for_comment_flow):
+    def test_retract_drops_when_root_not_raven_authored(self, mock_provider_for_comment_flow, bound_cache_entry):
         """Defense: Raven joined a developer-rooted thread (e.g. answered
         a @mention on a top-level discussion comment). The AI sees its
         own reply marked [YOU], lists it for retract — but the thread
@@ -7114,7 +7449,7 @@ class TestProcessCommentRetraction:
         # 20 walks to root=10 (alice). Root not Raven-authored → drop.
         mock_provider_for_comment_flow.retract_finding.assert_not_called()
 
-    def test_retracts_skipped_when_pr_not_open(self, mock_provider_for_comment_flow):
+    def test_retracts_skipped_when_pr_not_open(self, mock_provider_for_comment_flow, bound_cache_entry):
         mock_provider_for_comment_flow.get_pr_state.return_value = "merged"
         with patch("raven.server.respond_to_comment") as mock_respond:
             mock_respond.return_value = {
@@ -7124,7 +7459,7 @@ class TestProcessCommentRetraction:
             _process_comment(mock_provider_for_comment_flow, self._payload())
         mock_provider_for_comment_flow.retract_finding.assert_not_called()
 
-    def test_retract_failure_does_not_block_subsequent(self, mock_provider_for_comment_flow):
+    def test_retract_failure_does_not_block_subsequent(self, mock_provider_for_comment_flow, bound_cache_entry):
         # Two independent Raven-rooted threads so they don't dedupe to
         # a single root via the in-memory walk-up. (Within one thread,
         # multiple [YOU]-marked entries collapse to the same root.)
@@ -7161,7 +7496,7 @@ class TestProcessCommentRetraction:
         from raven.server import CacheEntry, _previous_diffs
         pr_key = "gitea:u/r#1"
         _previous_diffs[pr_key] = CacheEntry(
-            timestamp=0.0, hashes={"a.py": "h"},
+            timestamp=0.0, hashes={},
             findings={"a.py": [
                 {"file": "a.py", "line": 5, "severity": "medium",
                  "message": "the flagged thing", "comment_id": 42},
@@ -7204,7 +7539,7 @@ class TestProcessCommentRetraction:
         from raven.server import CacheEntry, _previous_diffs
         pr_key = "gitea:u/r#1"
         _previous_diffs[pr_key] = CacheEntry(
-            timestamp=0.0, hashes={"a.py": "h"},
+            timestamp=0.0, hashes={},
             findings={"a.py": [
                 {"file": "a.py", "line": 5, "severity": "high",
                  "message": "the only finding", "comment_id": 42},
@@ -7250,7 +7585,7 @@ class TestProcessCommentRetraction:
         from raven.server import CacheEntry, _previous_diffs
         pr_key = "gitea:u/r#1"
         _previous_diffs[pr_key] = CacheEntry(
-            timestamp=0.0, hashes={"a.py": "h"},
+            timestamp=0.0, hashes={},
             findings={"a.py": [
                 {"file": "a.py", "line": 5, "severity": "high",
                  "message": "retract me", "comment_id": 42},
@@ -7436,12 +7771,18 @@ class TestProcessCommentRevision:
         """Goal 3 regression guard: BB DC scenario where prior verdict
         was 'approve' but auto-merge was blocked by unresolved comments.
         Retraction succeeds → auto-merge MUST retry."""
-        from raven.server import CacheEntry, _previous_diffs
+        from raven.server import CacheEntry, _previous_diffs, _entry_config_hash
+        from raven.severity import default_scale
         from concurrent.futures import Future
         pr_key = "gitea:u/r#1"
+        # The blocking-on-BB-DC comment is Raven's own low nit — a cached
+        # finding. Only removing a cached finding re-triggers the merge.
         _previous_diffs[pr_key] = CacheEntry(
-            timestamp=0.0, hashes={}, findings={},
+            timestamp=0.0, hashes={},
+            findings={"a.py": [{"file": "a.py", "line": 5, "severity": "low",
+                                "message": "nit", "comment_id": 10}]},
             verdict="approve", summary="LGTM",
+            config_hash=_entry_config_hash(default_scale(), None),
         )
         submitted = []
 
@@ -7677,7 +8018,10 @@ class TestProcessCommentRevision:
             return ""
 
         mock_provider_for_comment_flow.fetch_file.side_effect = _fail_severities
-        with patch("raven.server.respond_to_comment") as mock_respond:
+        with (
+            patch("raven.server.respond_to_comment") as mock_respond,
+            patch("raven.server.inc") as mock_inc,
+        ):
             self._flip_to_approve(mock_respond)
             _process_comment(mock_provider_for_comment_flow, self._payload())
 
@@ -7688,6 +8032,12 @@ class TestProcessCommentRevision:
             "severities.json unreadable means the repo's real merge gate is "
             "unknown; a comment-driven flip-to-approve must not auto-merge"
         )
+        # Declined by the shared gate set, for this reason — not by some
+        # other gate that happened to fail first.
+        dispatch = [c.args[1] for c in mock_inc.call_args_list
+                    if c.args[0] == "raven_cached_merge_dispatch_total"]
+        assert [(d["outcome"], d["source"]) for d in dispatch] == [
+            ("declined_scale_fetch_failed", "comment")]
 
 
 class TestProcessCommentRaceGuard:
@@ -7799,7 +8149,7 @@ class TestProcessCommentRaceGuard:
             with _in_progress_lock:
                 _comment_mutating_prs.discard(pr_key)
 
-    def test_verdict_none_skips_revise_server_side(self, mock_provider_for_comment_flow):
+    def test_verdict_none_skips_revise_server_side(self, mock_provider_for_comment_flow, bound_cache_entry):
         """Server enforces 'no revise without prior verdict' regardless
         of AI behaviour (defense in depth)."""
         # No cache entry → prior_verdict is None
@@ -7990,6 +8340,7 @@ class TestCommentFlowUsesTheRepoScale:
 
         from raven.server import _previous_diffs
         pr_key = "gitea:u/r#1"
+        _previous_diffs[pr_key].config_hash = server._entry_config_hash(scale, None)
         _previous_diffs[pr_key].findings = {
             "a.py": [{"severity": "blocker", "message": "m"}],
         }
@@ -8033,6 +8384,7 @@ class TestCommentFlowUsesTheRepoScale:
 
         from raven.server import _previous_diffs
         pr_key = "gitea:u/r#1"
+        _previous_diffs[pr_key].config_hash = server._entry_config_hash(scale, None)
         _previous_diffs[pr_key].findings = {
             "a.py": [{"severity": "bug", "message": "m"}],
         }
@@ -8172,6 +8524,7 @@ class TestReviewOutputChannels:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
@@ -8373,6 +8726,7 @@ class TestCachedMergeDispatch:
 
     def _make_provider(self, sole=True):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = self.DIFF
         mc.get_authenticated_user.return_value = "Raven"
@@ -8392,6 +8746,7 @@ class TestCachedMergeDispatch:
     def _call(self, mc, **kwargs):
         from raven.server import _maybe_dispatch_cached_merge
         kwargs.setdefault("head_sha", "abc123")
+        kwargs.setdefault("scale_fetch_failed", False)
         return _maybe_dispatch_cached_merge(
             mc, "owner/repo", 42, "PR #42", "http://x", **kwargs)
 
@@ -8735,6 +9090,7 @@ class TestNoChangesSkipCachedMergeDispatch:
 
     def _make_provider(self, sole=True):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = self.DIFF
         mc.fetch_file.return_value = ""
@@ -9085,6 +9441,7 @@ class TestProcessPrThreadsScaleIntoRenderers:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
@@ -9183,6 +9540,259 @@ class TestPerEntryConfigHash:
         assert entry.config_hash != server._entry_config_hash(default_scale(), None)
 
 
+class TestProcessPrDiffHeadBinding:
+    """09-27 #21: Gitea builds a PR's ``.diff`` from ``refs/pull/N/head``,
+    which a background task moves after a push, while ``head_sha`` is the
+    branch tip. _process_pr must not pair a head with a diff built from
+    another commit: a cached approve of A plus a push of B otherwise took
+    the no-changes skip and merged B, which no review saw."""
+
+    # The no-changes fixture, borrowed rather than inherited so its tests
+    # don't run twice.
+    DIFF = TestNoChangesSkipCachedMergeDispatch.DIFF
+    PR_KEY = TestNoChangesSkipCachedMergeDispatch.PR_KEY
+    setup_method = TestNoChangesSkipCachedMergeDispatch.setup_method
+    _seed_cache = TestNoChangesSkipCachedMergeDispatch._seed_cache
+    _payload = TestNoChangesSkipCachedMergeDispatch._payload
+    _make_provider = TestNoChangesSkipCachedMergeDispatch._make_provider
+
+    NEW_DIFF = "diff --git a/f.py b/f.py\n+line\n+new line\n"
+    _BLOCKING = {"severity": "high", "summary": "bug", "findings": [
+        {"file": "f.py", "line": 2, "severity": "high", "message": "real bug"}]}
+
+    def _run(self, mc, payload=None, review=None):
+        submitted = MagicMock()
+        with (
+            patch("raven.server.review_diff", return_value=review or dict(self._BLOCKING)) as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.inc") as mock_inc,
+            patch("raven.server.time.sleep") as mock_sleep,
+            patch("raven.server.executor", submitted),
+        ):
+            _process_pr(mc, payload or self._payload())
+        self.reruns = [c.args[2]["head_sha"] for c in submitted.submit.call_args_list
+                       if c.args[0] is _process_pr]
+        return mock_review, mock_inc, mock_sleep
+
+    @staticmethod
+    def _labels(mock_inc, metric):
+        return [c.args[1].get("reason") for c in mock_inc.call_args_list
+                if c.args[0] == metric]
+
+    def _lagging_ref(self, mc, lag_polls):
+        """A ref that describes the old commit for ``lag_polls`` reads,
+        with a diff that follows the ref — as Gitea's does."""
+        ref = {"sha": "0ld5ha", "reads": 0}
+
+        def _diff_head(*a):
+            ref["reads"] += 1
+            if ref["reads"] > lag_polls:
+                ref["sha"] = "abc123"
+            return ref["sha"]
+        mc.get_pr_diff_head_sha.side_effect = _diff_head
+        mc.fetch_pr_diff.side_effect = lambda *a: (
+            self.DIFF if ref["sha"] == "0ld5ha" else self.NEW_DIFF)
+        return ref
+
+    def test_lagging_diff_ref_does_not_merge_the_new_head(self):
+        """The PR head is abc123 but the diff still describes the commit a
+        cached approve covered, and the ref never catches up."""
+        self._seed_cache()
+        mc = self._make_provider()
+        self._lagging_ref(mc, lag_polls=10**6)
+        mock_review, mock_inc, _ = self._run(mc)
+        mock_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        assert self._labels(mock_inc, "raven_review_failures_total") == ["diff_head_unverified"]
+        assert "latest commit" in mc.post_pr_comment.call_args.args[2]
+        assert self.reruns == []
+
+    def test_waits_for_the_diff_ref_to_catch_up(self):
+        """A ref that lags briefly is waited out, and the diff reviewed is
+        the new head's — not the old diff the cached approve matches, which
+        would merge through the no-changes skip without a review."""
+        self._seed_cache()
+        mc = self._make_provider()
+        self._lagging_ref(mc, lag_polls=2)
+        mock_review, _, mock_sleep = self._run(mc)
+        assert mock_sleep.call_count == 2
+        mock_review.assert_called_once()
+        assert mock_review.call_args.args[0] == self.NEW_DIFF
+        mc.merge_pr.assert_not_called()   # the fresh review blocks
+
+    def test_a_transient_diff_head_error_is_retried(self):
+        self._seed_cache()
+        mc = self._make_provider()
+        mc.get_pr_diff_head_sha.side_effect = [RuntimeError("502"), "abc123", "abc123"]
+        _, mock_inc, _ = self._run(mc)
+        assert self._labels(mock_inc, "raven_review_failures_total") == []
+        mc.merge_pr.assert_called_once()
+
+    def test_head_moved_while_waiting_reruns_for_the_new_head(self):
+        """A newer push landed. Its own event may never come (a bot author,
+        a lost webhook), so the run parks a re-run for it and stops without
+        reviewing, merging or posting a failure."""
+        self._seed_cache()
+        mc = self._make_provider()
+        mc.get_pr_diff_head_sha.return_value = "0ld5ha"
+        mc.get_pr_head_sha.return_value = "n3w5ha"
+        mock_review, mock_inc, _ = self._run(mc)
+        mock_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        mc.post_pr_comment.assert_not_called()
+        assert self._labels(mock_inc, "raven_reviews_skipped_total") == ["head_moved"]
+        assert self.reruns == ["n3w5ha"]
+
+    def test_diff_ref_moved_during_the_fetch_reruns_for_the_new_head(self):
+        """The ref matched before the fetch and moved during it, with the
+        PR head: the diff may describe either commit."""
+        self._seed_cache()
+        mc = self._make_provider()
+        mc.get_pr_diff_head_sha.side_effect = ["abc123", "n3w5ha"]
+        mc.get_pr_head_sha.return_value = "n3w5ha"
+        mock_review, mock_inc, _ = self._run(mc)
+        mock_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        mc.post_pr_comment.assert_not_called()
+        assert self.reruns == ["n3w5ha"]
+
+    def test_diff_ref_moved_without_the_head_fails_closed(self):
+        """The diff's head changed during the fetch but the PR head didn't:
+        nothing explains the diff, so it is not used."""
+        self._seed_cache()
+        mc = self._make_provider()
+        mc.get_pr_diff_head_sha.side_effect = ["abc123", "0dd5ha"]
+        mock_review, mock_inc, _ = self._run(mc)
+        mock_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        assert self._labels(mock_inc, "raven_review_failures_total") == ["diff_head_unverified"]
+        assert self.reruns == []
+
+    @pytest.mark.parametrize("diff_head", [None, "", RuntimeError("502")])
+    def test_unreadable_diff_head_fails_closed(self, diff_head):
+        self._seed_cache()
+        mc = self._make_provider()
+        if isinstance(diff_head, Exception):
+            mc.get_pr_diff_head_sha.side_effect = diff_head
+        else:
+            mc.get_pr_diff_head_sha.return_value = diff_head
+        mock_review, mock_inc, _ = self._run(mc)
+        mock_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        assert self._labels(mock_inc, "raven_review_failures_total") == ["diff_head_unverified"]
+
+    def test_a_transient_fault_after_the_fetch_is_retried(self):
+        """One API blip on the post-fetch read must not fail a push that
+        nothing would re-trigger."""
+        self._seed_cache()
+        mc = self._make_provider()
+        mc.get_pr_diff_head_sha.side_effect = ["abc123", RuntimeError("502"), "abc123"]
+        _, mock_inc, _ = self._run(mc)
+        assert self._labels(mock_inc, "raven_review_failures_total") == []
+        mc.merge_pr.assert_called_once()
+
+    def test_a_persistent_fault_after_the_fetch_fails_closed(self):
+        self._seed_cache()
+        mc = self._make_provider()
+        mc.get_pr_diff_head_sha.side_effect = ["abc123"] + [RuntimeError("502")] * 10
+        mock_review, mock_inc, _ = self._run(mc)
+        mock_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        assert self._labels(mock_inc, "raven_review_failures_total") == ["diff_head_unverified"]
+
+    def test_a_post_fetch_check_that_never_ran_fails_closed(self):
+        """With zero read tries the post-fetch check never runs; that must
+        count as unverified, not as bound — as it already does for a
+        payload with no SHA."""
+        self._seed_cache()
+        mc = self._make_provider()
+        with patch("raven.server._HEAD_READ_TRIES", 0):
+            mock_review, mock_inc, _ = self._run(mc)
+        mc.fetch_pr_diff.assert_called_once()   # it is the post-fetch check that failed
+        mock_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        assert self._labels(mock_inc, "raven_review_failures_total") == ["diff_head_unverified"]
+
+    def test_a_mismatch_after_the_fetch_is_not_retried(self):
+        """A retry may only paper over a failed read: a diff head that
+        moved means the diff may describe either commit."""
+        self._seed_cache()
+        mc = self._make_provider()
+        mc.get_pr_diff_head_sha.side_effect = ["abc123", "0dd5ha", "abc123"]
+        mock_review, _, _ = self._run(mc)
+        mock_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+
+    def test_payload_without_a_sha_retries_a_transient_head_read(self):
+        self._seed_cache()
+        mc = self._make_provider()
+        reads = {"n": 0}
+
+        def _head(*a):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                raise RuntimeError("502")
+            return "abc123"
+        mc.get_pr_head_sha.side_effect = _head
+        payload = self._payload()
+        del payload["head_sha"]
+        self._run(mc, payload=payload)
+        assert mc.merge_pr.call_args.kwargs["head_sha"] == "abc123"
+
+    def test_payload_without_a_sha_is_bound_to_the_head_read(self):
+        """A payload with no head SHA used to run unbound under the "HEAD"
+        sentinel; it is bound to the head read at that point instead."""
+        self._seed_cache()
+        mc = self._make_provider()
+        payload = self._payload()
+        del payload["head_sha"]
+        self._run(mc, payload=payload)
+        assert mc.merge_pr.call_args.kwargs["head_sha"] == "abc123"
+
+    def test_payload_without_a_sha_and_no_readable_head_fails_closed(self):
+        self._seed_cache()
+        mc = self._make_provider()
+        mc.get_pr_head_sha.return_value = None
+        payload = self._payload()
+        del payload["head_sha"]
+        mock_review, mock_inc, _ = self._run(mc, payload=payload)
+        mock_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        assert self._labels(mock_inc, "raven_review_failures_total") == ["diff_head_unverified"]
+
+    def test_cached_merge_self_fetch_is_bound_to_the_head(self):
+        """_maybe_dispatch_cached_merge fetches the diff itself when the
+        caller passes no hashes; that diff must describe the head too."""
+        from raven.server import _maybe_dispatch_cached_merge
+        self._seed_cache()
+        mc = self._make_provider()
+        mc.get_pr_diff_head_sha.return_value = "0ld5ha"
+        with patch("raven.server.inc") as mock_inc, patch("raven.server.notify"):
+            result = _maybe_dispatch_cached_merge(
+                mc, "owner/repo", 42, "PR #42", "http://x", head_sha="abc123",
+                scale_fetch_failed=False)
+        assert result is False
+        mc.merge_pr.assert_not_called()
+        outcomes = [c.args[1]["outcome"] for c in mock_inc.call_args_list
+                    if c.args[0] == "raven_cached_merge_dispatch_total"]
+        assert outcomes == ["declined_diff_head_unbound"]
+
+    def test_cached_merge_self_fetch_declines_when_the_ref_moves_during_the_fetch(self):
+        from raven.server import _maybe_dispatch_cached_merge
+        self._seed_cache()
+        mc = self._make_provider()
+        mc.get_pr_diff_head_sha.side_effect = ["abc123", "n3w5ha"]
+        with patch("raven.server.inc") as mock_inc, patch("raven.server.notify"):
+            result = _maybe_dispatch_cached_merge(
+                mc, "owner/repo", 42, "PR #42", "http://x", head_sha="abc123",
+                scale_fetch_failed=False)
+        assert result is False
+        mc.merge_pr.assert_not_called()
+        outcomes = [c.args[1]["outcome"] for c in mock_inc.call_args_list
+                    if c.args[0] == "raven_cached_merge_dispatch_total"]
+        assert outcomes == ["declined_diff_head_unbound"]
+
+
 class TestCachedMergeRespectsConfigHash:
     """Merge-safety half of the per-entry config hash: _maybe_dispatch_cached_merge
     re-dispatches an auto-merge from a cached approve verdict WITHOUT a fresh
@@ -9233,6 +9843,7 @@ class TestCachedMergeRespectsConfigHash:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = self.DIFF
         mc.get_authenticated_user.return_value = "Raven"
@@ -9248,6 +9859,7 @@ class TestCachedMergeRespectsConfigHash:
     def _call(self, mc, **kwargs):
         from raven.server import _maybe_dispatch_cached_merge
         kwargs.setdefault("head_sha", "abc123")
+        kwargs.setdefault("scale_fetch_failed", False)
         return _maybe_dispatch_cached_merge(
             mc, "owner/repo", 42, "PR #42", "http://x", **kwargs)
 
@@ -9351,6 +9963,49 @@ class TestCachedMergeRespectsConfigHash:
         mock_review.assert_not_called()          # still no fresh AI pass
         mc.merge_pr.assert_not_called()           # but the scale changed — no merge
 
+    def test_scale_fetch_failed_must_be_passed(self):
+        """The scale-fetch gate fails closed only if every caller says
+        whether its read failed. A False default would let a new caller
+        skip the gate silently, so omitting it is a TypeError instead."""
+        import inspect
+        from raven.server import _maybe_dispatch_cached_merge
+        param = inspect.signature(_maybe_dispatch_cached_merge).parameters["scale_fetch_failed"]
+        assert param.default is inspect.Parameter.empty
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_no_changes_skip_declines_dispatch_when_the_scale_cannot_be_read(self):
+        """A failed severities.json read substitutes default_scale(). For an
+        entry recorded under the default scale that matches its hash — so
+        the entry-hash gate cannot catch it — while the repo may by now
+        have a stricter scale on base. The no-changes path must fail the
+        merge closed on the fetch failure itself, like the review path."""
+        import raven.server as server
+        from raven.severity import default_scale
+        self._seed_cache(config_hash=server._entry_config_hash(default_scale(), None))
+        mc = self._make_provider()
+
+        def _fetch(repo, path, ref="HEAD"):
+            if path.endswith("severities.json"):
+                raise RuntimeError("503 from the git host")
+            return ""
+        mc.fetch_file.side_effect = _fetch
+        payload = {
+            "repo": "owner/repo", "sender": "alice", "pr_number": 42,
+            "pr_title": "PR #42", "pr_url": "http://x",
+            "head_sha": "abc123", "head_ref": "feature", "base_ref": "main",
+        }
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.inc") as mock_inc,
+        ):
+            _process_pr(mc, payload)
+        mock_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        outcomes = [c.args[1]["outcome"] for c in mock_inc.call_args_list
+                    if c.args[0] == "raven_cached_merge_dispatch_total"]
+        assert outcomes == ["declined_scale_fetch_failed"]
+
     def test_no_changes_skip_declines_dispatch_for_legacy_hashless_entry(self):
         """CRITICAL — the hole found in Task 10's review: a cached approve
         of UNKNOWN provenance (config_hash="", written before this feature
@@ -9394,6 +10049,8 @@ class TestCacheWriteRecordsConfigHash:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
+        mc.get_pr_head_sha.return_value = "abc123"  # the payload head
         mc.name = "gitea"
         mc.fetch_pr_diff.return_value = "diff --git a/f.py b/f.py\n+line\n"
         mc.fetch_file.return_value = ""
@@ -9500,6 +10157,7 @@ class TestInlineCommentBodyDefaultsToScaleNotLiteralLow:
 
     def _make_provider(self):
         mc = MagicMock(spec=GitProvider)
+        mc.get_pr_diff_head_sha.return_value = "abc123"
         mc.name = "gitea"
         mc.get_authenticated_user.return_value = "Raven"
         mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
@@ -9543,3 +10201,711 @@ class TestInlineCommentBodyDefaultsToScaleNotLiteralLow:
         assert "[nit]" in body
         assert "🔴" not in body
         assert "[low]" not in body
+
+
+# ------------------------------------------------------------------ #
+#  Comment-flow head binding (audit 2026-09-27 #1)                    #
+# ------------------------------------------------------------------ #
+
+class TestDiffChunkHashes:
+    def test_hashes_each_file_chunk(self):
+        from raven.server import _diff_chunk_hashes
+        diff = ("diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+                "diff --git a/b.py b/b.py\n@@ -1 +1 @@\n-p\n+q\n")
+        got = _diff_chunk_hashes(diff)
+        assert set(got) == {"a.py", "b.py"}
+        assert got["a.py"] == hashlib.sha256(
+            b"diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n").hexdigest()
+
+    def test_headerless_diff_hashes_to_empty(self):
+        """Legacy comment-flow fixtures seed hashes={} with a headerless
+        mock diff; that pairing must stay 'bound'."""
+        from raven.server import _diff_chunk_hashes
+        assert _diff_chunk_hashes("diff...") == {}
+
+
+_BIND_DIFF_A = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+                "@@ -1,1 +1,1 @@\n-x\n+y\n")
+_BIND_DIFF_B = _BIND_DIFF_A + (
+    "diff --git a/evil.py b/evil.py\n--- /dev/null\n+++ b/evil.py\n"
+    "@@ -0,0 +1,1 @@\n+import os; os.system('x')\n")
+_BIND_COMMENT = {"repo": "u/r", "pr_number": 1, "comment_body": "@raven F1 is wrong",
+                 "comment_id": 11, "parent_comment_id": 10, "file_path": "a.py",
+                 "line": 1, "_is_mention": True}
+
+
+def _binding_provider(diff, head="shaB"):
+    mp = MagicMock(spec=GitProvider)
+    mp.name = "gitea"
+    mp.fetch_pr_diff.return_value = diff
+    mp.get_pr_head_sha.return_value = head
+    mp.get_pr_diff_head_sha.return_value = head       # the diff describes the head
+    mp.get_pr_comments.return_value = []
+    mp.get_comment_thread.return_value = [
+        {"id": 10, "parent_id": None, "user": {"login": "raven"}, "body": "F1",
+         "file_path": "a.py", "line": 1}]
+    mp.get_pr_state.return_value = "open"
+    mp.get_pr_metadata.return_value = {"title": "t", "html_url": ""}
+    mp.fetch_file.return_value = ""
+    mp.get_pr_base_ref.return_value = "main"
+    mp.get_authenticated_user.return_value = "raven"
+    mp.get_pr_reviews.return_value = []
+    mp.get_pr_requested_reviewers.return_value = []
+    mp.retract_finding.return_value = True
+    mp.submit_review.return_value = {"id": 99}
+    mp.get_commit_status.return_value = "success"
+    mp.merge_pr.return_value = True
+    mp.supports_comment_threads = True
+    return mp
+
+
+def _seed_bound_entry(verdict, diff=_BIND_DIFF_A, findings=None, config_hash=None):
+    import time as _time
+    from raven.server import _diff_chunk_hashes, _entry_config_hash
+    from raven.severity import default_scale
+    _previous_diffs["gitea:u/r#1"] = CacheEntry(
+        timestamp=_time.time(), hashes=_diff_chunk_hashes(diff),
+        findings=findings if findings is not None else {"a.py": [
+            {"file": "a.py", "line": 1, "severity": "high", "message": "F1",
+             "comment_id": 10}]},
+        verdict=verdict, summary="s",
+        config_hash=(config_hash if config_hash is not None
+                     else _entry_config_hash(default_scale(), None)))
+
+
+class TestCommentFlowHeadBinding:
+    """A comment can revise, retract or merge only while Raven's cached
+    review covers the head it is replying about. Audit 2026-09-27 #1:
+    a push whose review failed or was dropped left the cache describing
+    an older head, and an ordinary reply then approved and merged code
+    no review ever saw."""
+
+    def setup_method(self):
+        _previous_diffs.clear()
+
+    def teardown_method(self):
+        _previous_diffs.clear()
+
+    def test_stale_cache_retraction_does_not_approve_or_merge(self):
+        _seed_bound_entry("needs_work")            # cache describes DIFF_A
+        mp = _binding_provider(_BIND_DIFF_B)       # head is B: evil.py unreviewed
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "you're right", "revise": None, "retract_findings": [10]}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        mp.submit_review.assert_not_called()
+        mp.merge_pr.assert_not_called()
+        mp.retract_finding.assert_not_called()
+        assert _previous_diffs["gitea:u/r#1"].verdict == "needs_work"
+
+    def test_stale_cache_reply_still_posts_with_note(self):
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_B)
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "you're right",
+                "revise": {"verdict": "approve", "body": "ok"},
+                "retract_findings": []}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        body = mp.post_pr_comment.call_args.args[2]
+        assert "you're right" in body
+        assert "latest commit" in body
+        mp.submit_review.assert_not_called()
+
+    def test_same_verdict_review_landing_mid_call_blocks_mutation(self):
+        """A push review of a new head lands while the model is thinking,
+        with the SAME verdict string. The old re-check compared only the
+        verdict, so the stale 'approve' posted and merged over F2."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+
+        def _review_lands(*a, **k):
+            _seed_bound_entry("needs_work", diff=_BIND_DIFF_B, findings={
+                "evil.py": [{"file": "evil.py", "line": 1, "severity": "high",
+                             "message": "F2", "comment_id": 20}],
+                "a.py": []})
+            return {"response": "ok",
+                    "revise": {"verdict": "approve", "body": "F1 is fine"},
+                    "retract_findings": []}
+
+        with patch("raven.server.respond_to_comment", side_effect=_review_lands):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        mp.submit_review.assert_not_called()
+        mp.merge_pr.assert_not_called()
+        assert _previous_diffs["gitea:u/r#1"].verdict == "needs_work"
+
+    def test_retracting_a_non_finding_does_not_trigger_merge(self):
+        """Retraction-on-prior-approve dispatches a merge. It must count
+        only when a cached finding was actually removed — resolving
+        Raven's summary or a failure notice is not a finding retraction."""
+        _seed_bound_entry("approve", findings={"a.py": []})
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        mp.get_comment_thread.return_value = [
+            {"id": 30, "parent_id": None, "user": {"login": "raven"},
+             "body": "summary", "file_path": "", "line": 0}]
+        payload = dict(_BIND_COMMENT, parent_comment_id=30, file_path="", line=0)
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "ok", "revise": None, "retract_findings": [30]}):
+            _process_comment(mp, payload)
+        mp.retract_finding.assert_called_once()   # the resolve itself still happens
+        mp.merge_pr.assert_not_called()
+
+    def test_head_moved_after_pin_blocks_revision(self):
+        """The author pushes during the AI call: the revision must not
+        post APPROVE for a head other than the one the reply was bound to."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A)
+        mp.get_pr_head_sha.side_effect = ["shaA", "shaB"]  # pin, then pre-submit re-check
+        mp.get_pr_diff_head_sha.return_value = "shaA"
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "ok", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": []}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        mp.submit_review.assert_not_called()
+        mp.merge_pr.assert_not_called()
+
+    def test_bound_flip_to_approve_merges_the_pinned_head(self):
+        """Happy path (guards against wedging): a cache that covers the
+        head still lets a comment flip to approve and merge that head."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "agreed", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": []}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        assert mp.submit_review.call_args.kwargs["commit_id"] == "shaA"
+        mp.merge_pr.assert_called_once()
+        assert mp.merge_pr.call_args.kwargs["head_sha"] == "shaA"
+
+    def test_config_drift_since_review_declines_comment_driven_merge(self):
+        """The merge goes through the cached-merge gates, so a verdict
+        computed under a scale/prompt-override that no longer applies does
+        not merge from a comment (it did: the comment path had no config
+        gate)."""
+        _seed_bound_entry("needs_work", config_hash="stale-config")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "agreed", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": []}), \
+             patch("raven.server.inc") as mock_inc:
+            _process_comment(mp, dict(_BIND_COMMENT))
+        mp.merge_pr.assert_not_called()
+        outcomes = [c.args[1]["outcome"] for c in mock_inc.call_args_list
+                    if c.args[0] == "raven_cached_merge_dispatch_total"]
+        assert outcomes == ["declined_config_hash_mismatch"]
+
+    def test_diff_lagging_the_head_counts_as_unbound(self):
+        """Gitea: the PR API reports head B while .diff still serves A
+        (refs/pull/N/head not yet updated). The cache covers A, so the
+        hashes match — but the head that would be approved and merged is
+        B. The diff's own head must equal the pinned head."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaB")   # diff is still A
+        mp.get_pr_diff_head_sha.return_value = "shaA"
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "ok", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": []}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        mp.submit_review.assert_not_called()
+        mp.merge_pr.assert_not_called()
+
+    def test_stale_cache_skip_is_counted_as_head_not_reviewed(self):
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_B)
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "ok", "revise": None, "retract_findings": [10]}), \
+             patch("raven.server.inc") as mock_inc:
+            _process_comment(mp, dict(_BIND_COMMENT))
+        reasons = [c.args[1]["reason"] for c in mock_inc.call_args_list
+                   if c.args[0] == "raven_comment_mutations_skipped_total"]
+        assert reasons == ["head_not_reviewed"]
+
+    def test_non_str_diff_head_counts_as_unbound(self):
+        """A provider that can't say what the diff describes (None, or any
+        non-SHA) must fail closed, like every other branch of the gate."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        mp.get_pr_diff_head_sha.return_value = None
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "ok", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": []}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        mp.submit_review.assert_not_called()
+
+    @staticmethod
+    def _skip_reasons(mock_inc):
+        return [c.args[1]["reason"] for c in mock_inc.call_args_list
+                if c.args[0] == "raven_comment_mutations_skipped_total"]
+
+    def _run_unbound(self, mp, revise=None, retract=(10,)):
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "ok", "revise": revise,
+                "retract_findings": list(retract)}), \
+             patch("raven.server.inc") as mock_inc:
+            _process_comment(mp, dict(_BIND_COMMENT))
+        return self._skip_reasons(mock_inc)
+
+    def test_skip_reason_diff_ref_lag(self):
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaB")
+        mp.get_pr_diff_head_sha.return_value = "shaA"
+        assert self._run_unbound(mp) == ["diff_ref_lag"]
+
+    def test_skip_reason_head_unknown(self):
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        mp.get_pr_head_sha.side_effect = RuntimeError("api down")
+        assert self._run_unbound(mp) == ["head_unknown"]
+
+    def test_skip_reason_no_cache_entry(self):
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        assert self._run_unbound(mp) == ["no_cache_entry"]
+
+    def test_skip_reason_diff_head_unknown(self):
+        """A provider that can't say what the diff describes still fails
+        closed, but under its own reason — it is not evidence of ref lag."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        mp.get_pr_diff_head_sha.return_value = None
+        assert self._run_unbound(mp) == ["diff_head_unknown"]
+
+    def test_skip_reason_diff_head_read_failure(self):
+        """A diff-head read that raises must leave the head unbound — before
+        the diff fetch and after it."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        mp.get_pr_diff_head_sha.side_effect = RuntimeError("502 from the git host")
+        assert self._run_unbound(mp) == ["head_unknown"]
+
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        mp.get_pr_diff_head_sha.side_effect = ["shaA", RuntimeError("502 from the git host")]
+        assert self._run_unbound(mp) == ["head_unknown"]
+
+    def test_skip_reason_push_during_fetch_is_head_moved(self):
+        """The diff ref matched before the fetch and moved during it: a push
+        landed mid-fetch, not a lagging ref."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        mp.get_pr_diff_head_sha.side_effect = ["shaA", "shaB"]
+        assert self._run_unbound(mp) == ["head_moved"]
+
+    def test_no_op_request_is_not_counted(self):
+        """A revise that keeps the prior verdict, with no retraction, asks
+        for nothing — nothing was skipped."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_B)          # unbound
+        assert self._run_unbound(mp, revise={"verdict": "needs_work", "body": "x"},
+                                 retract=()) == []
+
+    def test_head_lookup_failure_means_no_changes(self):
+        """No pinned head, nothing to bind to: reply only."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        mp.get_pr_head_sha.side_effect = RuntimeError("api down")
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "ok", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": [10]}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        mp.retract_finding.assert_not_called()
+        mp.submit_review.assert_not_called()
+        mp.post_pr_comment.assert_called()
+
+    def test_replaced_entry_with_identical_state_blocks_mutation(self):
+        """Identity alone: a concurrent review wrote a NEW entry with the
+        same hashes and verdict. The model reasoned about the old one."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+
+        def _replace(*a, **k):
+            _seed_bound_entry("needs_work")      # new object, same state
+            return {"response": "ok", "revise": {"verdict": "approve", "body": "fine"},
+                    "retract_findings": []}
+
+        with patch("raven.server.respond_to_comment", side_effect=_replace):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        mp.submit_review.assert_not_called()
+
+    def test_no_paused_note_when_bound(self):
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "agreed", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": []}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        body = mp.post_pr_comment.call_args_list[0].args[2]
+        assert "latest commit" not in body
+
+    def test_no_paused_note_for_a_no_op_revise(self):
+        """A 'revise' that keeps the prior verdict requests no change."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_B)            # unbound
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "still a bug", "revise": {"verdict": "needs_work", "body": "x"},
+                "retract_findings": []}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        assert "latest commit" not in mp.post_pr_comment.call_args.args[2]
+
+    def test_revision_cache_write_does_not_clobber_a_newer_entry(self):
+        """A same-head re-review replaces the entry between the TOCTOU
+        check and the revision's cache write: the stale verdict must not
+        be written over it."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+
+        def _submit(*a, **k):
+            _seed_bound_entry("needs_work", findings={"a.py": [
+                {"file": "a.py", "line": 1, "severity": "high", "message": "F9",
+                 "comment_id": 90}]})
+            return {"id": 99}
+
+        mp.submit_review.side_effect = _submit
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "ok", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": []}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        assert _previous_diffs["gitea:u/r#1"].verdict == "needs_work"
+        mp.merge_pr.assert_not_called()
+
+    def test_comment_driven_dispatch_is_labelled_by_source(self):
+        """Comment-driven merges share the cached-merge gate, but must stay
+        distinguishable from the no-changes wedge-recovery dispatches."""
+        _seed_bound_entry("needs_work")
+        mp = _binding_provider(_BIND_DIFF_A, head="shaA")
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "agreed", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": []}), \
+             patch("raven.server.inc") as mock_inc:
+            _process_comment(mp, dict(_BIND_COMMENT))
+        labels = [c.args[1] for c in mock_inc.call_args_list
+                  if c.args[0] == "raven_cached_merge_dispatch_total"]
+        assert labels == [{"outcome": "dispatched", "repo": "u/r", "source": "comment"}]
+
+# ------------------------------------------------------------------ #
+#  Dropped concurrent push is re-run (audit 2026-09-27 #7)            #
+# ------------------------------------------------------------------ #
+
+class _InlineReviewExecutor:
+    """Runs executor.submit() inline, recording each call."""
+    def __init__(self):
+        self.calls = []
+
+    def submit(self, fn, *args, **kwargs):
+        from concurrent.futures import Future
+        self.calls.append((fn, args))
+        fut = Future()
+        try:
+            fut.set_result(fn(*args, **kwargs))
+        except BaseException as exc:
+            fut.set_exception(exc)
+        return fut
+
+
+class TestConcurrentPushRerun:
+    """A push that lands while its PR is being reviewed used to be dropped
+    for good: the in-progress guard returned and nothing re-ran it, so
+    the new commit stayed unreviewed until another event arrived."""
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def teardown_method(self):
+        _previous_diffs.clear()
+
+    @staticmethod
+    def _payload(sha):
+        return {"repo": "owner/repo", "sender": "alice", "pr_number": 42,
+                "pr_title": "PR #42", "pr_url": "", "head_sha": sha,
+                "head_ref": "feature", "base_ref": "main"}
+
+    @staticmethod
+    def _provider(heads):
+        mc = MagicMock(spec=GitProvider)
+        # The diff below is built from the current head, so it describes it.
+        mc.get_pr_diff_head_sha.side_effect = lambda *a: heads["current"]
+        mc.name = "gitea"
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.fetch_file.return_value = ""
+        mc.list_directory.return_value = []
+        mc.get_pr_state.return_value = "open"
+        mc.get_commit_status.return_value = "success"
+        mc.merge_pr.return_value = True
+        mc.submit_review.return_value = {"id": 1}
+        mc.get_pr_head_sha.side_effect = lambda *a: heads["current"]
+        mc.fetch_pr_diff.side_effect = lambda *a: (
+            f"diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n"
+            f"@@ -1 +1 @@\n-x\n+{heads['current']}\n")
+        return mc
+
+    _BLOCKING = {"severity": "high", "summary": "bug",
+                 "findings": [{"file": "f.py", "line": 1, "severity": "high",
+                               "message": "real bug"}]}
+
+    def test_push_during_review_is_rerun_with_latest_payload(self, monkeypatch):
+        """The guard's park, on its own: the review BLOCKS (no approve), so
+        the head re-check can't park anything — only the in-progress guard
+        does. Three pushes during one review → exactly one re-run, carrying
+        the LAST push's payload."""
+        import raven.server as _srv
+        inline = _InlineReviewExecutor()
+        monkeypatch.setattr(_srv, "executor", inline)
+        heads = {"current": "shaA"}
+        mc = self._provider(heads)
+        calls = []
+
+        def _review(diff, *a, **k):
+            calls.append(heads["current"])
+            if len(calls) == 1:
+                for sha in ("shaB", "shaC"):
+                    heads["current"] = sha
+                    _process_pr(mc, self._payload(sha))
+            return dict(self._BLOCKING)
+
+        with patch("raven.server.review_diff", side_effect=_review), \
+             patch("raven.server.notify"), patch("raven.server.time.sleep"):
+            _process_pr(mc, self._payload("shaA"))
+        rerun_heads = [args[1]["head_sha"] for fn, args in inline.calls
+                       if fn is _srv._process_pr]
+        assert rerun_heads == ["shaC"]
+        assert calls == ["shaA", "shaC"]
+        assert not _srv._rerun_requested
+        assert "gitea:owner/repo#42" not in _srv._in_progress_prs
+
+    def test_stale_event_for_the_running_head_does_not_displace_a_newer_push(self, monkeypatch):
+        """Push B parks mid-review of A; then a stale event for A arrives
+        (a redelivery, an out-of-order delivery). It must not replace B —
+        A is dropped as already reviewed, so B would never re-run."""
+        import raven.server as _srv
+        inline = _InlineReviewExecutor()
+        monkeypatch.setattr(_srv, "executor", inline)
+        heads = {"current": "shaA"}
+        mc = self._provider(heads)
+
+        def _review(diff, *a, **k):
+            if heads["current"] == "shaA":
+                heads["current"] = "shaB"
+                _process_pr(mc, dict(self._payload("shaB"), pr_title="B-webhook"))
+                _process_pr(mc, self._payload("shaA"))     # stale, arrives later
+            return dict(self._BLOCKING)
+
+        with patch("raven.server.review_diff", side_effect=_review), \
+             patch("raven.server.notify"), patch("raven.server.time.sleep"):
+            _process_pr(mc, self._payload("shaA"))
+        reruns = [args[1] for fn, args in inline.calls if fn is _srv._process_pr]
+        # The B webhook itself survived — not A's payload re-pointed at B.
+        assert [(r["head_sha"], r["pr_title"]) for r in reruns] == [("shaB", "B-webhook")]
+
+    def test_older_head_event_is_rerun_for_the_current_head(self, monkeypatch):
+        """Delivery order is not push order: a redelivered OLDER push (not
+        the head under review) can displace a newer parked push. The re-run
+        must target the current head, not the stale one."""
+        import raven.server as _srv
+        inline = _InlineReviewExecutor()
+        monkeypatch.setattr(_srv, "executor", inline)
+        heads = {"current": "shaA"}
+        mc = self._provider(heads)
+
+        def _review(diff, *a, **k):
+            if heads["current"] == "shaA":
+                heads["current"] = "shaB"
+                _process_pr(mc, self._payload("shaB"))     # the real push
+                _process_pr(mc, self._payload("shaZ"))     # an older push, redelivered
+            return dict(self._BLOCKING)
+
+        with patch("raven.server.review_diff", side_effect=_review), \
+             patch("raven.server.notify"), patch("raven.server.time.sleep"):
+            _process_pr(mc, self._payload("shaA"))
+        reruns = [args[1]["head_sha"] for fn, args in inline.calls if fn is _srv._process_pr]
+        assert reruns == ["shaB"]
+
+    def test_same_head_event_rechecks_the_head_before_dropping(self, monkeypatch):
+        """Only a same-head event is parked (the push's own webhook was
+        lost), but the head moved: the run must re-run for the current
+        head instead of dropping it."""
+        import raven.server as _srv
+        inline = _InlineReviewExecutor()
+        monkeypatch.setattr(_srv, "executor", inline)
+        heads = {"current": "shaA"}
+        mc = self._provider(heads)
+
+        def _review(diff, *a, **k):
+            if not inline.calls and heads["current"] == "shaA":
+                _process_pr(mc, self._payload("shaA"))     # same-head event parks
+            return dict(self._BLOCKING)
+
+        def _submit(*a, **k):
+            heads["current"] = "shaC"                       # push lands; webhook lost
+            return {"id": 1}
+        mc.submit_review.side_effect = _submit
+
+        with patch("raven.server.review_diff", side_effect=_review), \
+             patch("raven.server.notify"), patch("raven.server.time.sleep"):
+            _process_pr(mc, self._payload("shaA"))
+        reruns = [args[1]["head_sha"] for fn, args in inline.calls if fn is _srv._process_pr]
+        assert reruns == ["shaC"]
+
+    def test_head_moved_replaces_a_stale_parked_event(self, monkeypatch):
+        """The approve re-check parks for the CURRENT head: a parked event
+        for an older head (stale A) is replaced, not kept."""
+        import raven.server as _srv
+        inline = _InlineReviewExecutor()
+        monkeypatch.setattr(_srv, "executor", inline)
+        heads = {"current": "shaA"}
+        mc = self._provider(heads)
+
+        def _review(diff, *a, **k):
+            if heads["current"] == "shaA":
+                _process_pr(mc, self._payload("shaA"))     # stale same-head event
+                heads["current"] = "shaC"                   # push; its webhook lost
+            return {"severity": "low", "summary": "ok", "findings": []}
+
+        with patch("raven.server.review_diff", side_effect=_review), \
+             patch("raven.server.notify"), patch("raven.server.time.sleep"):
+            _process_pr(mc, self._payload("shaA"))
+        reruns = [args[1]["head_sha"] for fn, args in inline.calls if fn is _srv._process_pr]
+        assert reruns == ["shaC"]
+
+    def test_a_transient_head_read_fault_before_approving_is_retried(self, monkeypatch):
+        """The review is already paid for: one API blip on the pre-submit
+        head read must not throw it away. Only the read is retried."""
+        import raven.server as _srv
+        inline = _InlineReviewExecutor()
+        monkeypatch.setattr(_srv, "executor", inline)
+        mc = self._provider({"current": "shaA"})
+        reads = {"n": 0}
+
+        def _head(*a):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                raise RuntimeError("api blip")
+            return "shaA"
+        mc.get_pr_head_sha.side_effect = _head
+        with patch("raven.server.review_diff", return_value={
+                "severity": "low", "summary": "ok", "findings": []}) as mock_review, \
+             patch("raven.server.notify"), patch("raven.server.time.sleep"):
+            _process_pr(mc, self._payload("shaA"))
+        mock_review.assert_called_once()
+        assert mc.submit_review.call_args.kwargs["approve"] is True
+        assert mc.submit_review.call_args.kwargs["commit_id"] == "shaA"
+
+    @pytest.mark.parametrize("read", [RuntimeError("api down"), None, "", 123])
+    def test_unverifiable_head_posts_nothing_and_parks_nothing(self, monkeypatch, read):
+        """An APPROVE must name the head it covers. When the pre-submit
+        re-read fails or returns no SHA, nothing is posted or cached — no
+        formal APPROVE (branch protection may count it), no comment-only
+        stand-in whose cached approve would re-arm a merge — and nothing is
+        parked, since re-running on an API error could loop paid reviews.
+        A classified failure comment asks for a re-trigger instead."""
+        import raven.server as _srv
+        inline = _InlineReviewExecutor()
+        monkeypatch.setattr(_srv, "executor", inline)
+        mc = self._provider({"current": "shaA"})
+        if isinstance(read, Exception):
+            mc.get_pr_head_sha.side_effect = read
+        else:
+            mc.get_pr_head_sha.side_effect = None
+            mc.get_pr_head_sha.return_value = read
+        with patch("raven.server.review_diff", return_value={
+                "severity": "low", "summary": "ok", "findings": []}), \
+             patch("raven.server.notify"), patch("raven.server.time.sleep"), \
+             patch("raven.server.inc") as mock_inc:
+            _process_pr(mc, self._payload("shaA"))
+        mc.submit_review.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        assert "gitea:owner/repo#42" not in _srv._previous_diffs
+        failures = [c.args[1]["reason"] for c in mock_inc.call_args_list
+                    if c.args[0] == "raven_review_failures_total"]
+        assert failures == ["head_unverified"]
+        assert "confirm" in mc.post_pr_comment.call_args.args[2]
+        assert not [1 for fn, _ in inline.calls if fn is _srv._process_pr]
+        assert not _srv._rerun_requested
+
+    def test_older_head_event_is_dropped_when_the_head_was_just_posted(self, monkeypatch):
+        """A redelivered OLDER push parks while the current head is under
+        review; the head doesn't move. The re-read head is the one just
+        posted, so the event has nothing left to do: re-running it would
+        only dispatch the merge a second time."""
+        import raven.server as _srv
+        inline = _InlineReviewExecutor()
+        monkeypatch.setattr(_srv, "executor", inline)
+        heads = {"current": "shaA"}
+        mc = self._provider(heads)
+
+        def _review(diff, *a, **k):
+            if not mc.submit_review.called:
+                _process_pr(mc, self._payload("shaZ"))     # older push, redelivered
+            return {"severity": "low", "summary": "ok", "findings": []}
+
+        with patch("raven.server.review_diff", side_effect=_review), \
+             patch("raven.server.notify"), patch("raven.server.time.sleep"):
+            _process_pr(mc, self._payload("shaA"))
+        assert not [1 for fn, _ in inline.calls if fn is _srv._process_pr]
+        mc.merge_pr.assert_called_once()
+
+    def test_same_head_event_during_review_is_not_rerun(self, monkeypatch):
+        """A same-head event parked mid-review (re-requested review, late
+        redelivery) must not re-run once that head was just reviewed and
+        posted — the re-run would take the no-changes skip and dispatch a
+        second merge, whose failure alerts on a PR that merged."""
+        import raven.server as _srv
+        inline = _InlineReviewExecutor()
+        monkeypatch.setattr(_srv, "executor", inline)
+        heads = {"current": "shaA"}
+        mc = self._provider(heads)
+
+        def _review(diff, *a, **k):
+            _process_pr(mc, self._payload("shaA"))     # same head, parked
+            return {"severity": "low", "summary": "ok", "findings": []}
+
+        with patch("raven.server.review_diff", side_effect=_review), \
+             patch("raven.server.notify"), patch("raven.server.time.sleep"):
+            _process_pr(mc, self._payload("shaA"))
+        assert not [1 for fn, _ in inline.calls if fn is _srv._process_pr]
+        mc.merge_pr.assert_called_once()
+
+    def test_head_moved_keeps_a_fresher_parked_webhook(self, monkeypatch):
+        """The approve re-check parks a re-run for the current head only if
+        nothing is parked: a webhook parked during this run is at least as
+        fresh, and carries its own title/base_ref."""
+        import raven.server as _srv
+        inline = _InlineReviewExecutor()
+        monkeypatch.setattr(_srv, "executor", inline)
+        heads = {"current": "shaA"}
+        mc = self._provider(heads)
+
+        def _review(diff, *a, **k):
+            if heads["current"] == "shaA":
+                heads["current"] = "shaD"
+                _process_pr(mc, dict(self._payload("shaD"), pr_title="from-webhook"))
+            return {"severity": "low", "summary": "ok", "findings": []}
+
+        with patch("raven.server.review_diff", side_effect=_review), \
+             patch("raven.server.notify"), patch("raven.server.time.sleep"):
+            _process_pr(mc, self._payload("shaA"))
+        reruns = [args[1] for fn, args in inline.calls if fn is _srv._process_pr]
+        assert [r["pr_title"] for r in reruns] == ["from-webhook"]
+
+    def test_approve_for_a_moved_head_is_not_posted(self, monkeypatch):
+        """The review computed for A must not post APPROVE once the head
+        is C — the re-run reviews C instead."""
+        import raven.server as _srv
+        inline = _InlineReviewExecutor()
+        monkeypatch.setattr(_srv, "executor", inline)
+        heads = {"current": "shaA"}
+        mc = self._provider(heads)
+        posted = []
+        mc.submit_review.side_effect = lambda *a, **k: posted.append(
+            (k.get("commit_id"), k.get("approve"))) or {"id": len(posted)}
+
+        def _review(diff, *a, **k):
+            if heads["current"] == "shaA":
+                heads["current"] = "shaC"          # push lands mid-review
+                _process_pr(mc, self._payload("shaC"))
+            return {"severity": "low", "summary": "ok", "findings": []}
+
+        with patch("raven.server.review_diff", side_effect=_review), \
+             patch("raven.server.notify"), patch("raven.server.time.sleep"):
+            _process_pr(mc, self._payload("shaA"))
+        assert ("shaA", True) not in posted
+        assert ("shaC", True) in posted

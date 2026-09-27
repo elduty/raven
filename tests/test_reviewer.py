@@ -2093,6 +2093,23 @@ class TestReviewConfigHashIncludesBackend:
         assert lower == mixed
         _reset_backend_cache()
 
+    def test_config_hash_changes_when_verdict_logic_version_changes(self, monkeypatch):
+        """A deploy that changes HOW a verdict is computed must wipe cached
+        verdicts. Nothing in the config tuple moves when only the code does,
+        so without this a verdict computed under superseded (possibly
+        vulnerable) logic stays merge-actionable via the cached-merge path.
+        Seen live 2026-08-04: 18 entries survived a verdict-logic deploy."""
+        from raven import reviewer as rv
+        from raven.ai import _reset_backend_cache
+        fake = MagicMock(); fake.name = "claude_cli"
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+        monkeypatch.setattr(rv, "_VERDICT_LOGIC_VERSION", "1", raising=False)
+        before = rv.review_config_hash()
+        monkeypatch.setattr(rv, "_VERDICT_LOGIC_VERSION", "2", raising=False)
+        after = rv.review_config_hash()
+        assert before != after
+        _reset_backend_cache()
+
 
 class TestRespondNullAuthorHardening:
     """A deleted/anonymous comment author serializes as ``{"user": null}`` on
