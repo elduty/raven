@@ -857,12 +857,10 @@ def review_config_hash() -> str:
 
 # Binary / lock file extensions and names to strip from diffs
 # Stripped without a coverage gap: media, documents, archives and fonts
-# stay auto-mergeable (D2 (b), 2026-09-27). Not here, so a git binary diff
-# of them is a coverage gap a human merges (strip_diff's binary_gaps):
-# compiled code (.so .dll .dylib .exe .pyc .o .a .jar .node .wasm) and a
-# binary with any other extension. On BB DC a binary is a header-only
-# section with no marker, so it doesn't gap there yet (CLAUDE.md Known
-# gaps #2b). .svg is text, and can carry script.
+# stay auto-mergeable (D2 (b), 2026-09-27). Not here, so they aren't
+# stripped and go to strip_diff's binary_gaps check: compiled code (.so
+# .dll .dylib .exe .pyc .o .a .jar .node .wasm) and a binary with any other
+# extension. .svg is text, and can carry script.
 SKIP_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
     ".tiff", ".tif", ".mp4", ".mp3", ".wav", ".ogg",
