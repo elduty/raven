@@ -2,9 +2,47 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## v0.7.0 — 2026-09-29
+
+Security release. **Upgrade recommended.** It closes ways a pull request could be approved and auto-merged with code the model never saw: content Raven strips from the review, file content that could disguise itself as diff structure, and file names or answers that could steer the review. Upgrading wipes the findings cache once (see Upgrading).
+
+### Fixed
+
+- **Changed lockfiles need a human merge.** Raven never shows the model lockfile content, so a lockfile change was approved without anything reading it. Every PR that changes a lockfile (edits, adds or deletes one, or renames a file onto or off a lockfile name) now carries a coverage gap and doesn't auto-merge.
+- **A push that changes only a lockfile can't merge from a cached approval.** The merge gate now compares the lockfiles a PR changes, not just the files the model reviewed.
+- **The model is told which files it isn't shown.** Lockfiles and skip-listed binaries (media, documents, archives, fonts) are named in the prompt as changed but not shown. A rename to a skipped name keeps showing the model the file it removed.
+- **`.svg` files are reviewed as text** instead of being stripped with the other images.
+- **File content can't pass itself off as diff structure.** Diffs are split on newlines only, and other line-break characters are shown to the model as visible markers.
+- **File names are treated as data.** Every path named in the prompt is escaped. A path containing a control character is a coverage gap until the file is renamed. A finding on a path a rename removed stays on the rename's target instead of being dropped.
+- **Only a review-shaped answer counts as the review.** Output that holds no review, or two different ones, is a parse error and blocks the merge.
+- **Consolidation can't drop a blocker.** On large PRs, the pass that applies whole-PR rules may still trim non-blocking findings, but a blocking finding it drops or downgrades is restored.
+- **Rebase tolerance can't be fooled by moved code.** A file's findings are carried over a rebase only if every hunk matches, including edits reordered around unchanged lines and mode changes (a file turned into a symlink, say). A relocation found during a review that then fails isn't trusted on the next push.
+
+### Changed
+
+- **PRs that change a lockfile, dependency bumps included, no longer auto-merge.** Raven reviews the rest of the PR as usual and marks the lockfile as not reviewed; a human merges it.
+
+### Corrections to earlier notes
+
+- **v0.6.0's rebase notes overstated two guarantees.** They said a push that only rebases "reviews nothing and merges nothing", and that a file whose surrounding code changed is sent back for a real review. Until v0.6.2, a rebase-only push could let a later trigger merge a head no review had covered (fixed in v0.6.2). Until this release, an edit reordered within its hunk, or a mode change such as a file turned into a symlink, still counted as unchanged (fixed above).
+
+### Added
+
+- Metric `raven_consolidation_findings_restored_total{reason,repo}`: blocking findings the consolidation pass dropped (`missing`) or downgraded (`downgraded`), restored at their original severity.
+
+### Upgrading
+
+**Upgrade recommended. Nothing to configure.** The first start after the upgrade discards the findings cache, so each open PR gets one full review on its next push or review request; deploy off-peak if many PRs are open. Findings from that review are posted fresh, so earlier resolutions don't carry over. On Bitbucket DC with an "all comments resolved" merge check, resolve the fresh threads and re-request Raven's review.
+
+Raven still requires a single gunicorn worker (`--workers 1`).
+
+### Stats
+
+1713 tests across 20 test files (up from 1468 at v0.6.2).
+
 ## v0.6.2 — 2026-09-27
 
-Patch release. It closes several ways a pull request could be auto-merged at a commit no review had covered. None of them needed anyone to act in bad faith, only ordinary timing: a push landing mid-review, a rebase, a comment reply to an older review, or a git host briefly serving the previous diff. Upgrading wipes the findings cache once (see Upgrading).
+Patch release. **Upgrade recommended.** It closes several ways a pull request could be auto-merged at a commit no review had covered. None of them needed anyone to act in bad faith, only ordinary timing: a push landing mid-review, a rebase, a comment reply to an older review, or a git host briefly serving the previous diff. Upgrading wipes the findings cache once (see Upgrading).
 
 ### Fixed
 

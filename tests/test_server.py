@@ -1011,6 +1011,60 @@ class TestProcessPr:
         mc.post_pr_comment.assert_called_once()
         assert "Empty diff" in mc.post_pr_comment.call_args[0][2]
 
+    def test_binary_source_only_diff_is_reviewed_as_a_gap_not_skipped(self):
+        """Audit 09-27 #2b: a push whose only change is a source file git
+        diffs as binary (one NUL byte is enough) hit the empty-diff skip,
+        so nothing reviewed it and nothing marked it unreviewed. It now
+        gets a review, forced to needs_work, and no merge."""
+        import json
+        from raven.ai.base import CompletionResult
+        diff = ("diff --git a/src/app.py b/src/app.py\nindex 1111111..2222222 100644\n"
+                "Binary files a/src/app.py and b/src/app.py differ\n")
+        mc = self._make_provider()
+        self._setup_raven_only(mc)
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        fake.complete.return_value = CompletionResult(text=json.dumps(
+            {"severity": "low", "summary": "ok", "findings": []}))
+        with (
+            patch("raven.ai._cached_backend", fake),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            mc.fetch_pr_diff.return_value = diff
+            mc.fetch_file.return_value = ""
+            mc.get_pr_description.return_value = ""
+            mc.get_pr_comments.return_value = []
+            mc.submit_review.return_value = {"id": 1}
+            mc.get_commit_status.return_value = "success"
+            mc.merge_pr.return_value = True
+            _process_pr(mc, self._normalized_payload())
+        mc.submit_review.assert_called_once()
+        assert mc.submit_review.call_args.kwargs["approve"] is False
+        mc.merge_pr.assert_not_called()
+        assert _previous_diffs["gitea:owner/repo#42"].coverage_gap_files == ["src/app.py"]
+        # Its content can't be shown meaningfully, and a binary with few
+        # newlines would pass the line cap whole (Raven's review of #262).
+        assert "src/app.py" not in [c.args[1] for c in mc.fetch_file.call_args_list]
+
+    def test_stripped_files_reach_review_diff(self):
+        """The model is told which files the PR changes but it isn't shown
+        (audit 09-27 #4)."""
+        diff = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+                "diff --git a/yarn.lock b/yarn.lock\n--- a/yarn.lock\n+++ b/yarn.lock\n"
+                "@@ -1 +1 @@\n-a\n+b\n")
+        mc = self._make_provider()
+        self._setup_raven_only(mc)
+        with (patch("raven.server.review_diff", return_value={
+                  "severity": "low", "summary": "ok", "findings": []}) as rd,
+              patch("raven.server.notify"), patch("raven.server.time.sleep")):
+            mc.fetch_pr_diff.return_value = diff
+            mc.fetch_file.return_value = ""
+            mc.submit_review.return_value = {"id": 1}
+            mc.get_commit_status.return_value = "success"
+            _process_pr(mc, self._normalized_payload())
+        assert rd.call_args.kwargs["stripped_files"] == ["yarn.lock"]
+
     def test_review_submit_failure_blocks_merge(self):
         mc = self._make_provider()
         self._setup_raven_only(mc)
@@ -3209,6 +3263,76 @@ class TestRebaseTolerance:
             "re-reviewed, not silently carried onto its new line"
         )
 
+    # Audit 09-27 #5: edits the rebase-tolerance digests used to miss.
+    APP_P1 = ("diff --git a/app.py b/app.py\nindex 27c2de9..4b6d14d 100644\n"
+              "--- a/app.py\n+++ b/app.py\n@@ -1,3 +1,4 @@\n"
+              " def delete(req):\n     require_admin(req)\n+    db.drop_all()\n     return ok()\n")
+    # The same added line moved above the check: an authz bypass with the
+    # same +/- lines and the same hunk position.
+    APP_P2 = ("diff --git a/app.py b/app.py\nindex 27c2de9..d08e602 100644\n"
+              "--- a/app.py\n+++ b/app.py\n@@ -1,3 +1,4 @@\n"
+              " def delete(req):\n+    db.drop_all()\n     require_admin(req)\n     return ok()\n")
+    SYM_FILE = ("diff --git a/fixture b/fixture\nnew file mode 100644\nindex 0000000..8b29d7e\n"
+                "--- /dev/null\n+++ b/fixture\n@@ -0,0 +1 @@\n+../../.ssh/id_rsa\n"
+                "\\ No newline at end of file\n")
+    SYM_LINK = SYM_FILE.replace("new file mode 100644", "new file mode 120000")
+
+    def test_reordered_edit_is_re_reviewed(self):
+        """rv_test_reorder_e2e.py, inverted: moving an added line across a
+        context line keeps the content hash and the hunk position, so only
+        the hunk body's line order tells the pushes apart."""
+        self._seed({"a.py": self.A_OLD, "app.py": self.APP_P1},
+                   {"a.py": [], "app.py": []}, verdict="approve")
+        _, mock_review = self._run(self.A_NEW + self.APP_P2)
+        assert "db.drop_all()" in mock_review.call_args.args[0]
+
+    def test_a_reorder_alone_on_a_needs_work_pr_is_reviewed(self):
+        """Raven's review of #269: with no other change, the push would take
+        the rebase-only shortcut (no review, new digests recorded) unless the
+        same-position check runs first; the next content push would then
+        carry the reorder into an approve."""
+        self._seed({"app.py": self.APP_P1}, {"app.py": []}, verdict="needs_work")
+        _, mock_review = self._run(self.APP_P2)
+        mock_review.assert_called_once()
+        assert "db.drop_all()" in mock_review.call_args.args[0]
+
+    def test_a_mode_change_to_a_symlink_is_re_reviewed(self):
+        """fixtures/symlink_p{1,2}.diff: the same bytes as a file, then as a
+        symlink. Only the mode line differs."""
+        self._seed({"a.py": self.A_OLD, "fixture": self.SYM_FILE},
+                   {"a.py": [], "fixture": []}, verdict="approve")
+        _, mock_review = self._run(self.A_NEW + self.SYM_LINK)
+        assert "new file mode 120000" in mock_review.call_args.args[0]
+
+    def test_a_failed_pass_does_not_launder_a_relocation(self):
+        """test_repro_failed_pass_hunks.py: a relocation found on a pass
+        whose review then failed must still be found on the next pass. The
+        pre-review remap wrote every file's new geometry into the entry, so
+        the relocated file compared equal and merged unreviewed."""
+        from raven.ai.base import AIError
+        c_before = self.B_BEFORE.replace("b.py", "c.py")
+        c_after = self.B_AFTER.replace("b.py", "c.py")
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE, "c.py": c_before},
+                   {"a.py": [], "b.py": [], "c.py": [self._finding(file="c.py")]},
+                   verdict="needs_work")
+        diff = self.A_NEW + self.B_MOVED + c_after
+        mc = self._make_provider()
+        mc.fetch_pr_diff.return_value = diff
+        with (patch("raven.server.review_diff",
+                    side_effect=AIError("cap", reason="usage_limit")) as failed,
+              patch("raven.server.notify")):
+            _process_pr(mc, self._normalized_payload())
+        assert "zzz47" in failed.call_args.args[0]       # found on the failed pass
+        _recent_prs.clear()
+        _, mock_review = self._run(diff)
+        assert "zzz47" in mock_review.call_args.args[0]  # and found again
+        # c.py was remapped on the failed pass: its line and geometry moved
+        # together, so the second run carries the finding where it is,
+        # comment_id intact, instead of shifting it again or re-reviewing.
+        assert "c.py" not in mock_review.call_args.args[0]
+        [carried] = _previous_diffs["gitea:owner/repo#42"].findings["c.py"]
+        assert (carried["line"], carried["comment_id"]) == (50, 999)
+
     def test_legacy_entry_without_context_still_remaps(self):
         """Entries written before hunk_context existed have nothing to
         compare, so they degrade to the previous behaviour (remap on
@@ -4097,8 +4221,8 @@ class TestCoverageGapBlocksMerge:
     Implementation spans raven/reviewer.py (gap detection + file-keyed
     ⚠️ markers on the chunked paths) and raven/server.py (CacheEntry
     persistence, per-file sticky carry, verdict force, gates in both
-    dispatch flows) — earlier commits on this branch; see CLAUDE.md
-    "Coverage-gap tracking" for the lifecycle summary."""
+    dispatch flows) — earlier commits on this branch; see
+    docs/design-notes.md "Coverage-gap tracking" for the lifecycle."""
 
     def setup_method(self):
         _recent_prs.clear()
@@ -4226,6 +4350,49 @@ class TestCoverageGapBlocksMerge:
         self._run(review)
         entry = _previous_diffs["gitea:owner/repo#42"]
         assert entry.coverage_gap_files == ["big.py"]
+
+    def test_control_char_path_blocks_approve_end_to_end(self):
+        """Audit 09-27 #9, through the real review_diff: a file whose
+        name carries a newline reviews clean, yet the PR posts as
+        needs_work, doesn't merge, and caches the gap — so the no-changes
+        skip and the comment flow can't merge it later either."""
+        from raven.ai.base import CompletionResult
+        backend = MagicMock()
+        backend.name = "claude_cli"
+        backend.complete.return_value = CompletionResult(
+            text='{"severity": "low", "summary": "clean", "findings": []}')
+        diff = ('diff --git "a/x.py\\n## note" "b/x.py\\n## note"\n'
+                "@@ -0,0 +1 @@\n+print(1)\n")
+        mc = self._make_provider()
+        with (
+            patch("raven.ai._cached_backend", backend),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+            patch("raven.server._safe_do_merge") as mock_merge,
+        ):
+            mc.fetch_pr_diff.return_value = diff
+            mc.fetch_file.return_value = ""
+            mc.list_directory.return_value = []
+            mc.get_pr_description.return_value = ""
+            mc.get_pr_comments.return_value = []
+            mc.get_resolved_comment_ids.return_value = set()
+            mc.submit_review.return_value = {"id": 1}
+            mc.get_commit_status.return_value = "success"
+            mc.merge_pr.return_value = True
+            mc.get_authenticated_user.return_value = "Raven"
+            mc.get_pr_reviews.return_value = [
+                {"user": {"login": "Raven"}, "state": "APPROVED"},
+            ]
+            mc.get_pr_requested_reviewers.return_value = []
+            mc.get_pr_head_sha.return_value = "abc123"
+            _process_pr(mc, self._normalized_payload())
+        backend.complete.assert_called_once()
+        mc.submit_review.assert_called_once()
+        assert mc.submit_review.call_args.kwargs["approve"] is False
+        mock_merge.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        entry = _previous_diffs["gitea:owner/repo#42"]
+        assert entry.coverage_gap_files == ["x.py\n## note"]
 
     def test_incremental_gap_persists_while_gap_file_unchanged(self):
         """Incremental re-reviews only run review_diff on changed files —
@@ -10909,3 +11076,399 @@ class TestConcurrentPushRerun:
             _process_pr(mc, self._payload("shaA"))
         assert ("shaA", True) not in posted
         assert ("shaC", True) in posted
+
+
+def test_split_chunk_by_hunks_keeps_a_separator_inside_its_line():
+    """The comment flow's hunk splitter splits on "\n" only, like git: a
+    \f inside an added line must not start a forged hunk."""
+    from raven.server import _split_chunk_by_hunks
+    chunk = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+             "@@ -1,1 +1,2 @@\n a\n+b\f@@ -50,1 +50,1 @@\n")
+    _, hunks = _split_chunk_by_hunks(chunk)
+    assert len(hunks) == 1
+
+
+_GATE_A = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+           "@@ -1,1 +1,1 @@\n-x\n+y\n")
+_GATE_LOCK = ("diff --git a/package-lock.json b/package-lock.json\n"
+              "--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,1 +1,1 @@\n"
+              '-"resolved": "https://registry.npmjs.org/x"\n'
+              '+"resolved": "https://registry.example.invalid/x"\n')
+
+
+class TestGateHashesCoverStrippedFiles:
+    """Audit 09-27 #4: every merge-gate hash was computed over the diff
+    with lockfiles and binaries stripped, so a push that only changed a
+    stripped file hashed the same as the approved head and merged from
+    the cache with no review. The gate identity now covers every file
+    the PR changes; what the model reviews is still the stripped diff."""
+
+    PR_KEY = "gitea:owner/repo#42"
+
+    def setup_method(self):
+        _recent_prs.clear()
+        _previous_diffs.clear()
+
+    def teardown_method(self):
+        _previous_diffs.clear()
+
+    def _seed(self, verdict, diff=_GATE_A):
+        import time as _time
+        from raven.reviewer import diff_hash, split_diff_by_file, strip_diff
+        from raven.server import _diff_chunk_hashes, _entry_config_hash
+        from raven.severity import default_scale
+        clean = strip_diff(diff).clean
+        _previous_diffs[self.PR_KEY] = CacheEntry(
+            timestamp=_time.time(), hashes=_diff_chunk_hashes(diff),
+            content_hashes={f: diff_hash(c) for f, c in split_diff_by_file(clean)},
+            findings={"a.py": []}, verdict=verdict, summary="s",
+            config_hash=_entry_config_hash(default_scale(), None))
+
+    def _provider(self, diff):
+        mc = MagicMock(spec=GitProvider)
+        mc.name = "gitea"
+        mc.fetch_pr_diff.return_value = diff
+        mc.get_pr_diff_head_sha.return_value = "shaB"
+        mc.get_pr_head_sha.return_value = "shaB"
+        mc.fetch_file.return_value = ""
+        mc.get_pr_description.return_value = ""
+        mc.get_pr_comments.return_value = []
+        mc.get_authenticated_user.return_value = "Raven"
+        mc.get_pr_reviews.return_value = [{"user": {"login": "Raven"}, "state": "APPROVED"}]
+        mc.get_pr_requested_reviewers.return_value = []
+        mc.get_pr_state.return_value = "open"
+        mc.get_resolved_comment_ids.return_value = set()
+        mc.submit_review.return_value = {"id": 1}
+        mc.get_commit_status.return_value = "success"
+        mc.merge_pr.return_value = True
+        return mc
+
+    def _payload(self):
+        return {"repo": "owner/repo", "sender": "alice", "pr_number": 42,
+                "pr_title": "t", "pr_url": "", "head_sha": "shaB",
+                "head_ref": "feature", "base_ref": "main"}
+
+    def test_diff_chunk_hashes_cover_stripped_files(self):
+        from raven.server import _diff_chunk_hashes
+        assert set(_diff_chunk_hashes(_GATE_A + _GATE_LOCK)) == {"a.py", "package-lock.json"}
+
+    def test_lockfile_only_push_to_an_approved_pr_is_reviewed_not_merged_from_cache(self):
+        """The audit's repro (test_lockfile_only_push_hits_no_changes_skip_
+        and_merges), inverted: no no-changes skip, no cached merge. The
+        approved PR's changed head gets a full review, like a rebase."""
+        self._seed("approve")
+        mc = self._provider(_GATE_A + _GATE_LOCK)
+        with (patch("raven.server.review_diff", return_value={
+                  "severity": "low", "summary": "ok", "findings": []}) as rd,
+              patch("raven.server.notify"),
+              patch("raven.server.inc") as mock_inc):
+            _process_pr(mc, self._payload())
+        rd.assert_called_once()
+        skipped = [c.args[1].get("reason") for c in mock_inc.call_args_list
+                   if c.args[0] == "raven_reviews_skipped_total"]
+        assert "no_changes" not in skipped
+        assert "package-lock.json" in _previous_diffs[self.PR_KEY].hashes
+
+    def test_lockfile_only_push_to_a_needs_work_pr_is_recorded_unreviewed(self):
+        self._seed("needs_work")
+        before = dict(_previous_diffs[self.PR_KEY].hashes)
+        mc = self._provider(_GATE_A + _GATE_LOCK)
+        with patch("raven.server.review_diff") as rd, patch("raven.server.notify"):
+            _process_pr(mc, self._payload())
+        rd.assert_not_called()
+        mc.merge_pr.assert_not_called()
+        entry = _previous_diffs[self.PR_KEY]
+        assert entry.hashes == before
+        assert "package-lock.json" in entry.unreviewed_hashes
+
+    def test_cached_merge_self_fetch_declines_a_stripped_only_change(self):
+        from raven.server import _maybe_dispatch_cached_merge
+        self._seed("approve")
+        mc = self._provider(_GATE_A + _GATE_LOCK)
+        with patch("raven.server.notify"):
+            merged = _maybe_dispatch_cached_merge(
+                mc, "owner/repo", 42, "t", "", head_sha="shaB",
+                scale_fetch_failed=False)
+        assert merged is False
+        mc.merge_pr.assert_not_called()
+
+    def test_comment_flow_is_unbound_after_a_stripped_only_push(self):
+        _seed_bound_entry("needs_work")                  # cache covers _BIND_DIFF_A
+        mp = _binding_provider(_BIND_DIFF_A + _GATE_LOCK, head="shaB")
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "agreed", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": []}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        mp.submit_review.assert_not_called()
+        mp.merge_pr.assert_not_called()
+
+    # Raven's review of #266: the normal state of a dependency bump is a
+    # reviewed head that already contains the lockfile. These start from
+    # the entry _process_pr itself wrote for such a head.
+    _LOCK2 = _GATE_LOCK.replace("example.invalid", "example2.invalid")
+
+    def _push(self, mc, verdict_findings=()):
+        _recent_prs.clear()
+        with (patch("raven.server.review_diff", return_value={
+                  "severity": "high" if verdict_findings else "low", "summary": "s",
+                  "findings": list(verdict_findings)}) as rd,
+              patch("raven.server.notify"),
+              patch("raven.server.inc") as mock_inc):
+            _process_pr(mc, self._payload())
+        skipped = [c.args[1].get("reason") for c in mock_inc.call_args_list
+                   if c.args[0] == "raven_reviews_skipped_total"]
+        return rd, skipped
+
+    def test_a_re_push_of_a_reviewed_head_with_a_lockfile_changes_nothing(self):
+        mc = self._provider(_GATE_A + _GATE_LOCK)
+        rd, _ = self._push(mc)
+        rd.assert_called_once()
+        rd, skipped = self._push(mc)
+        rd.assert_not_called()
+        assert "no_changes" in skipped
+        assert "package-lock.json" not in [c.args[1] for c in mc.fetch_file.call_args_list]
+
+    def test_dropping_the_lockfile_is_a_removed_file(self):
+        mc = self._provider(_GATE_A + _GATE_LOCK)
+        self._push(mc)
+        mc.fetch_pr_diff.return_value = _GATE_A
+        rd, skipped = self._push(mc)
+        rd.assert_called_once()
+        assert "no_changes" not in skipped
+        assert "package-lock.json" not in _previous_diffs[self.PR_KEY].hashes
+
+    # A stripped skip-listed binary: a PR changing a lockfile can't be
+    # approved at all (every changed lockfile is a coverage gap), so the
+    # approved-PR cases below use one instead.
+    _PNG = ("diff --git a/logo.png b/logo.png\nindex 1111111..2222222 100644\n"
+            "Binary files a/logo.png and b/logo.png differ\n")
+    _PNG2 = _PNG.replace("2222222", "3333333")
+
+    def test_changing_a_stripped_file_again_on_an_approved_pr_is_reviewed(self):
+        mc = self._provider(_GATE_A + self._PNG)
+        self._push(mc)
+        assert _previous_diffs[self.PR_KEY].verdict == "approve"
+        mc.fetch_pr_diff.return_value = _GATE_A + self._PNG2
+        rd, skipped = self._push(mc)
+        rd.assert_called_once()
+        assert "no_changes" not in skipped
+
+    def test_changing_the_lockfile_again_never_approves(self):
+        mc = self._provider(_GATE_A + _GATE_LOCK)
+        self._push(mc)
+        mc.fetch_pr_diff.return_value = _GATE_A + self._LOCK2
+        self._push(mc)
+        assert _previous_diffs[self.PR_KEY].verdict == "needs_work"
+        assert all(c.kwargs["approve"] is False for c in mc.submit_review.call_args_list)
+        mc.merge_pr.assert_not_called()
+
+    # Raven's review of #266: a push that changes only shown files on an
+    # entry that already holds a lockfile stays incremental, and dropping
+    # the lockfile from a needs_work PR is a removed file.
+    _B = _GATE_A.replace("a.py", "b.py")
+    _B_FINDING = {"severity": "high", "file": "b.py", "line": 1, "message": "b bug"}
+
+    def test_dropping_the_lockfile_on_a_needs_work_entry_is_a_removed_file(self):
+        mc = self._provider(_GATE_A + _GATE_LOCK)
+        self._push(mc, verdict_findings=[self._B_FINDING])
+        mc.fetch_pr_diff.return_value = _GATE_A
+        rd, _ = self._push(mc)
+        rd.assert_called_once()
+        assert rd.call_args.kwargs.get("is_incremental") is False
+
+    def test_a_content_only_push_on_a_lockfile_carrying_entry_stays_incremental(self):
+        mc = self._provider(_GATE_A + self._B + _GATE_LOCK)
+        self._push(mc, verdict_findings=[self._B_FINDING])
+        mc.fetch_pr_diff.return_value = (_GATE_A.replace("+y", "+z") + self._B + _GATE_LOCK)
+        rd, _ = self._push(mc)
+        assert rd.call_args.kwargs["is_incremental"] is True
+        assert rd.call_args.kwargs["unchanged_files"] == ["b.py"]
+
+    # D2 (b), as amended 2026-09-28: every lockfile the PR changes is a
+    # coverage gap, since the model never sees its content. The gap is
+    # recomputed from the whole diff on every pass and never carried, so it
+    # clears when the PR stops changing the lockfile and never piles up.
+    def _real_review_push(self, mc):
+        from raven.ai.base import CompletionResult
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        fake.complete.return_value = CompletionResult(text=json.dumps(
+            {"severity": "low", "summary": "ok", "findings": []}))
+        _recent_prs.clear()
+        with patch("raven.ai._cached_backend", fake), patch("raven.server.notify"):
+            _process_pr(mc, self._payload())
+
+    def test_a_changed_lockfile_blocks_the_merge(self):
+        mc = self._provider(_GATE_A + _GATE_LOCK)
+        self._real_review_push(mc)
+        entry = _previous_diffs[self.PR_KEY]
+        assert entry.coverage_gap_files == ["package-lock.json"]
+        assert mc.submit_review.call_args.kwargs["approve"] is False
+        mc.merge_pr.assert_not_called()
+
+    def test_a_pr_without_a_lockfile_still_merges(self):
+        mc = self._provider(_GATE_A)
+        self._real_review_push(mc)
+        assert _previous_diffs[self.PR_KEY].coverage_gap_files == []
+        mc.merge_pr.assert_called_once()
+
+    def test_a_deleted_lockfile_is_a_gap(self):
+        """Raven's review of #273 (2524): without the lockfile, the next
+        plain install re-resolves the whole tree within the manifest's
+        ranges, drops the pins, and can resolve a package the lockfile
+        pinned to a private host from the public registry instead."""
+        deleted = ("diff --git a/package-lock.json b/package-lock.json\ndeleted file mode 100644\n"
+                   "--- a/package-lock.json\n+++ /dev/null\n@@ -1 +0,0 @@\n-{}\n")
+        mc = self._provider(_GATE_A + deleted)
+        self._real_review_push(mc)
+        assert _previous_diffs[self.PR_KEY].coverage_gap_files == ["package-lock.json"]
+        mc.merge_pr.assert_not_called()
+
+    def test_the_server_holds_the_gap_whatever_review_diff_returns(self):
+        """Raven's review of #273 (2524): the merge block must not depend on
+        every review_diff return path echoing the lockfile gap back (the
+        chunked path dropped it once)."""
+        mc = self._provider(_GATE_A + _GATE_LOCK)
+        with (patch("raven.server.review_diff", return_value={
+                  "severity": "low", "summary": "ok", "findings": []}),
+              patch("raven.server.notify")):
+            _process_pr(mc, self._payload())
+        assert _previous_diffs[self.PR_KEY].coverage_gap_files == ["package-lock.json"]
+        assert mc.submit_review.call_args.kwargs["approve"] is False
+        mc.merge_pr.assert_not_called()
+
+    def test_a_bitbucket_synthesized_lockfile_is_a_gap(self):
+        """Raven's review of #273: the rule keys off the paths
+        split_diff_by_file parses from either provider's diff, not git-only
+        diff text."""
+        from raven.providers.bitbucket_dc import BitbucketDCProvider
+        bb = BitbucketDCProvider("https://bb.example.com", "tok", "secret", username="u")
+        synthesized = bb._json_diff_to_unified({"diffs": [{
+            "source": {"toString": "package-lock.json"},
+            "destination": {"toString": "package-lock.json"},
+            "hunks": [{"sourceLine": 1, "sourceSpan": 1, "destinationLine": 1,
+                       "destinationSpan": 1, "segments": [
+                           {"type": "REMOVED", "lines": [{"line": "a"}]},
+                           {"type": "ADDED", "lines": [{"line": "b"}]}]}]}]})
+        mc = self._provider(_GATE_A + synthesized)
+        self._real_review_push(mc)
+        assert _previous_diffs[self.PR_KEY].coverage_gap_files == ["package-lock.json"]
+
+    def test_the_gap_clears_when_the_pr_stops_changing_the_lockfile(self):
+        mc = self._provider(_GATE_A + _GATE_LOCK)
+        self._real_review_push(mc)
+        mc.fetch_pr_diff.return_value = _GATE_A.replace("+y", "+z")
+        self._real_review_push(mc)
+        entry = _previous_diffs[self.PR_KEY]
+        assert entry.coverage_gap_files == []
+        assert not [f for fl in entry.findings.values() for f in fl if f.get("gap_marker")]
+
+    _RENAMED_INTO_LOCK = ("diff --git a/fixtures/sample.json b/package-lock.json\n"
+                          "similarity index 100%\n"
+                          "rename from fixtures/sample.json\nrename to package-lock.json\n")
+
+    def test_a_file_renamed_into_a_lockfile_is_a_gap(self):
+        """Raven's review of #273: a rename from a non-lockfile name is not
+        stripped (the model must see the source leave), so the gap can't
+        come from the stripped paths alone. Content planted in a 'fixture'
+        becomes a live lockfile."""
+        mc = self._provider(_GATE_A + self._RENAMED_INTO_LOCK)
+        self._real_review_push(mc)
+        assert _previous_diffs[self.PR_KEY].coverage_gap_files == ["package-lock.json"]
+        mc.merge_pr.assert_not_called()
+
+    def test_a_renamed_in_lockfile_marker_is_not_carried_twice(self):
+        mc = self._provider(_GATE_A + self._RENAMED_INTO_LOCK)
+        self._real_review_push(mc)
+        mc.fetch_pr_diff.return_value = _GATE_A.replace("+y", "+z") + self._RENAMED_INTO_LOCK
+        self._real_review_push(mc)
+        entry = _previous_diffs[self.PR_KEY]
+        assert entry.coverage_gap_files == ["package-lock.json"]
+        markers = [f for fl in entry.findings.values() for f in fl if f.get("gap_marker")]
+        assert len(markers) == 1
+        assert entry.findings.get("", []) == []
+
+    @pytest.mark.parametrize("section", [
+        # Both names skip-listed: stripped, so the model never sees it.
+        ("diff --git a/package-lock.json b/package-lock.json.png\n"
+         "similarity index 100%\n"
+         "rename from package-lock.json\nrename to package-lock.json.png\n"),
+        # A target the model is shown.
+        ("diff --git a/Cargo.lock b/Cargo.lock.orig\n"
+         "similarity index 100%\n"
+         "rename from Cargo.lock\nrename to Cargo.lock.orig\n"),
+    ])
+    def test_a_lockfile_renamed_away_is_a_gap(self, section):
+        """Raven's review of #275: renaming a lockfile off its live path
+        removes it just like a deletion does."""
+        mc = self._provider(_GATE_A + section)
+        self._real_review_push(mc)
+        [gap] = _previous_diffs[self.PR_KEY].coverage_gap_files
+        assert gap.endswith((".png", ".orig"))
+        mc.merge_pr.assert_not_called()
+
+    def test_a_bitbucket_synthesized_rename_away_is_a_gap(self):
+        from raven.providers.bitbucket_dc import BitbucketDCProvider
+        bb = BitbucketDCProvider("https://bb.example.com", "tok", "secret", username="u")
+        synthesized = bb._json_diff_to_unified({"diffs": [{
+            "source": {"toString": "package-lock.json"},
+            "destination": {"toString": "deps/lock.json"}, "hunks": []}]})
+        mc = self._provider(_GATE_A + synthesized)
+        self._real_review_push(mc)
+        assert _previous_diffs[self.PR_KEY].coverage_gap_files == ["deps/lock.json"]
+        mc.merge_pr.assert_not_called()
+
+    def test_a_skip_listed_binary_is_not_a_lockfile_gap(self):
+        png = ("diff --git a/logo.png b/logo.png\n"
+               "Binary files a/logo.png and b/logo.png differ\n")
+        mc = self._provider(_GATE_A + png)
+        self._real_review_push(mc)
+        assert _previous_diffs[self.PR_KEY].coverage_gap_files == []
+        mc.merge_pr.assert_called_once()
+
+    def test_the_gap_persists_while_the_lockfile_stays(self):
+        mc = self._provider(_GATE_A + _GATE_LOCK)
+        self._real_review_push(mc)
+        for edit in ("+z", "+w"):   # two more pushes: the marker never piles up
+            mc.fetch_pr_diff.return_value = (_GATE_A.replace("+y", edit) + _GATE_LOCK)
+            self._real_review_push(mc)
+        entry = _previous_diffs[self.PR_KEY]
+        assert entry.coverage_gap_files == ["package-lock.json"]
+        markers = [f for fl in entry.findings.values() for f in fl if f.get("gap_marker")]
+        assert len(markers) == 1
+        assert entry.findings.get("", []) == []
+
+    def test_the_comment_flow_binds_to_the_entry_the_push_wrote(self):
+        """The push flow hashes ``diff`` and the comment flow ``raw_diff``;
+        they must agree, or every PR with a stripped file stays unbound. A
+        skip-listed binary, since a PR changing a lockfile can't approve."""
+        mp = _binding_provider(_BIND_DIFF_A + self._PNG, head="shaA")
+        mp.get_pr_requested_reviewers.return_value = ["raven"]
+        _recent_prs.clear()
+        with (patch("raven.server.review_diff", return_value={
+                  "severity": "high", "summary": "s", "findings": [
+                      {"severity": "high", "file": "a.py", "line": 1, "message": "F1"}]}),
+              patch("raven.server.notify")):
+            _process_pr(mp, {"repo": "u/r", "sender": "alice", "pr_number": 1,
+                             "pr_title": "t", "pr_url": "", "head_sha": "shaA",
+                             "head_ref": "f", "base_ref": "main"})
+        assert _previous_diffs["gitea:u/r#1"].verdict == "needs_work"
+        mp.submit_review.reset_mock()
+        with patch("raven.server.respond_to_comment", return_value={
+                "response": "agreed", "revise": {"verdict": "approve", "body": "fine"},
+                "retract_findings": []}):
+            _process_comment(mp, dict(_BIND_COMMENT))
+        assert mp.submit_review.call_args.kwargs["commit_id"] == "shaA"
+        mp.merge_pr.assert_called_once()
+
+    def test_unchanged_files_in_the_prompt_are_reviewable_files_only(self):
+        """The incremental prompt lists unchanged files the model isn't
+        shown; a stripped file is not one of them."""
+        b = _GATE_A.replace("a.py", "b.py")
+        self._seed("needs_work", diff=_GATE_A + b)
+        mc = self._provider(_GATE_A + b.replace("+y", "+z") + _GATE_LOCK)
+        with (patch("raven.server.review_diff", return_value={
+                  "severity": "low", "summary": "ok", "findings": []}) as rd,
+              patch("raven.server.notify")):
+            _process_pr(mc, self._payload())
+        assert rd.call_args.kwargs["unchanged_files"] == ["a.py"]

@@ -77,6 +77,7 @@ _METRIC_HELP: dict[str, str] = {
     "raven_severity_mismatch_total": "Reviews where the model's stated top-level severity disagreed with the highest severity among its own findings; the derived value is used.",
     "raven_ungrounded_findings_dropped_total": "Fresh findings dropped for naming a file the model was never shown (evidence-grounding backstop).",
     "raven_findings_capped_total": "Findings dropped by the per-PR cap on chunked reviews in repos with no rules/CLAUDE.md.",
+    "raven_consolidation_findings_restored_total": "Blocking chunk findings the chunked-review consolidation pass dropped or downgraded, restored at their chunk severity, by reason: downgraded (the same finding at a lower tier) or missing (dropped or reworded).",
     "raven_cached_merge_dispatch_total": "Auto-merge dispatches attempted from a cached approve verdict, by outcome (dispatched / declined_<reason>) and source (no_changes / comment).",
     "raven_responses_skipped_total": "Comment replies skipped before dispatch, by reason (no_mention / rate_limit).",
     "raven_cache_save_failures_total": "Findings-cache disk-write failures, by exception type.",

@@ -200,25 +200,44 @@ class BitbucketDCProvider(GitProvider):
 
     def _json_diff_to_unified(self, data: dict) -> str:
         """Convert BB DC JSON diff response to unified diff format."""
+        # Paths and line text arrive as JSON strings and are written into
+        # line-oriented text, so a raw "\n" in either would start a line of
+        # its own — a forged "Binary files" or "diff --git" line that hides
+        # the rest of the file (audit 09-27 #2a). Line text escapes it.
+        def _one_line(text: str) -> str:
+            return text.replace("\n", "\\n")
+
+        # A path is also a key (per-file hashes, the findings cache, the
+        # file fetch, the inline anchor), so it must parse back to its real
+        # name. A path with a newline is written the way git writes one:
+        # quoted, with C escapes, which reviewer._parse_diff_header_path
+        # decodes. Every other path is written as it is — escaping its
+        # backslashes renamed real paths such as systemd's
+        # "mnt-data\x2d1.mount" (Raven's review of #260).
+        def _side(prefix: str, path: str) -> str:
+            if "\n" not in path:
+                return f"{prefix}/{path}"
+            return '"' + _c_quote(f"{prefix}/{path}") + '"'
+
         lines: list[str] = []
         for diff_entry in data.get("diffs", []):
             src = (diff_entry.get("source") or {}).get("toString", "/dev/null")
             dst = (diff_entry.get("destination") or {}).get("toString", "/dev/null")
-            src_header = "/dev/null" if src == "/dev/null" else f"a/{src}"
-            dst_header = "/dev/null" if dst == "/dev/null" else f"b/{dst}"
             # Use the real file path for diff --git header.
             #
             # CONTRACT (relied on by reviewer._parse_diff_header_path): both
-            # sides are built from the SAME value and are never quoted. That
-            # keeps every synthesized header — including renames and
-            # non-ASCII paths — on the parser's unambiguous same-path branch,
-            # which is why BB DC is immune to the rename-with-spaces gap that
-            # affects real git output. If this ever emits differing sides or
-            # adds git-style quoting, revisit that parser.
+            # sides are built from the SAME value. That keeps every
+            # synthesized header — including renames and non-ASCII paths —
+            # on one of the parser's unambiguous branches: same-path for an
+            # unquoted header, the trailing quoted span for a quoted one
+            # (both sides are quoted together, only for a path with a
+            # newline). That is why BB DC is immune to the rename-with-spaces
+            # gap that affects real git output. If this ever emits differing
+            # sides, revisit that parser.
             file_path = dst if dst != "/dev/null" else src
-            lines.append(f"diff --git a/{file_path} b/{file_path}")
-            lines.append(f"--- {src_header}")
-            lines.append(f"+++ {dst_header}")
+            lines.append(f"diff --git {_side('a', file_path)} {_side('b', file_path)}")
+            lines.append("--- " + ("/dev/null" if src == "/dev/null" else _side("a", src)))
+            lines.append("+++ " + ("/dev/null" if dst == "/dev/null" else _side("b", dst)))
             for hunk in diff_entry.get("hunks", []):
                 src_line = hunk.get("sourceLine", 1)
                 src_span = hunk.get("sourceSpan", 0)
@@ -233,7 +252,7 @@ class BitbucketDCProvider(GitProvider):
                     elif seg_type == "REMOVED":
                         prefix = "-"
                     for line_obj in segment.get("lines", []):
-                        lines.append(f"{prefix}{line_obj.get('line', '')}")
+                        lines.append(f"{prefix}{_one_line(line_obj.get('line', ''))}")
         return "\n".join(lines) + "\n"
 
     @staticmethod
@@ -1309,6 +1328,29 @@ class BitbucketDCProvider(GitProvider):
 # ------------------------------------------------------------------ #
 #  Helpers                                                            #
 # ------------------------------------------------------------------ #
+
+_C_ESCAPES = {ord("\a"): "\\a", ord("\b"): "\\b", ord("\t"): "\\t",
+              ord("\n"): "\\n", ord("\v"): "\\v", ord("\f"): "\\f",
+              ord("\r"): "\\r", ord('"'): '\\"', ord("\\"): "\\\\"}
+
+
+def _c_quote(path: str) -> str:
+    """Escape ``path`` the way git does inside a quoted path
+    (``quote_c_style`` with ``core.quotePath``): named escapes for the
+    common control characters, ``\\"`` and ``\\\\``, octal for every other
+    byte outside printable ASCII. ``reviewer._unquote_git_path`` reverses
+    it. ``surrogatepass`` so a lone surrogate from the JSON can't raise
+    mid-diff."""
+    out = []
+    for byte in path.encode("utf-8", "surrogatepass"):
+        if byte in _C_ESCAPES:
+            out.append(_C_ESCAPES[byte])
+        elif byte < 0x20 or byte >= 0x7F:
+            out.append(f"\\{byte:03o}")
+        else:
+            out.append(chr(byte))
+    return "".join(out)
+
 
 def _split_repo(repo_full_name: str) -> tuple[str, str]:
     """Split 'project/repo' into ('project', 'repo')."""

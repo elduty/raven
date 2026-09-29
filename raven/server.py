@@ -25,7 +25,8 @@ from .providers import GitProvider, DiffTruncatedError, DiffUnverifiableError, g
 from .providers.gitea import GiteaProvider
 from .metrics import add, inc, Timer, format_prometheus
 from .notifier import notify
-from .reviewer import review_diff, respond_to_comment, review_config_hash, _strip_lockfiles_and_binaries, split_diff_by_file, diff_hash, hunk_positions, hunk_context_digests, MAX_DIFF_LINES, terminate_active_processes, RespondParseError, RAVEN_AI_MODEL, RAVEN_AI_EFFORT, RAVEN_AI_TIMEOUT, RAVEN_AI_RETRY
+from .reviewer import _is_lockfile_name, _normalize_path, _rename_aliases
+from .reviewer import review_diff, respond_to_comment, review_config_hash, strip_diff, _diff_lines, split_diff_by_file, diff_hash, hunk_positions, hunk_context_digests, MAX_DIFF_LINES, terminate_active_processes, RespondParseError, RAVEN_AI_MODEL, RAVEN_AI_EFFORT, RAVEN_AI_TIMEOUT, RAVEN_AI_RETRY
 from .ai import get_backend
 from .ai.base import AIError
 from .severity import SeverityScale, default_scale, from_json, InvalidScale
@@ -404,8 +405,8 @@ class CacheEntry:
     # forward only the gap files that are NOT in changed_files (a file
     # REMOVED from the PR clears via the removed-files full-re-review
     # gate instead). Defaults empty so cache files written before this
-    # field load as no-gap. Lifecycle documented in CLAUDE.md
-    # ("Coverage-gap tracking"); pinned end-to-end by
+    # field load as no-gap. Lifecycle documented in
+    # docs/design-notes.md ("Coverage-gap tracking"); pinned end-to-end by
     # tests/test_server.py::TestCoverageGapBlocksMerge.
     coverage_gap_files: list[str] = field(default_factory=list)
     # Per-repo review config this entry was computed under: the resolved
@@ -459,14 +460,16 @@ class CacheEntry:
     content_hashes: dict[str, str] = field(default_factory=dict)
     hunks: dict[str, list] = field(default_factory=dict)
     #   * hunk_context — reviewer.hunk_context_digests(chunk): a digest of
-    #     each hunk's surrounding lines. Positions alone cannot tell a
-    #     rebase (same edit, moved by the base branch) from the author
-    #     RELOCATING a byte-identical edit elsewhere in the file — both
-    #     leave content_hashes equal and the hunk geometry intact, so the
-    #     remap "succeeds" and the finding is carried onto a new line that
-    #     was never reviewed. Context content is what separates them: a
-    #     rebase keeps it byte-identical while its position moves. A
-    #     mismatch here makes _remap_carried_lines give up and re-review.
+    #     each hunk's body, its edit lines reduced to their +/- markers.
+    #     Positions alone cannot tell a rebase (same edit, moved by the
+    #     base branch) from the author RELOCATING a byte-identical edit
+    #     elsewhere in the file, or REORDERING it across a context line —
+    #     all leave content_hashes equal and the hunk geometry intact, so
+    #     the finding is carried onto code that was never reviewed where
+    #     it now sits. The body is what separates them: a rebase keeps it
+    #     byte-identical while its position moves. A mismatch makes
+    #     _remap_carried_lines give up, or (same positions) _process_pr
+    #     send the file back, for a re-review.
     #     Empty for entries written before this field, which simply skips
     #     the comparison — the same degrade-to-previous-behaviour rule the
     #     two fields above follow.
@@ -1305,9 +1308,8 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
                         "cached merge dispatch (fail-closed)", pr_number, head_sha[:8])
             return _decline("diff_head_unbound")
         try:
-            clean_diff = _strip_lockfiles_and_binaries(
+            current_hashes = _diff_chunk_hashes(
                 provider.fetch_pr_diff(repo_full_name, pr_number))
-            current_hashes = _diff_chunk_hashes(clean_diff)
         except Exception as e:
             logger.warning("PR #%d: could not fetch diff for cached merge "
                            "dispatch: %s — declining (fail-closed)", pr_number, e)
@@ -1682,7 +1684,18 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # doesn't incur those network calls only to return early.
 
         # Guard: empty diff after stripping lockfiles/binaries
-        clean_diff = _strip_lockfiles_and_binaries(diff)
+        stripped = strip_diff(diff)
+        clean_diff = stripped.clean
+        # Stripped files' gaps (a changed lockfile, D2 (b)) come from the
+        # whole diff on every pass, so they are never carried. A lockfile a
+        # rename brought into the clean diff is carried like any reviewed
+        # file: its marker dedupes against the fresh one, and it stops
+        # being a gap only by leaving the diff, which forces a full review.
+        stripped_now = set(stripped.stripped)
+        # Every lockfile the PR changes, held here and unioned into the
+        # effective gap below, so the merge block doesn't depend on every
+        # review_diff return path echoing it back.
+        lockfile_gaps = _lockfile_gaps(diff)
         if not clean_diff.strip():
             provider.post_pr_comment(repo_full_name, pr_number,
                 "🦅 **Raven Review**\n\nEmpty diff after stripping lockfiles/binaries — skipping review.")
@@ -1695,10 +1708,12 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # Two hashes per file, answering two different questions — see
         # CacheEntry.content_hashes. ``current_hashes`` (raw chunk) is
         # "is this literally the same diff?" and gates the no-changes
-        # skip and the cached-merge dispatch under it;
-        # ``current_content_hashes`` is "did the PR's own edits to this
-        # file change?" and picks the incremental delta.
-        current_hashes = _diff_chunk_hashes(clean_diff)
+        # skip and the cached-merge dispatch under it; it covers every
+        # file the PR changes, stripped ones included (see
+        # _diff_chunk_hashes). ``current_content_hashes`` is "did the
+        # PR's own edits to this file change?" and picks the incremental
+        # delta, over the files the model can review.
+        current_hashes = _diff_chunk_hashes(diff)
         current_content_hashes = {f: diff_hash(c) for f, c in file_chunks.items()}
         current_hunks = {f: hunk_positions(c) for f, c in file_chunks.items()}
         current_hunk_context = {f: hunk_context_digests(c)
@@ -1796,7 +1811,20 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             if fname in changed_files or fname in removed_files:
                 continue
             old_h = previous_hunks.get(fname)
-            if not old_h or [tuple(x) for x in old_h] == [tuple(x) for x in new_h]:
+            if not old_h:
+                continue
+            if [tuple(x) for x in old_h] == [tuple(x) for x in new_h]:
+                # Same positions, so nothing to remap — but the body can
+                # still differ: an added line moved across a context line
+                # inside its hunk keeps both the content hash and the
+                # geometry (audit 09-27 #5). Compared only when both sides
+                # recorded it, like the remap below.
+                old_ctx = previous_hunk_context.get(fname)
+                new_ctx = current_hunk_context.get(fname)
+                if old_ctx and new_ctx and list(old_ctx) != list(new_ctx):
+                    logger.info("PR #%d: %s kept its positions but its hunk body "
+                                "changed — re-reviewing the file", pr_number, fname)
+                    changed_files.add(fname)
                 continue
             mapping = _remap_carried_lines(
                 old_h, new_h, cached_findings.get(fname, []),
@@ -1830,8 +1858,17 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                                 for f in fl]
                         for fname, fl in live_entry.findings.items()
                     }
-                    live_entry.hunks = current_hunks
-                    live_entry.hunk_context = current_hunk_context
+                    # Only the remapped files' geometry moves with their
+                    # shifted lines. Writing every file's new geometry here
+                    # laundered a relocation this pass had just found: if
+                    # the review then failed, the next pass compared the
+                    # relocated file against its own geometry and carried
+                    # it unreviewed (audit 09-27 #5). The rest is written
+                    # at the post-submit write, after a review covered it.
+                    live_entry.hunks = {**live_entry.hunks, **{
+                        f: current_hunks[f] for f in remapped_lines}}
+                    live_entry.hunk_context = {**live_entry.hunk_context, **{
+                        f: current_hunk_context[f] for f in remapped_lines}}
                     cached = live_entry
                     cached_findings = live_entry.findings
 
@@ -1848,9 +1885,9 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             # judges PR-level claims ("the implementation is missing
             # from this PR") from files it was never shown.
             is_incremental = True
-            unchanged_files = sorted(set(current_hashes) - changed_files)
+            unchanged_files = sorted(set(file_chunks) - changed_files)
             review_diff_text = "".join(file_chunks[f] for f in sorted(changed_files))
-            logger.info("PR #%d incremental review: %d/%d files changed", pr_number, len(changed_files), len(current_hashes))
+            logger.info("PR #%d incremental review: %d/%d files changed", pr_number, len(changed_files), len(file_chunks))
         elif (previous_hashes and cached is not None and cached.verdict == "approve"
               and RAVEN_REVIEW_MODE != "advisory"):
             # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
@@ -1881,7 +1918,8 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             review_diff_text = clean_diff
         elif previous_hashes:
             # The diff moved but the PR's own edits did not — a rebase or
-            # a merge from the base branch, nothing else. There is no new
+            # a merge from the base branch, or a change to stripped files
+            # only (a lockfile, a skip-listed binary). There is no new
             # authored code to review, so re-reviewing would only
             # regenerate the standing findings and strand the developer's
             # resolutions (which match on comment_id). Record the new
@@ -1972,7 +2010,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # local flag, not module state: _process_pr runs one PR to
         # completion per call, so a closure is enough and stays free of
         # the cross-repo leak a shared "current scale" would risk (see
-        # CLAUDE.md's "Severity scale" on why scale is always threaded as
+        # CLAUDE.md's "Severity scale rules" on why scale is always threaded as
         # a parameter, never global).
         scale_fetch_failed = False
 
@@ -2028,7 +2066,10 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         if is_incremental and cached_findings:
             carried_gap_files = set(cached.coverage_gap_files or []) if cached else set()
             for fname in current_hashes:
-                if fname not in changed_files:
+                # A stripped file's only findings are its lockfile gap
+                # marker, recomputed from the whole diff on every pass:
+                # carrying it would duplicate it, and outlive a fix.
+                if fname not in changed_files and fname not in stripped_now:
                     for f in cached_findings.get(fname, []):
                         if f.get("comment_id") in resolved_ids:
                             user_resolved_count += 1
@@ -2088,6 +2129,8 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 review_diff_text, repo_full_name,
                 claude_md=claude_md, file_contents=file_contents,
                 omitted_files=omitted_files,
+                stripped_files=stripped.stripped,
+                lockfile_gaps=lockfile_gaps,
                 pr_title=pr_title, pr_description=pr_description,
                 pr_comments=pr_comments, bot_user=bot_user,
                 rules=rules,
@@ -2211,10 +2254,11 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # only.
         fresh_gap_files = set(review.get("coverage_gap_files") or [])
         carried_gap_files = (
-            {f for f in (cached.coverage_gap_files or []) if f not in changed_files}
+            {f for f in (cached.coverage_gap_files or [])
+             if f not in changed_files and f not in stripped_now}
             if is_incremental and cached is not None else set()
         )
-        effective_gap_files = sorted(fresh_gap_files | carried_gap_files)
+        effective_gap_files = sorted(fresh_gap_files | carried_gap_files | set(lockfile_gaps))
         review["coverage_gap_files"] = effective_gap_files
         review["coverage_gap"] = bool(effective_gap_files)
 
@@ -2297,7 +2341,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             # name and colour that exist in THIS repo's vocabulary. Sibling
             # fix to 9d2d478, which covered the other three
             # .get("severity", "low") sites in this function and missed
-            # this one (CLAUDE.md "recurring defect class").
+            # this one.
             sev = f.get("severity") or scale.least_severe
             return f"{scale.emoji(sev)} **[{sev}]** {f['message']}"
 
@@ -2514,7 +2558,13 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                     fname: [f for f in live_findings.get(fname, []) if _keep_carried(f)]
                     for fname in current_hashes if fname not in changed_files
                 }
-                fresh = _findings_by_file(fresh_findings, changed_files)
+                # A stripped file's gap marker is fresh on every pass (see
+                # stripped_now): keyed under its file, the fresh bucket
+                # replaces the cached one (empty once the PR stops changing
+                # the lockfile), and it never falls into the file-less
+                # bucket, which the next pass would carry back to the model
+                # as a finding.
+                fresh = _findings_by_file(fresh_findings, changed_files | stripped_now)
                 # Carry forward file-less findings from previous review + new file-less ones
                 fresh.setdefault("", []).extend(
                     f for f in live_findings.get("", []) if _keep_carried(f))
@@ -2856,8 +2906,8 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 provider, repo_full_name, pr_number, pinned_head, "head_moved")
             if unbound_reason is not None:
                 pinned_head = None
-        clean_diff = _strip_lockfiles_and_binaries(raw_diff)
-        pinned_hashes = _diff_chunk_hashes(clean_diff)
+        clean_diff = strip_diff(raw_diff).clean
+        pinned_hashes = _diff_chunk_hashes(raw_diff)
         diff = _truncate_diff_for_comment(clean_diff, file_path, line)
         # Fetch CLAUDE.md from the PR's BASE ref (matches _process_pr's
         # post-trust-tier behavior). CLAUDE.md is repo-policy content and
@@ -2878,9 +2928,10 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # unranked against the built-in low/medium/high vocabulary in the
         # two _max_severity_from_findings call sites below, silently
         # mis-rendering (and mis-notifying) severity — the comment-reply
-        # flow was the last path still doing that (Task 14; see CLAUDE.md
-        # "Severity scale"). _fetch_severity_scale never raises — it
-        # already falls back to default_scale() internally on any failure.
+        # flow was the last path still doing that (Task 14; see
+        # docs/design-notes.md "Severity scale"). _fetch_severity_scale
+        # never raises — it already falls back to default_scale()
+        # internally on any failure.
         #
         # But "does not raise" is not "does not loosen the gate": that
         # fallback silently substitutes the built-in vocabulary for a
@@ -3793,13 +3844,45 @@ def _park_rerun(pr_key: str, provider: GitProvider, payload: dict, head: str) ->
             _rerun_requested[pr_key] = (provider, {**payload, "head_sha": head})
 
 
-def _diff_chunk_hashes(clean_diff: str) -> dict[str, str]:
-    """Per-file SHA256 of the raw stripped-diff chunks: the "is this
-    literally the same diff?" identity ``CacheEntry.hashes`` records.
-    One definition shared by every path that compares against it, so the
-    push flow, the cached-merge gate and the comment flow can't drift."""
+def _lockfile_gaps(diff: str) -> list[str]:
+    """Every lockfile this PR changes, deleted ones included (D2 (b), as
+    amended 2026-09-28). Lockfiles are stripped from the diff the model
+    reviews, so a swapped package source or an added package would merge
+    unseen; a human merges instead. A deletion counts too: the next plain
+    install re-resolves the whole tree within the manifest's ranges, drops
+    the pins, and can resolve a package the lockfile pinned to a private
+    host from the public registry. So does a rename off a lockfile name
+    (``git mv package-lock.json package-lock.json.png``): it removes the
+    live lockfile just the same. Read from every section of the whole diff
+    by both its names, not from the stripped paths: a rename from a
+    non-lockfile name isn't stripped (the model must see the source
+    leave), yet it makes a live lockfile. Each gap is keyed by the
+    section's new name, the key the diff has."""
+    renamed_off_a_lockfile = {target for source, target in _rename_aliases(diff).items()
+                              if _is_lockfile_name(source)}
+    paths: list[str] = []
+    for path, _chunk in split_diff_by_file(diff):
+        if ((_is_lockfile_name(path) or _normalize_path(path) in renamed_off_a_lockfile)
+                and path not in paths):
+            paths.append(path)
+    return paths
+
+
+def _diff_chunk_hashes(diff: str) -> dict[str, str]:
+    """Per-file SHA256 of the raw diff chunks: the "is this literally the
+    same diff?" identity ``CacheEntry.hashes`` records. One definition
+    shared by every path that compares against it, so the push flow, the
+    cached-merge gate and the comment flow can't drift.
+
+    Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
+
+    Callers pass the UNSTRIPPED diff: the identity covers every file the
+    PR changes, lockfiles and skip-listed binaries included. Over the
+    stripped diff, a push that changed only a stripped file hashed the
+    same as the approved head and merged from the cache with no review
+    (audit 09-27 #4)."""
     return {f: hashlib.sha256(c.encode()).hexdigest()
-            for f, c in split_diff_by_file(clean_diff)}
+            for f, c in split_diff_by_file(diff)}
 
 
 def _findings_by_file(findings: list[dict], filenames: set[str]) -> dict[str, list[dict]]:
@@ -3827,7 +3910,7 @@ def _extract_code_snippet(file_content: str, line: int,
     """
     if not file_content or line <= 0:
         return ""
-    lines = file_content.splitlines()
+    lines = _diff_lines(file_content)
     if not lines or line > len(lines):
         return ""
     start = max(1, line - context)
@@ -3836,7 +3919,9 @@ def _extract_code_snippet(file_content: str, line: int,
     formatted: list[str] = []
     for n in range(start, end + 1):
         marker = "→" if n == line else " "
-        formatted.append(f"{n:>{width}} {marker} {lines[n - 1]}")
+        # Numbered as git numbers lines (\n only); a CRLF file's \r is
+        # dropped from the display.
+        formatted.append(f"{n:>{width}} {marker} {lines[n - 1].rstrip(chr(13))}")
     return "\n".join(formatted)
 
 
@@ -3845,7 +3930,7 @@ def _head_truncate(diff: str) -> str:
     total = diff.count("\n")
     if total <= MAX_DIFF_LINES:
         return diff
-    lines = diff.splitlines(keepends=True)
+    lines = _diff_lines(diff, keepends=True)
     # Consume lines until we've included MAX_DIFF_LINES newlines.
     out_lines: list[str] = []
     seen = 0
@@ -3870,7 +3955,7 @@ def _split_chunk_by_hunks(chunk: str) -> tuple[str, list[tuple[int, int, str]]]:
     dst range is the inclusive destination line span. Returns an empty
     hunks list if the chunk has no parseable hunk headers.
     """
-    lines = chunk.splitlines(keepends=True)
+    lines = _diff_lines(chunk, keepends=True)
     header_lines: list[str] = []
     hunks: list[tuple[int, int, str]] = []
     current_start = 0
@@ -3971,7 +4056,7 @@ def _window_chunk_around_line(chunk: str, line: int, budget: int) -> str | None:
 
 def _head_truncate_chunk(chunk: str, budget: int) -> str:
     """Head-truncate a single chunk to ``budget`` newlines, with marker."""
-    lines = chunk.splitlines(keepends=True)
+    lines = _diff_lines(chunk, keepends=True)
     out: list[str] = []
     seen = 0
     for ln in lines:
@@ -4083,7 +4168,11 @@ def _fetch_changed_files(provider: GitProvider, repo_full_name: str, head_sha: s
     assume the attached contents are exhaustive. Fetch failures are
     logged, not disclosed — they are not cap omissions.
     """
-    file_chunks = split_diff_by_file(clean_diff)
+    # A source file git diffed as binary is a coverage gap (strip_diff)
+    # whose content can't be shown meaningfully, and one with few
+    # newlines would pass the line cap whole: don't fetch it.
+    binary = set(strip_diff(clean_diff).binary_gaps)
+    file_chunks = [(f, c) for f, c in split_diff_by_file(clean_diff) if f not in binary]
     file_contents: dict[str, str] = {}
     omitted: list[str] = []
     for filename, _ in file_chunks[:MAX_FILES]:
@@ -4312,7 +4401,7 @@ def _fetch_severity_scale(provider: GitProvider, repo_full_name: str,
     existing caller (and every test that calls or mocks this function
     positionally / by return value) is unaffected. ``_process_pr``'s
     review path and no-changes skip and ``_process_comment`` all wire it
-    up. See CLAUDE.md "Severity scale".
+    up. See CLAUDE.md "Severity scale rules".
 
     ``on_legacy_path`` — see ``_fetch_repo_config_file``.
 
@@ -4445,8 +4534,9 @@ def _severity_mismatch_lines(review: dict) -> list[str]:
     """Lines reporting a vocabulary mismatch between the model's emitted
     severities and the scale actually in effect — the empirical detection
     signal for the whole feature (see raven/severity.py's ``normalize()``
-    and CLAUDE.md's "Prompt trust model"). Returns ``[]`` when there's no
-    mismatch (the common case) or the review predates this field.
+    and docs/archive/specs/2026-08-03-configurable-severity-scale-design.md).
+    Returns ``[]`` when there's no mismatch (the common case) or the review
+    predates this field.
 
     Shared by ``_format_comment`` and ``_format_inline_leftovers`` so
     ``RAVEN_REVIEW_OUTPUT=inline`` — which never calls ``_format_comment``
