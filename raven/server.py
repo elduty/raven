@@ -446,8 +446,9 @@ class CacheEntry:
     #   * hunks — reviewer.hunk_positions(chunk): new-side (start, length)
     #     per hunk. A file can be content-equal while every line number in
     #     it moved, and carried findings keep the ``line`` they were found
-    #     at — so without this they would re-post anchored to whatever
-    #     code the rebase slid into that position. _remap_carried_lines
+    #     at — so without this the cache would pin them (and post any
+    #     that has no thread yet) to whatever code the rebase slid into
+    #     that position. _remap_carried_lines
     #     shifts them by the per-hunk delta; a finding that cannot be
     #     mapped safely sends its file back into changed_files for a real
     #     re-review instead.
@@ -1399,6 +1400,12 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
 # first) are carried verbatim instead, the pre-re-validation behavior.
 RAVEN_CARRIED_REVALIDATION_MAX = max(
     int(os.environ.get("RAVEN_CARRIED_REVALIDATION_MAX", "20")), 1)
+# Cap on prior findings offered to a re-review for keep-or-resolve,
+# ranked by severity, then by whether the thread has replies. Overflow is
+# kept verbatim on its threads (like the carried overflow): not offered,
+# never resolved, never dropped.
+RAVEN_PRIOR_FINDINGS_MAX = max(
+    int(os.environ.get("RAVEN_PRIOR_FINDINGS_MAX", "30")), 1)
 
 
 def _is_coverage_gap_marker(finding: dict, gap_files: set[str]) -> bool:
@@ -1499,6 +1506,145 @@ def _finding_at_remapped_line(finding: dict, mapping: dict[int, int] | None) -> 
     if new_line is None:
         return finding
     return {**finding, "line": new_line}
+
+
+# The inline comment Raven posts for a finding, and its reader. Kept side
+# by side because get_review_threads hands back only an untracked
+# thread's body: _parse_inline_body must read exactly what
+# _format_inline_body wrote, so a change to one changes the other.
+_INLINE_BODY_RE = re.compile(
+    r"\A\S+ \*\*\[(?P<sev>[^\]\n]+)\]\*\* (?P<msg>.+)\Z", re.DOTALL)
+
+
+def _format_inline_body(f: dict, scale: SeverityScale) -> str:
+    """``{emoji} **[{tier}]** {message}``.
+
+    The default tier is the SCALE's least severe one, not the literal
+    'low': a finding missing its severity key (e.g. a malformed or legacy
+    cache entry carried forward — CacheEntry.findings loads straight from
+    JSON with no per-finding validation) must still render a name and a
+    colour that exist in THIS repo's vocabulary.
+    """
+    sev = f.get("severity") or scale.least_severe
+    return f"{scale.emoji(sev)} **[{sev}]** {f['message']}"
+
+
+def _parse_inline_body(body: str | None, scale: SeverityScale) -> tuple[str, str] | None:
+    """``(tier, message)`` from a body ``_format_inline_body`` wrote, or
+    ``None`` when it isn't one or its tier isn't on ``scale`` (a scale
+    change since it was posted): such a thread is left alone."""
+    m = _INLINE_BODY_RE.match(body or "")
+    if not m or not scale.is_known(m.group("sev")):
+        return None
+    return m.group("sev").strip().lower(), m.group("msg")
+
+
+class _PriorSet(NamedTuple):
+    findings: list[dict]   # offered to the model; prior_id = index
+    replies: list[int]     # reply count per offered finding
+    tracked: set[int]      # id() of offered findings that are cache dicts
+    overflow: list[dict]   # over RAVEN_PRIOR_FINDINGS_MAX: kept verbatim
+    moot: list[dict]       # on removed files: resolved after submit
+    untracked_acted: int   # untracked open threads offered or moot
+    moved: dict[int, str]  # id() of an offered finding from a renamed file -> its target
+
+
+def _collect_prior_findings(threads: list[dict] | None,
+                            cached_findings: dict[str, list[dict]],
+                            scope: set[str], removed: set[str],
+                            resolved_ids: set, gap_files: set[str],
+                            scale: SeverityScale, cap: int,
+                            renamed: dict[str, str] | None = None) -> _PriorSet:
+    """The open prior findings on the files a re-review covers (``scope``).
+
+    ``threads`` is ``provider.get_review_threads`` (``None``: unsupported
+    or failed, so only the cache is read). A tracked finding — its
+    ``comment_id`` in the cache — is offered as the cache's own dict,
+    whose severity, message and remapped line win. A missing listing entry
+    never means resolved: only an explicit ``resolved`` flag or
+    ``resolved_ids`` does, so a partial listing can't drop a tracked
+    blocker. An untracked open thread is parsed from its body and offered
+    when it sits on a scope file; one that doesn't parse, or names a tier
+    this scale lacks, is left alone. Findings on ``removed`` files (the
+    PR no longer changes them) are moot — except a rename source
+    (``renamed``: removed file -> the current file it was renamed to),
+    whose code still ships under the target: its findings are offered as
+    priors on the target when that is in scope (``moved`` records the
+    target for a cache dict; an orphan is built on it), and are otherwise
+    left alone, never resolved. Gap markers keep their own
+    lifecycle and are never offered. ``untracked_acted`` counts only the
+    untracked threads this pass acts on (offered or moot): one left alone
+    would be recounted by every review of the PR.
+    """
+    listed = {t["comment_id"]: t for t in threads or []
+              if isinstance(t.get("comment_id"), int)}
+    closed = set(resolved_ids) | {cid for cid, t in listed.items() if t.get("resolved")}
+    tracked_cids = {f.get("comment_id") for fl in cached_findings.values() for f in fl}
+
+    def _open(f: dict) -> bool:
+        return (not _is_coverage_gap_marker(f, gap_files)
+                and f.get("comment_id") not in closed)
+
+    renamed = renamed or {}
+    gone = set(removed) - renamed.keys()
+    offered = [f for fname in sorted(scope)
+               for f in cached_findings.get(fname, []) if _open(f)]
+    moved: dict[int, str] = {}
+    for src, dst in sorted(renamed.items()):
+        if dst in scope:
+            for f in cached_findings.get(src, []):
+                if _open(f):
+                    offered.append(f)
+                    moved[id(f)] = dst
+    tracked = {id(f) for f in offered}
+    moot = [f for fname in sorted(gone) for f in cached_findings.get(fname, [])
+            if _open(f) and f.get("comment_id") is not None]
+    untracked_acted = 0
+    for cid, t in listed.items():
+        if cid in tracked_cids or cid in closed:
+            continue
+        parsed = _parse_inline_body(t.get("body"), scale)
+        home = renamed.get(t.get("file"), t.get("file"))
+        if parsed is None or not (home in scope or t.get("file") in gone):
+            continue
+        untracked_acted += 1
+        orphan = {"severity": parsed[0], "file": home, "line": t.get("line"),
+                  "message": parsed[1], "comment_id": cid}
+        (offered if home in scope else moot).append(orphan)
+    replies = [int(listed.get(f.get("comment_id"), {}).get("replies") or 0)
+               for f in offered]
+    overflow: list[dict] = []
+    if len(offered) > cap:
+        # scale.rank() fails closed (unknown -> most severe): a tier the
+        # current scale lost ranks first, so it is re-judged under this
+        # scale instead of sitting in the overflow. Either way the kept copy counts as the most severe
+        # tier (see _process_pr).
+        order = sorted(range(len(offered)), key=lambda i: (
+            -scale.rank(offered[i].get("severity")), -(replies[i] > 0)))
+        top = set(order[:cap])
+        overflow = [f for i, f in enumerate(offered) if i not in top]
+        replies = [r for i, r in enumerate(replies) if i in top]
+        offered = [f for i, f in enumerate(offered) if i in top]
+    return _PriorSet(offered, replies, tracked, overflow, moot, untracked_acted, moved)
+
+
+def _resolve_finding_threads(provider: GitProvider, repo_full_name: str,
+                             pr_number: int, findings: list[dict], reason: str,
+                             skip: set | frozenset = frozenset()) -> None:
+    """Resolve each finding's platform thread, best-effort and after a
+    successful submit only. A failed resolve logs and moves on."""
+    for f in findings:
+        cid = f.get("comment_id")
+        if cid is None or cid in skip:
+            continue
+        try:
+            ok = provider.retract_finding(repo_full_name, pr_number, cid)
+        except Exception as e:
+            ok = False
+            logger.warning("retract_finding for %s finding (comment %s) on PR #%d "
+                           "failed: %s", reason, cid, pr_number, e)
+        inc("raven_retractions_total",
+            {"repo": repo_full_name, "result": "ok" if ok else "fail"})
 
 
 def _process_pr(provider: GitProvider, payload: dict) -> None:
@@ -1875,7 +2021,8 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         is_incremental = False
         unchanged_files: list[str] = []
         if previous_hashes and removed_files:
-            # Files were removed — do a full review to clear stale findings
+            # Files were removed — do a full review to clear stale findings;
+            # their threads resolve as moot (_collect_prior_findings)
             logger.info("PR #%d files removed since last review — full re-review", pr_number)
             review_diff_text = clean_diff
         elif previous_hashes and changed_files:
@@ -1895,10 +2042,10 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             # (a rebase or base merge) gets a full review of the rebased
             # head. The shortcut below would leave the approve standing
             # against a head no review saw (audit 2026-09-27 #6). Costs one
-            # review per rebase of an approved-but-unmerged PR, and
-            # regenerates its (non-blocking) findings, so resolutions on
-            # them are lost — and a blocking finding the author argued away
-            # through the comment flow can come back, as can an approve the
+            # review per rebase of an approved-but-unmerged PR. Its open
+            # findings ride in as prior findings, so the still-valid ones
+            # stay on their threads; a finding the comment flow retracted
+            # isn't offered and can come back, as can an approve the
             # comment flow granted. Advisory mode never merges, so it keeps
             # the shortcut.
             logger.info("PR #%d: approved PR rebased — full review of the new head",
@@ -2024,7 +2171,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
 
         # User-resolved-comment filter, pass 1 (pre-review). Findings
         # whose backing inline comment the developer marked resolved via
-        # the platform UI (Gitea ≥1.24 /resolve; BB DC "Resolve thread"
+        # the platform UI (Gitea "Resolve conversation"; BB DC "Resolve thread"
         # → threadResolved=true) are excluded from the carry-forward set
         # — the model must never be asked to drop-or-keep a finding the
         # developer already dismissed. Symmetric to the AI-driven
@@ -2032,6 +2179,9 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # on the AI's behalf; this one is Raven respecting the user's
         # direct dismissal. A second fetch after the AI call (below)
         # catches resolutions landing during the multi-minute review.
+        # Every re-review with a cache fetches it: the carried set
+        # (incremental) and the prior findings (every re-review) both skip
+        # resolved threads.
         #
         # NOTE: nothing is written to the cache here. ALL cache effects
         # of this pass — user-resolved drops, model drops — are applied
@@ -2040,7 +2190,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # review (the comment-flow all-retracted backstop counts cached
         # findings; a premature wipe could synthesize flip-to-approve).
         resolved_ids: set = set()
-        if is_incremental and cached_findings:
+        if cached_findings:
             try:
                 resolved_ids = provider.get_resolved_comment_ids(repo_full_name, pr_number)
             except Exception as e:
@@ -2123,6 +2273,43 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 RAVEN_CARRIED_REVALIDATION_MAX, len(overflow_candidates),
             )
 
+        # Prior findings on the files this pass re-reviews — Raven's open
+        # threads (platform) joined with the cache — offered for
+        # keep-or-resolve, so a still-valid finding stays on its thread
+        # instead of being regenerated into a second one.
+        # Only files whose code is in this pass's diff: changed_files is a
+        # subset of file_chunks by construction today, and the
+        # intersection keeps it that way if that ever changes — a prior
+        # judged without its code in the prompt must never be superseded.
+        rereviewed = ((set(changed_files) & set(file_chunks)) if is_incremental
+                      else set(file_chunks))
+        review_threads = None
+        if bot_user:
+            try:
+                review_threads = provider.get_review_threads(repo_full_name, pr_number, bot_user)
+            except Exception as e:
+                logger.warning("get_review_threads for PR #%d failed: %s — prior "
+                               "findings from the cache only", pr_number, e)
+        if not isinstance(review_threads, list):
+            review_threads = None
+        # A removed file that a rename carried to a current file is not
+        # gone: its findings are offered on the target (review 2575).
+        renamed: dict[str, str] = {}
+        if removed_files:
+            aliases = _rename_aliases(diff)
+            by_norm = {_normalize_path(k): k for k in current_hashes}
+            for src in removed_files:
+                target = by_norm.get(aliases.get(_normalize_path(src), ""))
+                if target:
+                    renamed[src] = target
+        priors = _collect_prior_findings(
+            review_threads, cached_findings, rereviewed, set(removed_files),
+            resolved_ids, set(cached.coverage_gap_files or []) if cached else set(),
+            scale, RAVEN_PRIOR_FINDINGS_MAX, renamed=renamed)
+        if priors.untracked_acted:
+            add("raven_untracked_open_threads_total", priors.untracked_acted,
+                {"repo": repo_full_name})
+
         # Run review
         with Timer("raven_review_duration_seconds", {"repo": repo_full_name}):
             review = review_diff(
@@ -2138,6 +2325,11 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 is_incremental=is_incremental,
                 unchanged_files=unchanged_files,
                 carried_findings=revalidation_candidates or None,
+                prior_findings=[
+                    {**{k: f[k] for k in ("line", "message") if k in f},
+                     "file": priors.moved.get(id(f), f.get("file")),
+                     "severity": scale.normalize(f.get("severity")), "replies": r}
+                    for f, r in zip(priors.findings, priors.replies)] or None,
                 scale=scale,
             )
         # Ride the migration nag on the review dict, the same channel
@@ -2149,6 +2341,56 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
 
         # Save original findings before merging carried ones (used for cache write)
         fresh_findings = list(review.get("findings", []))
+
+        # The keep-or-resolve answer. Superseding is the explicit outcome,
+        # keeping the fail-safe: the prompt tells the model not to restate
+        # what it keeps, so a prior is superseded (resolved + dropped)
+        # ONLY when a well-formed answer from its call omits it. An
+        # unanswered prior (missing or voided answer, failed chunk) is
+        # kept verbatim, like the over-cap overflow — the same rule as
+        # dropped_carried. A verbatim restatement — the same severity
+        # too, since a new tier is the "raise it fresh" case — counts as
+        # a keep, and the prior copy wins with its thread. A prior's tier
+        # is read through scale.normalize() here and on every kept copy:
+        # a cached tier the current scale lost fails closed to the most
+        # severe, like model output, so a kept prior never counts less.
+        prior_answer = review.pop("prior_answer", None) or {}
+        answered: set[int] = set(prior_answer.get("answered") or ())
+        kept_lines: dict[int, int | None] = dict(prior_answer.get("kept") or {})
+
+        def _prior_key(f: dict) -> tuple:
+            return (scale.normalize(f.get("severity")),
+                    priors.moved.get(id(f), f.get("file")), f.get("line"),
+                    f.get("message"))
+
+        def _kept_copy(p: dict, line: int | None) -> dict:
+            c = {**p, "severity": scale.normalize(p.get("severity")),
+                 "file": priors.moved.get(id(p), p.get("file"))}
+            if line:
+                c["line"] = line
+            return c
+
+        # The fresh copy of a verbatim restatement is removed at the merge
+        # (step 8), against only the kept priors that survive the
+        # post-review resolved filter: if the prior's thread was resolved
+        # mid-review, the model's restatement must still post.
+        if priors.findings:
+            prior_keys = {_prior_key(p): i for i, p in enumerate(priors.findings)}
+            for f in fresh_findings:
+                i = prior_keys.get(_prior_key(f))
+                if i is not None:
+                    kept_lines.setdefault(i, None)
+        unanswered = [i for i in range(len(priors.findings)) if i not in answered]
+        for i in unanswered:
+            kept_lines.setdefault(i, None)
+        # (copy, origin): the new line rides on a copy, never on the
+        # shared cache dict; origin is how the cache write spots a
+        # concurrent retraction.
+        kept_pairs = [
+            (_kept_copy(priors.findings[i], line), priors.findings[i])
+            for i, line in sorted(kept_lines.items())
+        ] + [(_kept_copy(f, None), f) for f in priors.overflow]
+        superseded = [p for i, p in enumerate(priors.findings) if i not in kept_lines]
 
         # Apply the model's drop-or-keep answer to the carried set —
         # LOCALLY only; the cache is untouched until the post-submit
@@ -2187,12 +2429,10 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
 
         # User-resolved-comment filter, pass 2 (post-review). The AI
         # call takes minutes; a finding the developer resolves DURING it
-        # would otherwise be re-posted by the carry merge and re-tagged
-        # with a fresh comment_id (the standing re-tagging below), after
-        # which the next pass's filter — matching the OLD id — could
-        # never catch it: the user's resolution would be permanently
-        # lost. One extra provider GET per incremental review.
-        if is_incremental and kept_candidates:
+        # would otherwise stay in this pass's verdict and summary body
+        # until the next push. One extra provider GET per incremental
+        # review.
+        if (is_incremental and kept_candidates) or kept_pairs or superseded or priors.moot:
             try:
                 resolved_post = provider.get_resolved_comment_ids(repo_full_name, pr_number)
             except Exception as e:
@@ -2209,6 +2449,10 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                     if f.get("comment_id") not in resolved_ids
                 ]
                 user_resolved_count += before_count - len(kept_candidates)
+                before_prior = len(kept_pairs)
+                kept_pairs = [(k, o) for k, o in kept_pairs
+                              if k.get("comment_id") not in resolved_ids]
+                user_resolved_count += before_prior - len(kept_pairs)
         if user_resolved_count:
             logger.info(
                 "PR #%d: dropped %d user-resolved finding(s) from carry-forward",
@@ -2226,6 +2470,15 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # message) duplicates lose to the carried copy, which holds the
         # comment_id retraction needs.
         carried = kept_candidates + carried_markers
+        kept_priors = [k for k, _ in kept_pairs]
+        if kept_pairs:
+            # Verbatim restatements of the kept priors that survived pass
+            # 2 lose to the prior copy (keyed on both the prior and its
+            # line-updated copy).
+            kept_keys = ({_prior_key(o) for _, o in kept_pairs}
+                         | {_prior_key(k) for k, _ in kept_pairs})
+            fresh_findings = [f for f in fresh_findings
+                              if _prior_key(f) not in kept_keys]
         if carried:
             carried_keys = {
                 (f.get("file"), f.get("line"), f.get("message")) for f in carried
@@ -2234,11 +2487,14 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 f for f in fresh_findings
                 if (f.get("file"), f.get("line"), f.get("message")) not in carried_keys
             ]
-            review["findings"] = fresh_findings + carried
             review["carried_count"] = len(carried)
+        if kept_priors:
+            review["kept_prior_count"] = len(kept_priors)
+        review["findings"] = fresh_findings + carried + kept_priors
+        if carried or kept_priors:
             # Recompute severity across all findings
             review["severity"] = _max_severity_from_findings(
-                [{"severity": review["severity"]}] + carried, scale)
+                [{"severity": review["severity"]}] + carried + kept_priors, scale)
 
         # Per-file sticky coverage gap. An incremental pass only
         # re-reviews CHANGED files, so an unchanged oversized file from
@@ -2286,6 +2542,25 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         def _is_inline_postable(f: dict) -> bool:
             return bool(f.get("file")) and isinstance(f.get("line"), int) and f["line"] > 0
 
+        # A carried finding with a comment_id already has its inline
+        # thread, from the pass that found it, so it is not posted again.
+        # A second copy would open a second thread for the same finding on
+        # every push and orphan the first one's conversation: resolution
+        # and retraction match only the id the cache tracks. Nothing would
+        # clear the old copy either — dismiss_previous_reviews is a no-op
+        # on Bitbucket DC, and dismissing a review doesn't delete its
+        # inline comments. The finding still counts toward the verdict and
+        # still appears in the summary body. Matched by identity against
+        # the carried dicts, so only the cache's own findings qualify.
+        # The post below and the comment_id tagging after submit share
+        # this one predicate, which keeps their zip aligned. A kept prior
+        # finding likewise stays on its thread.
+        on_thread = {
+            id(f) for f in carried + kept_priors if f.get("comment_id") is not None}
+
+        def _posts_inline(f: dict) -> bool:
+            return _is_inline_postable(f) and id(f) not in on_thread
+
         # Submit formal review — must succeed before dismissing old reviews.
         # Verdict + inline comments are computed first; the inline-mode body
         # (below) needs to know whether anything was posted inline.
@@ -2330,29 +2605,19 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 "forcing needs_work verdict (fail-closed; refusing to "
                 "auto-merge under a guessed scale)", pr_number)
             approve = False
-
-        def _inline_body(f: dict) -> str:
-            # Bound once — not scale.emoji(f.get(...)) / f.get(...) twice —
-            # so both reads see the same fallback. The default is the
-            # SCALE's least-severe tier, not the literal 'low': a finding
-            # missing its severity key (e.g. a malformed/legacy cache entry
-            # carried forward — CacheEntry.findings loads straight from
-            # JSON with no per-finding validation) must still render a
-            # name and colour that exist in THIS repo's vocabulary. Sibling
-            # fix to 9d2d478, which covered the other three
-            # .get("severity", "low") sites in this function and missed
-            # this one.
-            sev = f.get("severity") or scale.least_severe
-            return f"{scale.emoji(sev)} **[{sev}]** {f['message']}"
+        # Display only: the headline badge (SeverityScale.badge) must not
+        # read "no issues" on a review whose verdict blocks, and the forced
+        # needs_work above happens outside the severity it would otherwise go by.
+        review["blocking"] = not approve
 
         inline_comments = [
             {
                 "file": f["file"],
                 "line": f["line"],
-                "body": _inline_body(f),
+                "body": _format_inline_body(f, scale),
             }
             for f in review.get("findings", [])
-            if _is_inline_postable(f)
+            if _posts_inline(f)
         ] if post_inline else []
 
         # Build the summary body per output channel:
@@ -2363,10 +2628,16 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         #                    coverage-gap markers) get a MINIMAL body so they
         #                    aren't silently dropped. Empty body when there
         #                    are none — a clean PR posts just the verdict.
+        #                    A carried finding with a thread isn't posted
+        #                    inline, so the body lists it too: a pass whose
+        #                    only blocker is carried must still name it.
         if RAVEN_REVIEW_OUTPUT == "inline":
             leftover = [f for f in review.get("findings", [])
                         if not _is_inline_postable(f)]
-            body = _format_inline_leftovers(leftover, scale, review)
+            on_threads = [f for f in review.get("findings", [])
+                          if _is_inline_postable(f) and not _posts_inline(f)]
+            body = _format_inline_leftovers(leftover, scale, review,
+                                            on_threads=on_threads)
             # Never submit a content-less non-approve review: Gitea rejects an
             # empty body + no inline comments for a COMMENT / REQUEST_CHANGES
             # event. (A clean APPROVE with an empty body is fine and stays
@@ -2376,9 +2647,12 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 RAVEN_REVIEW_MODE == "advisory" or not approve
             ):
                 sev = review.get("severity", scale.least_severe)
+                emoji, label = scale.badge(sev, review.get("findings"),
+                                           blocking=not approve)
                 body = (
-                    f"🦅 **Raven** — {scale.emoji(sev)} "
-                    f"**{sev.upper()}** — {review.get('summary') or 'changes requested'}"
+                    f"🦅 **Raven** — {emoji} "
+                    f"**{label}** — {review.get('summary') or 'changes requested'}"
+                    f"\n\n{_review_footer()}"
                 )
         else:
             body = _format_comment(
@@ -2453,20 +2727,24 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # block the very merge it enables. Best-effort: a failed resolve
         # logs and continues (the drop itself stands). Runs only after
         # submit_review succeeded, alongside the other cache effects.
-        for f in dropped_findings:
-            cid = f.get("comment_id")
-            if cid is None:
-                continue
-            try:
-                ok = provider.retract_finding(repo_full_name, pr_number, cid)
-            except Exception as e:
-                ok = False
-                logger.warning(
-                    "retract_finding for re-validation-dropped finding "
-                    "(comment %s) on PR #%d failed: %s", cid, pr_number, e,
-                )
-            inc("raven_retractions_total",
-                {"repo": repo_full_name, "result": "ok" if ok else "fail"})
+        _resolve_finding_threads(provider, repo_full_name, pr_number,
+                                 dropped_findings, "re-validation-dropped")
+        # Superseded prior findings (a well-formed answer omitted them) and moot ones
+        # (their file left the PR): resolved so no open thread is left
+        # untracked. Ones already resolved are skipped.
+        _resolve_finding_threads(provider, repo_full_name, pr_number,
+                                 superseded + priors.moot, "superseded prior",
+                                 skip=resolved_ids)
+        outcomes = (
+            ("kept", sum(1 for i in kept_lines if i in answered)),
+            ("superseded", len(superseded)),
+            ("unanswered", len(unanswered) + len(priors.overflow)),
+            ("moot", len(priors.moot)),
+        )
+        for outcome, n in outcomes:
+            if n:
+                add("raven_prior_findings_total", n,
+                    {"repo": repo_full_name, "outcome": outcome})
 
         # Dismiss previous Raven reviews — only after new review is safely posted
         new_review_id = new_review.get("id") if isinstance(new_review, dict) else None
@@ -2488,21 +2766,22 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # by comment_id to drop the right entry on a successful retract.
         #
         # CRITICAL: iterate review["findings"] (post-carry-forward merge)
-        # — NOT fresh_findings — to mirror the inline_comments filter at
-        # line ~776. On incremental reviews, review["findings"] also
-        # contains carried findings whose previous IDs were dismissed
-        # alongside the prior review (server.py:794 dismiss_previous_reviews).
-        # submit_review re-posts them with fresh IDs; the carried-finding
-        # dicts in cache get retagged with those new IDs via shared
-        # references (carried = list of dict refs from cached_findings,
-        # which are the same dicts as _previous_diffs[pr_key].findings).
+        # — NOT fresh_findings — with the same _posts_inline predicate as
+        # the inline_comments build, so this list and posted_inline line
+        # up by index. On incremental reviews that list includes carried
+        # findings that had no thread yet (first seen in summary mode, or
+        # their post failed); they are posted now, and their carried
+        # dicts get the new ids through shared references (carried = dict
+        # refs from cached_findings, the same dicts as
+        # _previous_diffs[pr_key].findings). A carried finding that
+        # already had a thread wasn't posted, so it keeps its comment_id.
         # Only findings actually submitted as inline comments can be tagged
         # with a comment_id. When inline output is suppressed (summary mode),
         # nothing was posted inline, so this stays empty and the length-match
         # guard below trivially passes (0 == 0) rather than warning.
         submitted_findings = [
             f for f in review.get("findings", [])
-            if _is_inline_postable(f)
+            if _posts_inline(f)
         ] if post_inline else []
         posted_inline = (new_review or {}).get("inline_comments") or []
         # Defensive: providers MUST return inline_comments aligned by
@@ -2553,6 +2832,11 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             live_findings = (
                 live_entry.findings if live_entry is not None else cached_findings
             )
+            # A tracked prior finding that left the live entry was retracted
+            # by the comment flow mid-review: never resurrect it.
+            live_ids = {id(f) for fl in live_findings.values() for f in fl}
+            kept_live = [k for k, origin in kept_pairs
+                         if id(origin) not in priors.tracked or id(origin) in live_ids]
             if is_incremental and cached_findings:
                 findings_map = {
                     fname: [f for f in live_findings.get(fname, []) if _keep_carried(f)]
@@ -2564,13 +2848,13 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 # the lockfile), and it never falls into the file-less
                 # bucket, which the next pass would carry back to the model
                 # as a finding.
-                fresh = _findings_by_file(fresh_findings, changed_files | stripped_now)
+                fresh = _findings_by_file(fresh_findings + kept_live, changed_files | stripped_now)
                 # Carry forward file-less findings from previous review + new file-less ones
                 fresh.setdefault("", []).extend(
                     f for f in live_findings.get("", []) if _keep_carried(f))
                 findings_map.update(fresh)
             else:
-                findings_map = _findings_by_file(fresh_findings, set(current_hashes.keys()))
+                findings_map = _findings_by_file(fresh_findings + kept_live, set(current_hashes.keys()))
             _previous_diffs[pr_key] = CacheEntry(
                 timestamp=time.time(),
                 hashes=current_hashes,
@@ -3290,8 +3574,8 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 if not ok:
                     continue
                 # Drop matching cached finding so the next push-driven
-                # incremental review doesn't carry it forward and re-post
-                # it as a new inline comment, effectively undoing the
+                # incremental review doesn't carry it forward into its
+                # verdict and summary, effectively undoing the
                 # retraction. Findings carry `comment_id` only when
                 # provider.submit_review's extended return shape is wired
                 # (deferred to a follow-up); legacy findings without
@@ -3417,6 +3701,7 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                             "severity": _max_severity_from_findings(remaining_findings, comment_scale),
                             "summary": revise["body"],
                             "findings": remaining_findings,
+                            "blocking": new_verdict != "approve",
                         },
                         mode="advisory_update",
                         scale=comment_scale,
@@ -4586,6 +4871,13 @@ def _severity_mismatch_lines(review: dict) -> list[str]:
     ]
 
 
+def _review_footer() -> str:
+    """The provenance line that closes every review body Raven composes:
+    the full summary, and inline mode's short body whenever one is posted."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return f"*Reviewed by Raven · {RAVEN_AI_MODEL} · effort {RAVEN_AI_EFFORT} · {timestamp}*"
+
+
 def _format_comment(review: dict, mode: str = "review",
                     scale: SeverityScale | None = None) -> str:
     """Render the review summary body.
@@ -4608,8 +4900,8 @@ def _format_comment(review: dict, mode: str = "review",
     severity = review.get("severity", scale.least_severe)
     summary = review.get("summary", "")
     findings = review.get("findings", [])
-    emoji = scale.emoji(severity)
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    emoji, label = scale.badge(severity, review.get("findings"),
+                               blocking=bool(review.get("blocking")))
 
     if mode == "advisory":
         header = "🦅 **Raven Recommendation**"
@@ -4622,7 +4914,7 @@ def _format_comment(review: dict, mode: str = "review",
     if mode in ("advisory", "advisory_update"):
         lines.append("_Advisory only — Raven is not blocking this PR._")
     lines.append("")
-    lines.append(f"**{emoji} {severity.upper()}** — {summary}")
+    lines.append(f"**{emoji} {label}** — {summary}")
 
     # Empirical vocabulary-mismatch signal — an override that contradicts
     # the scale is not prevented (impossible against opaque override
@@ -4656,15 +4948,21 @@ def _format_comment(review: dict, mode: str = "review",
         lines.append("")
         lines.append(f"*Includes {n} finding(s) carried from unchanged files*")
 
+    if review.get("kept_prior_count"):
+        n = review["kept_prior_count"]
+        lines.append("")
+        lines.append(f"*Includes {n} earlier finding(s) that still apply, kept on their threads*")
+
     lines.append("")
-    lines.append(f"*Reviewed by Raven · {RAVEN_AI_MODEL} · effort {RAVEN_AI_EFFORT} · {timestamp}*")
+    lines.append(_review_footer())
 
     return "\n".join(lines)
 
 
 def _format_inline_leftovers(findings: list[dict],
                              scale: SeverityScale | None = None,
-                             review: dict | None = None) -> str:
+                             review: dict | None = None,
+                             on_threads: list[dict] | None = None) -> str:
     """Minimal body for ``RAVEN_REVIEW_OUTPUT=inline``.
 
     Inline mode posts no summary/recommendation comment. The only findings
@@ -4673,7 +4971,14 @@ def _format_inline_leftovers(findings: list[dict],
     listed in a short body so they aren't silently dropped. Returns ``""``
     when every finding is inline-anchored AND there's neither a
     severity-mismatch note nor a deprecated-config-path note (see below),
-    so a clean review posts no body.
+    so a clean review posts no body. A body that is posted ends with the
+    same footer as the full summary (``_review_footer``); a footer alone
+    would be a comment on every clean review, so an empty body stays empty.
+
+    ``on_threads`` — carried findings that already have an inline thread
+    from an earlier review, so this review doesn't post them. They are
+    listed in their own section, or a pass whose only blocker is carried
+    would request changes without naming it.
 
     ``scale`` should be the repo's resolved scale — see ``_format_comment``
     for why omitting it is unsafe for a custom vocabulary (every tier
@@ -4693,14 +4998,18 @@ def _format_inline_leftovers(findings: list[dict],
     scale = scale or default_scale()
     mismatch_lines = _severity_mismatch_lines(review) if review else []
     legacy_lines = _legacy_config_path_lines(review) if review else []
-    if not findings and not mismatch_lines and not legacy_lines:
+    if not findings and not on_threads and not mismatch_lines and not legacy_lines:
         return ""
     lines = ["🦅 **Raven**"]
-    if findings:
+    for heading, group in (("Findings without an inline location:", findings),
+                           ("Still open from earlier reviews, on their existing threads:",
+                            on_threads)):
+        if not group:
+            continue
         lines.append("")
-        lines.append("Findings without an inline location:")
+        lines.append(heading)
         lines.append("")
-        for f in findings:
+        for f in group:
             f_sev = f.get("severity", scale.least_severe)
             f_emoji = scale.emoji(f_sev)
             lines.append(f"- {f_emoji} **[{f_sev}]** {f.get('message', '')}")
@@ -4710,6 +5019,8 @@ def _format_inline_leftovers(findings: list[dict],
     if legacy_lines:
         lines.append("")
         lines.extend(legacy_lines)
+    lines.append("")
+    lines.append(_review_footer())
     return "\n".join(lines)
 
 

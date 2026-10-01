@@ -65,3 +65,9 @@ def test_get_pr_diff_head_sha_default_is_the_pr_head():
     class _P(_MinimalProvider):
         def get_pr_head_sha(self, r, p): return "headsha"
     assert _P().get_pr_diff_head_sha("u/r", 1) == "headsha"
+
+
+def test_get_review_threads_default_is_unsupported():
+    """None, not []: an empty list would read as 'Raven has no threads',
+    and the server would then offer no untracked thread at all."""
+    assert _MinimalProvider().get_review_threads("u/r", 1, "raven") is None

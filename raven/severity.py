@@ -109,6 +109,29 @@ class SeverityScale:
             return "🟡"
         return "🟠"
 
+    def badge(self, severity: str, findings: list | None,
+              blocking: bool = False) -> tuple[str, str]:
+        """``(emoji, label)`` for a review's headline.
+
+        A review that lists no findings at the least severe tier reads as
+        ``✅ NO ISSUES``: showing it as ``🟡 LOW`` labels a clean review as
+        a low-severity issue. Anything else shows its tier: a severity the
+        model raised with no findings, and any review whose verdict blocks
+        (``blocking``), since Raven can force needs_work outside the
+        severity (a failed scale read, a coverage gap, a scale whose least
+        tier blocks) and a blocking review must not say there are no
+        issues. The scale's own gate is asked as well, so a caller that
+        forgets ``blocking`` still can't label a tier this scale blocks as
+        no issues. ``findings=None`` (a review dict without the list) never
+        claims there are no issues either. Display only: the gate still
+        reads the severity itself.
+        """
+        if (not blocking and not self.blocks(severity)
+                and isinstance(findings, list) and not findings
+                and self.normalize(severity) == self.least_severe):
+            return "✅", "NO ISSUES"
+        return self.emoji(severity), str(severity).upper()
+
     # ── identity ──────────────────────────────────────────────────── #
 
     def fingerprint(self) -> str:

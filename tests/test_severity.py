@@ -344,3 +344,47 @@ class TestRepoAuthoredTextIsBounded:
             "descriptions": {"bug": "A real defect. " * 20},
         }))
         assert "A real defect." in scale.descriptions["bug"]
+
+
+class TestBadge:
+    """The headline a review shows. A review that lists no findings at the
+    least severe tier reads as no issues, not as a low-severity issue."""
+
+    def test_no_findings_at_the_least_tier_reads_as_no_issues(self):
+        assert default_scale().badge("low", []) == ("✅", "NO ISSUES")
+
+    def test_a_finding_at_the_least_tier_shows_the_tier(self):
+        finding = {"severity": "low", "message": "m"}
+        assert default_scale().badge("low", [finding]) == ("🟡", "LOW")
+
+    def test_no_findings_above_the_least_tier_shows_the_tier(self):
+        """A blocking verdict with no findings is still a blocking verdict."""
+        assert default_scale().badge("high", []) == ("🔴", "HIGH")
+
+    def test_unknown_findings_show_the_tier(self):
+        """A review dict without a findings list (a legacy or partial one)
+        never claims there are no issues."""
+        assert default_scale().badge("low", None) == ("🟡", "LOW")
+
+    def test_custom_scale_uses_its_own_least_tier(self):
+        assert _scale().badge("nit", []) == ("✅", "NO ISSUES")
+        assert _scale().badge("low", []) == ("🟠", "LOW")
+
+    def test_unknown_name_fails_closed_to_the_tier_badge(self):
+        assert default_scale().badge("bogus", []) == ("🔴", "BOGUS")
+
+    def test_name_is_read_case_insensitively(self):
+        assert default_scale().badge(" Low ", []) == ("✅", "NO ISSUES")
+
+    def test_a_blocking_verdict_never_reads_as_no_issues(self):
+        """Raven can force needs_work outside the severity (a failed scale
+        read, a coverage gap, a scale whose least tier blocks); the headline
+        must not say "no issues" on a review that blocks."""
+        assert default_scale().badge("low", [], blocking=True) == ("🟡", "LOW")
+
+    def test_a_tier_the_scale_blocks_never_reads_as_no_issues(self):
+        """The scale's own gate counts even when a caller forgets the flag
+        (a notifier dict built outside _process_pr carries none)."""
+        strict = SeverityScale(ranks={"nit": 10, "bug": 20},
+                               blocks_at_or_above="nit")
+        assert strict.badge("nit", []) == ("🟡", "NIT")

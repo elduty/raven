@@ -1,0 +1,116 @@
+{
+ "diffs": [
+  {
+   "source": {
+    "components": [
+     "config.example.env"
+    ],
+    "parent": "",
+    "name": "config.example.env",
+    "extension": "env",
+    "toString": "config.example.env"
+   },
+   "destination": {
+    "components": [
+     "config.example.env"
+    ],
+    "parent": "",
+    "name": "config.example.env",
+    "extension": "env",
+    "toString": "config.example.env"
+   },
+   "hunks": [],
+   "truncated": false
+  },
+  {
+   "source": {
+    "components": [
+     "docs",
+     "evaluate.md"
+    ],
+    "parent": "docs",
+    "name": "evaluate.md",
+    "extension": "md",
+    "toString": "docs/evaluate.md"
+   },
+   "destination": {
+    "components": [
+     "docs",
+     "evaluate-renamed.md"
+    ],
+    "parent": "docs",
+    "name": "evaluate-renamed.md",
+    "extension": "md",
+    "toString": "docs/evaluate-renamed.md"
+   },
+   "hunks": [],
+   "truncated": false
+  },
+  {
+   "source": {
+    "components": [
+     "probe",
+     "blob.bin"
+    ],
+    "parent": "probe",
+    "name": "blob.bin",
+    "extension": "bin",
+    "toString": "probe/blob.bin"
+   },
+   "destination": {
+    "components": [
+     "probe",
+     "blob.bin"
+    ],
+    "parent": "probe",
+    "name": "blob.bin",
+    "extension": "bin",
+    "toString": "probe/blob.bin"
+   },
+   "binary": true
+  },
+  {
+   "source": null,
+   "destination": {
+    "components": [
+     "probe",
+     "empty.txt"
+    ],
+    "parent": "probe",
+    "name": "empty.txt",
+    "extension": "txt",
+    "toString": "probe/empty.txt"
+   },
+   "hunks": [],
+   "truncated": false
+  },
+  {
+   "source": null,
+   "destination": {
+    "components": [
+     "probe",
+     "pixel.png"
+    ],
+    "parent": "probe",
+    "name": "pixel.png",
+    "extension": "png",
+    "toString": "probe/pixel.png"
+   },
+   "binary": true
+  },
+  {
+   "source": null,
+   "destination": {
+    "components": [
+     "probe",
+     "source_with_nul.py"
+    ],
+    "parent": "probe",
+    "name": "source_with_nul.py",
+    "extension": "py",
+    "toString": "probe/source_with_nul.py"
+   },
+   "binary": true
+  }
+ ]
+}

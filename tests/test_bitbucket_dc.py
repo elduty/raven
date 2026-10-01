@@ -6,6 +6,7 @@ import hmac as hmac_mod
 import json
 import os
 import pytest
+import requests
 from unittest.mock import MagicMock, patch
 
 
@@ -1285,6 +1286,90 @@ class TestJsonDiffToUnified:
         assert result == "\n"
 
 
+class TestBinaryEntries:
+    """Audit 09-27 #2b, BB DC half. The fixtures are real compare/diff
+    responses from the work instance for synthetic probe files: BB DC marks
+    a binary entry ``"binary": true`` and gives it no hunks; the synthesizer
+    writes git's marker for it, so it gaps as on git. A pure rename and an
+    empty new file stay plain sections."""
+
+    @staticmethod
+    def _fixture(name):
+        from pathlib import Path
+        return json.loads((Path(__file__).parent / "fixtures/audit" / name).read_text())
+
+    @pytest.fixture()
+    def unified(self, client):
+        return client._json_diff_to_unified(self._fixture("bbdc_binary_shapes.json"))
+
+    @pytest.fixture()
+    def deleted(self, client):
+        return client._json_diff_to_unified(self._fixture("bbdc_binary_deleted.json"))
+
+    def test_binary_entries_get_git_markers(self, unified, deleted):
+        assert "Binary files a/probe/blob.bin and b/probe/blob.bin differ" in unified
+        assert "Binary files /dev/null and b/probe/source_with_nul.py differ" in unified
+        assert "Binary files /dev/null and b/probe/pixel.png differ" in unified
+        assert "Binary files a/probe/blob.bin and /dev/null differ" in deleted
+
+    def test_a_deletion_carries_the_deleted_file_mode_header(self, deleted):
+        """strip_diff reads deletion from this header, as it does for git,
+        so a deleted binary is shown going but isn't a gap."""
+        header, mode = deleted.split("\n")[:2]
+        assert header == "diff --git a/probe/blob.bin b/probe/blob.bin"
+        assert mode == "deleted file mode 100644"
+
+    def test_non_binary_hunkless_entries_get_no_marker(self, unified):
+        sections = unified.split("diff --git ")[1:]
+        plain = [s for s in sections if s.startswith(("a/config.example.env ",
+                                                      "a/docs/evaluate-renamed.md ",
+                                                      "a/probe/empty.txt "))]
+        assert len(plain) == 3
+        assert not any("Binary files" in s or "deleted file mode" in s for s in plain)
+
+    def test_strip_diff_gaps_the_binaries_that_are_not_skip_listed(self, unified, deleted):
+        """End to end with the reviewer: the binary source file and the
+        modified .bin are binary gaps, the PNG is stripped (D2 (b)),
+        config.example.env is an unshown change, and the pure rename, the
+        empty file and the deletion are not gaps."""
+        from raven.reviewer import strip_diff
+        result = strip_diff(unified)
+        assert result.binary_gaps == ["probe/blob.bin", "probe/source_with_nul.py"]
+        assert result.stripped == ["probe/pixel.png"]
+        assert result.gaps == []
+        # config.example.env gaps as a change the diff doesn't show
+        # (decided 2026-10-01); the rename and the empty new file don't.
+        assert result.unshown_gaps == ["config.example.env"]
+        assert strip_diff(deleted).binary_gaps == []
+        assert strip_diff(deleted).unshown_gaps == []
+
+    @staticmethod
+    def _binary_rename(src, dst):
+        """BB DC's binary-entry shape (as in the fixtures) with a rename."""
+        return {"diffs": [{"source": {"toString": src}, "destination": {"toString": dst},
+                           "binary": True}]}
+
+    @pytest.mark.parametrize("src,dst,gaps,stripped", [
+        # Renaming source code to a skip-listed name must not hide it:
+        # the source side isn't skip-named, so it gaps (audit 09-27 #4).
+        ("authz.py", "authz.png", ["authz.png"], []),
+        # Media renamed to media is stripped, as on git.
+        ("logo.png", "logo2.png", [], ["logo2.png"]),
+        # Compiled code renamed to compiled code gaps (D2 (b)).
+        ("tool.so", "tool.wasm", ["tool.wasm"], []),
+    ])
+    def test_a_binary_rename_reads_both_names(self, client, src, dst, gaps, stripped):
+        """The header carries the destination on both sides, so the source
+        name survives only in the ``---`` line and the marker; strip_diff
+        must still decide on both names (Raven's review of this PR)."""
+        from raven.reviewer import strip_diff
+        unified = client._json_diff_to_unified(self._binary_rename(src, dst))
+        assert f"Binary files a/{src} and b/{dst} differ" in unified
+        result = strip_diff(unified)
+        assert result.binary_gaps == gaps
+        assert result.stripped == stripped
+
+
 # ------------------------------------------------------------------ #
 #  get_pr_reviews — status normalization                              #
 # ------------------------------------------------------------------ #
@@ -1782,6 +1867,72 @@ class TestGetResolvedCommentIds:
         with patch.object(client.session, "get", side_effect=fake_get):
             resolved = client.get_resolved_comment_ids("proj/repo", 1)
         assert resolved == {10, 20}
+
+
+class TestGetReviewThreads:
+    """Raven's own inline threads from the activities scan: roots with an
+    anchor path + line, authored by the bot (name or slug), replies
+    counted through the nested tree, both resolved signals honoured."""
+
+    def _page(self, comments, is_last=True, next_start=0):
+        return {"values": [{"action": "COMMENTED", "comment": c} for c in comments],
+                "isLastPage": is_last, "nextPageStart": next_start}
+
+    def test_lists_bot_roots_with_replies_and_resolution(self, client):
+        comments = [
+            {"id": 1, "author": {"name": "raven-bot", "slug": "raven-bot"},
+             "text": "🔴 **[high]** bug", "anchor": {"path": "a.py", "line": 5},
+             "threadResolved": False, "state": "OPEN",
+             "comments": [{"id": 2, "author": {"slug": "alice"}, "text": "no",
+                           "comments": [{"id": 3, "author": {"slug": "raven-bot"},
+                                         "text": "yes", "comments": []}]}]},
+            {"id": 4, "author": {"name": "RAVEN-BOT", "slug": "raven-bot"},
+             "text": "🟡 **[low]** nit", "anchor": {"path": "b.py", "line": 2},
+             "threadResolved": True, "comments": []},
+            {"id": 5, "author": {"slug": "raven-bot"}, "text": "🟡 **[low]** x",
+             "anchor": {"path": "c.py", "line": 1}, "state": "RESOLVED"},
+            # not the bot / no line / general comment: skipped
+            {"id": 6, "author": {"slug": "alice"}, "text": "hi",
+             "anchor": {"path": "a.py", "line": 5}},
+            {"id": 7, "author": {"slug": "raven-bot"}, "text": "file-level",
+             "anchor": {"path": "a.py"}},
+            {"id": 8, "author": {"slug": "raven-bot"}, "text": "summary"},
+        ]
+        with _mock_get(client, json_data=self._page(comments)):
+            threads = client.get_review_threads("PROJ/repo", 1, "raven-bot")
+        assert threads == [
+            {"comment_id": 1, "file": "a.py", "line": 5, "body": "🔴 **[high]** bug",
+             "replies": 2, "resolved": False},
+            {"comment_id": 4, "file": "b.py", "line": 2, "body": "🟡 **[low]** nit",
+             "replies": 0, "resolved": True},
+            {"comment_id": 5, "file": "c.py", "line": 1, "body": "🟡 **[low]** x",
+             "replies": 0, "resolved": True},
+        ]
+
+    def test_fetch_error_is_none(self, client):
+        resp = MagicMock(status_code=500)
+        resp.raise_for_status.side_effect = requests.HTTPError("500")
+        with patch.object(client.session, "get", return_value=resp):
+            assert client.get_review_threads("PROJ/repo", 1, "raven-bot") is None
+
+    def test_empty_bot_user_is_none(self, client):
+        assert client.get_review_threads("PROJ/repo", 1, "") is None
+
+    def test_follows_pages(self, client):
+        c1 = {"id": 1, "author": {"slug": "raven-bot"}, "text": "t",
+              "anchor": {"path": "a.py", "line": 1}}
+        c2 = {"id": 2, "author": {"slug": "raven-bot"}, "text": "t",
+              "anchor": {"path": "b.py", "line": 1}}
+        pages = [self._page([c1], is_last=False, next_start=50), self._page([c2])]
+        resps = []
+        for pg in pages:
+            r = MagicMock(status_code=200)
+            r.raise_for_status = MagicMock()
+            r.json.return_value = pg
+            resps.append(r)
+        with patch.object(client.session, "get", side_effect=resps):
+            threads = client.get_review_threads("PROJ/repo", 1, "raven-bot")
+        assert [t["comment_id"] for t in threads] == [1, 2]
 
 
 class TestGetPrComments:

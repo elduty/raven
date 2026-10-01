@@ -234,7 +234,8 @@ def _format_message(repo_name: str, ref: str, review: dict, link: str, action: s
     scale = _scale_from_review(review)
     severity = review.get("severity", scale.least_severe)
     summary = review.get("summary", "")
-    emoji = scale.emoji(severity)
+    emoji, label = scale.badge(severity, review.get("findings"),
+                               blocking=bool(review.get("blocking")))
 
     if action == "merge_failed":
         header = "🦅 *Raven* — ⚠️ Auto-merge failed"
@@ -249,9 +250,9 @@ def _format_message(repo_name: str, ref: str, review: dict, link: str, action: s
     elif action == "review_submit_failed":
         header = "🦅 *Raven* — ⚠️ Failed to submit review"
     elif action == "needs_review":
-        header = f"🦅 *Raven* — {emoji} {severity.upper()} — needs your review"
+        header = f"🦅 *Raven* — {emoji} {label} — needs your review"
     else:
-        header = f"🦅 *Raven Alert* — {emoji} {severity.upper()}"
+        header = f"🦅 *Raven Alert* — {emoji} {label}"
 
     text = (
         f"{header}\n"

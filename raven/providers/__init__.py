@@ -285,10 +285,10 @@ class GitProvider(ABC):
             path for severity=BLOCKER comments). Raven posts inline
             review comments at the top level, so checking roots is
             sufficient.
-          - Gitea (>=1.24): scans review comments and returns IDs where
-            ``resolver is not None``. Older Gitea returns an empty set
-            (no resolved-state field exposed) — degrades to current
-            behavior (no filtering).
+          - Gitea: scans review comments and returns IDs where
+            ``resolver is not None`` (in the API since at least 1.20,
+            filled by UI resolves). A server that omits the field
+            yields an empty set — no filtering.
 
         Default returns ``set()`` — out-of-tree providers degrade
         gracefully (no filtering). Implementations must be best-effort:
@@ -297,6 +297,20 @@ class GitProvider(ABC):
         block it.
         """
         return set()
+
+    def get_review_threads(self, repo: str, pr_number: int,
+                           bot_user: str) -> list[dict] | None:
+        """List ``bot_user``'s inline review threads on this PR, open and
+        resolved: ``{"comment_id", "file", "line", "body", "replies",
+        "resolved"}`` per thread.
+
+        Used by ``_process_pr`` to offer a re-review its open prior
+        findings, so a still-valid one stays on its thread instead of
+        being regenerated into a second one. Default ``None`` means
+        unsupported: the server then reads prior findings from its cache
+        only. Implementations return ``None`` on a fetch error too.
+        """
+        return None
 
 
 # Provider registry — populated at app startup

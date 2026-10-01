@@ -2769,6 +2769,112 @@ class TestIncrementalReview:
         # Verdict should be REQUEST_CHANGES because carried finding is high
         assert mc.submit_review.call_args.kwargs["approve"] is False
 
+    def _run_carry_pass(self, carried: dict, fresh: list | None = None,
+                        output: str = "both"):
+        """One incremental pass: a.py changed, every file in ``carried``
+        (filename -> findings) unchanged. submit_review hands back one
+        comment id per posted inline comment, keyed by its file, so a
+        misaligned tag shows up as the wrong id on the wrong finding."""
+        import hashlib, time as _time
+        chunks = {"a.py": "diff --git a/a.py b/a.py\n+old\n"}
+        chunks.update({f: f"diff --git a/{f} b/{f}\n+stable\n" for f in carried})
+        _previous_diffs["gitea:owner/repo#42"] = CacheEntry(
+            timestamp=_time.time(),
+            hashes={f: hashlib.sha256(c.encode()).hexdigest() for f, c in chunks.items()},
+            findings={"a.py": [], **carried})
+        new_diff = "diff --git a/a.py b/a.py\n+new\n" + "".join(
+            chunks[f] for f in carried)
+        new_ids = {"a.py": 801, "b.py": 802, "c.py": 803}
+        mc = self._make_provider()
+        with (
+            patch("raven.server.review_diff") as mock_review,
+            patch("raven.server.notify"),
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", output),
+        ):
+            mc.fetch_pr_diff.return_value = new_diff
+            mc.fetch_file.return_value = ""
+            mc.get_resolved_comment_ids.return_value = set()
+            mc.submit_review.side_effect = lambda *a, **kw: {
+                "id": 1,
+                "inline_comments": [{"comment_id": new_ids[c["file"]]}
+                                    for c in kw["inline_comments"]],
+            }
+            mc.add_label_to_pr.return_value = None
+            mc.get_authenticated_user.return_value = "Raven"
+            mc.get_pr_reviews.side_effect = [
+                [],                                                        # auto-add check
+                [{"user": {"login": "Raven"}, "state": "APPROVED"}],      # gate check
+            ]
+            mock_review.return_value = {"severity": "low", "summary": "a looks ok",
+                                        "findings": fresh or []}
+            _process_pr(mc, self._normalized_payload())
+        return mc, _previous_diffs["gitea:owner/repo#42"]
+
+    def test_carried_finding_with_a_thread_is_not_reposted(self):
+        """A carried finding already has its inline thread from the pass
+        that found it. Posting it again opens a second thread for the
+        same finding on every push, and the conversation in the first
+        one is orphaned. It still counts toward the verdict and still
+        appears in the summary body."""
+        carried = {"severity": "high", "file": "b.py", "line": 10,
+                   "message": "bug in b", "comment_id": 555}
+        mc, _ = self._run_carry_pass({"b.py": [carried]})
+        inline = mc.submit_review.call_args.kwargs["inline_comments"]
+        assert [c for c in inline if c["file"] == "b.py"] == []
+        assert mc.submit_review.call_args.kwargs["approve"] is False
+        assert "bug in b" in mc.submit_review.call_args[0][2]
+
+    def test_inline_mode_lists_a_carried_finding_with_a_thread(self):
+        """Inline mode's body normally holds only findings that have no
+        line. A carried finding with a thread isn't posted inline either,
+        so the body lists it: otherwise a pass whose only blocker is
+        carried would request changes without naming it."""
+        carried = {"severity": "high", "file": "b.py", "line": 10,
+                   "message": "bug in b", "comment_id": 555}
+        mc, _ = self._run_carry_pass({"b.py": [carried]}, output="inline")
+        assert mc.submit_review.call_args.kwargs["inline_comments"] == []
+        assert mc.submit_review.call_args.kwargs["approve"] is False
+        body = mc.submit_review.call_args[0][2]
+        assert "bug in b" in body
+        assert "on their existing threads" in body
+        assert "without an inline location" not in body
+
+    def test_carried_finding_keeps_its_comment_id(self):
+        """The existing thread stays the finding's identity: resolution
+        and retraction match on this id."""
+        carried = {"severity": "high", "file": "b.py", "line": 10,
+                   "message": "bug in b", "comment_id": 555}
+        _, entry = self._run_carry_pass({"b.py": [carried]})
+        assert [f["comment_id"] for f in entry.findings["b.py"]] == [555]
+
+    def test_carried_finding_without_a_thread_is_posted_and_tagged(self):
+        """No comment_id means no thread yet (first seen in summary mode,
+        or its post failed): it is posted, and the new id is recorded."""
+        carried = {"severity": "high", "file": "b.py", "line": 10,
+                   "message": "bug in b"}
+        mc, entry = self._run_carry_pass({"b.py": [carried]})
+        inline = mc.submit_review.call_args.kwargs["inline_comments"]
+        assert [(c["file"], c["line"]) for c in inline] == [("b.py", 10)]
+        assert [f["comment_id"] for f in entry.findings["b.py"]] == [802]
+
+    def test_mixed_pass_tags_each_posted_finding_with_its_own_id(self):
+        """Fresh finding, carried finding with a thread, carried finding
+        without one. Only the first and last are posted, and the ids the
+        provider returns land on those two, in order."""
+        fresh = [{"severity": "high", "file": "a.py", "line": 1,
+                  "message": "fresh in a"}]
+        with_thread = {"severity": "high", "file": "b.py", "line": 10,
+                       "message": "carried in b", "comment_id": 555}
+        without_thread = {"severity": "high", "file": "c.py", "line": 20,
+                          "message": "carried in c"}
+        mc, entry = self._run_carry_pass(
+            {"b.py": [with_thread], "c.py": [without_thread]}, fresh=fresh)
+        inline = mc.submit_review.call_args.kwargs["inline_comments"]
+        assert [c["file"] for c in inline] == ["a.py", "c.py"]
+        assert [f["comment_id"] for f in entry.findings["a.py"]] == [801]
+        assert [f["comment_id"] for f in entry.findings["b.py"]] == [555]
+        assert [f["comment_id"] for f in entry.findings["c.py"]] == [803]
+
     def test_carried_finding_survives_grounding_filter(self, monkeypatch):
         """Regression for the evidence-grounding filter: carried findings
         are merged in server.py from the CACHE, not from review_diff's
@@ -2853,7 +2959,9 @@ class TestIncrementalReview:
         assert mc.submit_review.call_args.kwargs["approve"] is False
 
     def test_incremental_clears_findings_for_changed_file(self):
-        """When a file is re-reviewed, its old findings are replaced."""
+        """When a file is re-reviewed and the model's answer omits its old
+        finding, the finding is superseded (an unanswered prior would be
+        kept instead — see tests/test_rereview_threads.py)."""
         import hashlib, time as _time
         old_hash = hashlib.sha256("diff --git a/a.py b/a.py\n+old\n".encode()).hexdigest()
         _previous_diffs["gitea:owner/repo#42"] = CacheEntry(timestamp=_time.time(), hashes={"a.py": old_hash}, findings={"a.py": [{"severity": "high", "file": "a.py", "message": "old bug"}]})
@@ -2872,8 +2980,9 @@ class TestIncrementalReview:
                 [],                                                        # auto-add check
                 [{"user": {"login": "Raven"}, "state": "APPROVED"}],      # gate check
             ]
-            # Re-review finds nothing
-            mock_review.return_value = {"severity": "low", "summary": "clean", "findings": []}
+            # Re-review finds nothing; the answer keeps no prior finding
+            mock_review.return_value = {"severity": "low", "summary": "clean", "findings": [],
+                                        "prior_answer": {"answered": {0}, "kept": {}}}
             _process_pr(mc, self._normalized_payload())
         # Old "old bug" finding should NOT appear
         submitted_body = mc.submit_review.call_args[0][2]
@@ -3191,14 +3300,24 @@ class TestRebaseTolerance:
         assert mock_review.call_args.kwargs["unchanged_files"] == ["b.py"]
 
     def test_carried_finding_follows_the_shift(self):
-        """Carried findings re-post from the cache, so an unshifted line
-        would anchor the inline comment to whatever the rebase slid into
-        that position. The hunk moved 7 -> 47, so line 10 -> 50."""
+        """A carried finding with no thread yet is posted from the cache,
+        so an unshifted line would anchor its inline comment to whatever
+        the rebase slid into that position. The hunk moved 7 -> 47, so
+        line 10 -> 50."""
+        self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
+                   {"a.py": [], "b.py": [self._finding(line=10, comment_id=None)]})
+        mc, _ = self._run(self.A_NEW + self.B_AFTER)
+        inline = mc.submit_review.call_args.kwargs["inline_comments"]
+        assert [c["line"] for c in inline if c["file"] == "b.py"] == [50]
+
+    def test_shifted_finding_with_a_thread_is_not_reposted(self):
+        """A shifted finding that already has a thread keeps it: the
+        shift moves the cached line, and nothing is posted again."""
         self._seed({"a.py": self.A_OLD, "b.py": self.B_BEFORE},
                    {"a.py": [], "b.py": [self._finding(line=10)]})
         mc, _ = self._run(self.A_NEW + self.B_AFTER)
         inline = mc.submit_review.call_args.kwargs["inline_comments"]
-        assert [c["line"] for c in inline if c["file"] == "b.py"] == [50]
+        assert [c for c in inline if c["file"] == "b.py"] == []
 
     def test_shift_is_recorded_in_the_cache(self):
         """The next pass has to diff against the shifted state, not the
@@ -3227,8 +3346,8 @@ class TestRebaseTolerance:
                    {"a.py": [], "b.py": [self._finding(line=10)]})
         mc, mock_review = self._run(self.A_NEW + b_reindexed)
         assert "b.py" not in mock_review.call_args.args[0]
-        inline = mc.submit_review.call_args.kwargs["inline_comments"]
-        assert [c["line"] for c in inline if c["file"] == "b.py"] == [10]
+        entry = _previous_diffs["gitea:owner/repo#42"]
+        assert [(f["line"], f["comment_id"]) for f in entry.findings["b.py"]] == [(10, 999)]
 
     def test_real_edit_to_a_shifted_file_still_re_reviews(self):
         """Rebase tolerance must not swallow an actual change: a file
@@ -3497,8 +3616,11 @@ class TestRebaseTolerance:
                    verdict="approve")
         regenerated = {"severity": "low", "file": "b.py", "line": 10,
                        "message": "regenerated"}
+        # The answer omits the cached finding, so it is superseded; an
+        # unanswered one would be kept on its thread instead.
         self._run(self.A_OLD + self.B_AFTER, review={
-            "severity": "low", "summary": "ok", "findings": [regenerated]})
+            "severity": "low", "summary": "ok", "findings": [regenerated],
+            "prior_answer": {"answered": {0}, "kept": {}}})
         entry = _previous_diffs["gitea:owner/repo#42"]
         cached = [f for fl in entry.findings.values() for f in fl]
         assert [f["message"] for f in cached] == ["regenerated"]
@@ -4048,9 +4170,10 @@ class TestCarriedFindingsRevalidation:
         """The prompt forbids copying carried findings into `findings`,
         but a model may restate one anyway. Verbatim duplicates are
         dropped in favor of the carried copy (it holds the comment_id
-        retraction needs) — no duplicate inline comments, and no clone
-        leaking into the '' cache bucket (the restated copy names an
-        unchanged file, which _findings_by_file would bucket under '')."""
+        retraction needs) — no new inline comment (the carried copy
+        already has its thread), and no clone leaking into the '' cache
+        bucket (the restated copy names an unchanged file, which
+        _findings_by_file would bucket under '')."""
         valid = {"severity": "medium", "file": "b.py", "line": 20,
                  "message": "still valid", "comment_id": 43}
         self._seed_cache({"a.py": [], "b.py": [valid]})
@@ -4060,9 +4183,10 @@ class TestCarriedFindingsRevalidation:
         self._run(mc, {"severity": "medium", "summary": "ok",
                        "findings": [restated]})
         inline = mc.submit_review.call_args.kwargs["inline_comments"]
-        assert sum("still valid" in c["body"] for c in inline) == 1
+        assert sum("still valid" in c["body"] for c in inline) == 0
         entry = _previous_diffs["gitea:owner/repo#42"]
-        assert [f["message"] for f in entry.findings.get("b.py", [])] == ["still valid"]
+        assert [(f["message"], f["comment_id"]) for f in entry.findings.get("b.py", [])] == [
+            ("still valid", 43)]
         assert entry.findings.get("", []) == []
 
 
@@ -8751,9 +8875,10 @@ class TestReviewOutputChannels:
         # the file-less finding has nowhere inline to go → kept in a MINIMAL
         # body so it isn't dropped...
         assert "no file/line — body-only" in body
-        # ...but with NO recommendation: no review-summary prose, no footer.
+        # ...but with NO recommendation: no review-summary prose. It still
+        # ends with the footer the full summary carries (model, effort, time).
         assert "two issues" not in body
-        assert "Reviewed by Raven" not in body
+        assert body.splitlines()[-1].startswith("*Reviewed by Raven · ")
 
     def test_inline_all_anchored_posts_no_body(self):
         """Every finding has a line → all post inline, body is empty: inline
@@ -8810,7 +8935,57 @@ class TestReviewOutputChannels:
         body = call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
         assert body != ""
         assert "blocked" in body
+        assert "🔴 **HIGH**" in body  # a blocking verdict keeps its tier
+        assert body.splitlines()[-1].startswith("*Reviewed by Raven · ")
         assert call.kwargs["approve"] is False
+
+    def test_inline_advisory_clean_review_reads_as_no_issues(self):
+        """Advisory + inline, no findings (the work deployment's setup):
+        the one-line body says there are no issues instead of labelling the
+        clean review as a low-severity one."""
+        mc = self._make_provider()
+        review = {"severity": "low", "summary": "No significant issues", "findings": []}
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", "inline"),
+            patch("raven.server.RAVEN_REVIEW_MODE", "advisory"),
+            patch("raven.server.review_diff", return_value=review),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+        call = mc.submit_review.call_args
+        body = call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
+        assert body.startswith("🦅 **Raven** — ✅ **NO ISSUES** — No significant issues")
+        assert "LOW" not in body
+
+    @staticmethod
+    def _failing_scale_fetch(provider, repo, ref, on_fetch_failed=None, **kw):
+        from raven.severity import default_scale
+        if on_fetch_failed:
+            on_fetch_failed()
+        return default_scale()
+
+    @pytest.mark.parametrize("output", ["both", "inline"])
+    def test_forced_needs_work_never_reads_as_no_issues(self, output):
+        """A failed severities.json read forces needs_work on a review with
+        no findings at the least tier. A blocking verdict must not headline
+        "no issues" (Raven's review of the NO ISSUES PR)."""
+        mc = self._make_provider()
+        review = {"severity": "low", "summary": "No significant issues", "findings": []}
+        with (
+            patch("raven.server.RAVEN_REVIEW_OUTPUT", output),
+            patch("raven.server.RAVEN_REVIEW_MODE", "all"),
+            patch("raven.server._fetch_severity_scale", side_effect=self._failing_scale_fetch),
+            patch("raven.server.review_diff", return_value=review),
+            patch("raven.server.notify"),
+            patch("raven.server.time.sleep"),
+        ):
+            _process_pr(mc, self._payload())
+        call = mc.submit_review.call_args
+        body = call.args[2] if len(call.args) >= 3 else call.kwargs["body"]
+        assert call.kwargs["approve"] is False
+        assert "NO ISSUES" not in body
+        assert "🟡" in body and "LOW" in body
 
     def test_inline_surfaces_severity_mismatch_note(self):
         """Finding 2 (PR #216 review): under RAVEN_REVIEW_OUTPUT=inline,
@@ -9515,6 +9690,56 @@ class TestSeverityMismatchComment:
         production, but direct unit callers/tests) must keep working."""
         import raven.server as server
         assert server._format_inline_leftovers([]) == ""
+
+    def test_inline_leftovers_ends_with_the_review_footer(self):
+        """The short inline-mode body closes with the same footer as the
+        full summary. An empty one stays empty: a footer-only comment on
+        every clean review would be noise."""
+        import raven.server as server
+        body = server._format_inline_leftovers(
+            [{"severity": "low", "message": "PR-wide note"}])
+        assert body.splitlines()[-1].startswith(
+            f"*Reviewed by Raven · {server.RAVEN_AI_MODEL} · "
+            f"effort {server.RAVEN_AI_EFFORT} · ")
+        assert server._format_inline_leftovers([]) == ""
+
+
+class TestFormatCommentHeadline:
+    """The summary's headline badge: a review with no findings at the least
+    severe tier reads as no issues, not as a low-severity issue."""
+
+    def test_clean_review_reads_as_no_issues(self):
+        import raven.server as server
+        body = server._format_comment(
+            {"severity": "low", "summary": "No significant issues", "findings": []})
+        assert "**✅ NO ISSUES** — No significant issues" in body
+        assert "LOW" not in body
+
+    def test_review_with_a_least_tier_finding_keeps_its_tier(self):
+        import raven.server as server
+        body = server._format_comment(
+            {"severity": "low", "summary": "s",
+             "findings": [{"severity": "low", "message": "nit"}]})
+        assert "**🟡 LOW** — s" in body
+
+    def test_custom_scale_clean_review_reads_as_no_issues(self):
+        import raven.server as server
+        from raven.severity import SeverityScale
+        scale = SeverityScale(ranks={"nit": 10, "bug": 20, "blocker": 30},
+                              blocks_at_or_above="bug")
+        body = server._format_comment(
+            {"severity": "nit", "summary": "s", "findings": []},
+            mode="advisory", scale=scale)
+        assert "**✅ NO ISSUES** — s" in body
+        assert "NIT" not in body
+
+    def test_blocking_review_keeps_its_tier(self):
+        """A review whose verdict blocks never claims there are no issues."""
+        import raven.server as server
+        body = server._format_comment(
+            {"severity": "low", "summary": "s", "findings": [], "blocking": True})
+        assert "**🟡 LOW** — s" in body
+        assert "NO ISSUES" not in body
 
 
 class TestFormatCommentUsesTheRepoScale:

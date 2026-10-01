@@ -2,6 +2,40 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## v0.7.1 — 2026-10-01
+
+Review threads stop multiplying, and a security fix for Bitbucket Data Center. **Upgrade recommended**, above all on Bitbucket Data Center. Upgrading wipes the findings cache once (see Upgrading).
+
+### Fixed
+
+- **Findings on unchanged files are no longer posted again on every push.** An incremental review used to re-post every carried finding as a new inline comment, so the same finding piled up one thread per push, and a reply or a resolve on an older copy stopped counting. A carried finding now stays on the thread it was first posted on; it still counts toward the verdict and is still listed in the review summary (with `RAVEN_REVIEW_OUTPUT=inline`, in its own section of the short review body).
+- **A re-review no longer opens a second thread for a finding that is still open.** Re-reviewing a changed file, or the whole PR, used to restate open findings in new words and post them as new threads, leaving the old ones open and untracked. Raven now shows the model its open threads on the code it re-reviews: a finding that still applies stays on its thread and still counts, and the rest are resolved. Threads on files that left the PR are resolved too; a renamed file's threads follow it to the new name. This needs Bitbucket Data Center, or Gitea 1.26 or newer.
+- **On Bitbucket Data Center, a source file Bitbucket marks as binary is now a coverage gap.** It blocks approve and auto-merge until a human reviews it, as on git. Media and archives are still stripped by name, and a deleted binary is shown leaving, not gapped.
+
+### Added
+
+- `RAVEN_PRIOR_FINDINGS_MAX` (default 30) caps the prior findings offered to a re-review.
+- Metrics: `raven_prior_findings_total{repo,outcome}` and `raven_untracked_open_threads_total{repo}`.
+
+### Changed
+
+- With `RAVEN_REVIEW_OUTPUT=inline`, the short review body now ends with the same footer as the full summary (model, effort and time). A review whose findings all sit on their lines still posts no body.
+- A review with no findings now reads as **✅ NO ISSUES** instead of showing the lowest severity tier ("🟡 LOW — No significant issues" looked like a low-severity issue). This applies to the summary comment, inline mode's short body and Slack/webhook notifications. A review whose verdict blocks keeps its tier, whether the model raised the severity or Raven forced needs_work (a failed `severities.json` read, a coverage gap), and the approve gate and notification thresholds read the severity exactly as before.
+
+### Upgrading
+
+- Upgrading wipes the findings cache once. On Bitbucket Data Center and Gitea 1.26 or newer, the next push to each open PR gets a full review that keeps its open findings on their existing threads instead of regenerating them, and duplicate threads left by older versions collapse to one per issue the first time a re-review covers their file; copies on files no re-review covers stay open and can be resolved by hand.
+- On Gitea older than 1.26, Raven can't list or resolve threads through the API, so prior findings come from its cache alone. Because the cache is wiped, the first review of each open PR after the upgrade regenerates its open findings once, next to the old threads; resolve the old ones by hand. Later re-reviews keep findings on their threads through the cache.
+
+### Corrections to earlier notes
+
+- v0.7.0 also made a source file that git diffs as binary a coverage gap, compiled code and binary types not on the skip list included. Its notes left this out.
+- Native finding retraction through the API needs **Gitea 1.26**, not 1.24 as earlier notes said: `POST /pulls/comments/{id}/resolve` first ships in 1.26. A resolve clicked in Gitea's UI is still honoured on older versions.
+
+### Stats
+
+1847 tests across 21 test files (up from 1713 at v0.7.0).
+
 ## v0.7.0 — 2026-09-29
 
 Security release. **Upgrade recommended.** It closes ways a pull request could be approved and auto-merged with code the model never saw: content Raven strips from the review, file content that could disguise itself as diff structure, and file names or answers that could steer the review. Upgrading wipes the findings cache once (see Upgrading).

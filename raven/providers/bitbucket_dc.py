@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 _ACTIVITIES_MAX_PAGES = 30
 
 
+def _count_replies(comment: dict) -> int:
+    """Replies anywhere under a BB DC comment (its nested ``comments`` tree)."""
+    return sum(1 + _count_replies(c) for c in comment.get("comments") or []
+               if isinstance(c, dict))
+
+
 class BitbucketDCProvider(GitProvider):
     """Bitbucket Data Center API client implementing the GitProvider interface."""
 
@@ -236,8 +242,23 @@ class BitbucketDCProvider(GitProvider):
             # sides, revisit that parser.
             file_path = dst if dst != "/dev/null" else src
             lines.append(f"diff --git {_side('a', file_path)} {_side('b', file_path)}")
-            lines.append("--- " + ("/dev/null" if src == "/dev/null" else _side("a", src)))
-            lines.append("+++ " + ("/dev/null" if dst == "/dev/null" else _side("b", dst)))
+            # A deletion's header, written the way git writes one: strip_diff
+            # and _is_deletion_chunk read deletion from it, so a deleted
+            # binary is shown going rather than gapped.
+            if dst == "/dev/null":
+                lines.append("deleted file mode 100644")
+            old_side = "/dev/null" if src == "/dev/null" else _side("a", src)
+            new_side = "/dev/null" if dst == "/dev/null" else _side("b", dst)
+            lines.append("--- " + old_side)
+            lines.append("+++ " + new_side)
+            # BB DC marks a binary entry ``"binary": true`` and gives it no
+            # hunks (audit 09-27 #2b; real payloads in tests/fixtures/audit).
+            # Git's marker makes strip_diff treat it as it treats git output:
+            # a source file diffed as binary is a coverage gap, a skip-listed
+            # binary is stripped, and a deletion is neither.
+            # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
+            if diff_entry.get("binary") is True:
+                lines.append(f"Binary files {old_side} and {new_side} differ")
             for hunk in diff_entry.get("hunks", []):
                 src_line = hunk.get("sourceLine", 1)
                 src_span = hunk.get("sourceSpan", 0)
@@ -638,6 +659,66 @@ class BitbucketDCProvider(GitProvider):
                     pr_number, _ACTIVITIES_MAX_PAGES,
                 )
         return resolved
+
+    def get_review_threads(self, repo_full_name: str, pr_number: int,
+                           bot_user: str) -> list[dict] | None:
+        """List ``bot_user``'s inline review threads, open and resolved.
+
+        Same activities scan as ``get_resolved_comment_ids``. A thread is
+        a top-level ``COMMENTED`` comment with an ``anchor`` path and
+        line, authored by ``bot_user`` (``author.name`` or
+        ``author.slug``, case-insensitive: the BB DC username is
+        configured, not read back). Replies are nested under
+        ``comments``, so they are never listed as threads. ``None`` on a
+        fetch error; a scan cut short by ``_ACTIVITIES_MAX_PAGES``
+        returns what it read, which is safe because the server never
+        reads a missing thread as resolved.
+        """
+        bot = (bot_user or "").strip().lower()
+        if not bot:
+            return None
+        project, repo = _split_repo(repo_full_name)
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/activities"
+        threads: list[dict] = []
+        seen: set[int] = set()
+        start = 0
+        for _ in range(_ACTIVITIES_MAX_PAGES):
+            try:
+                resp = self.session.get(url, params={"start": start, "limit": 50}, timeout=10)
+                resp.raise_for_status()
+            except requests.RequestException as e:
+                logger.warning("BB DC get_review_threads for PR #%d failed: %s", pr_number, e)
+                return None
+            data = resp.json()
+            for activity in data.get("values", []):
+                if activity.get("action") != "COMMENTED":
+                    continue
+                c = activity.get("comment") or {}
+                anchor = c.get("anchor") or {}
+                author = c.get("author") or {}
+                cid, path, line = c.get("id"), anchor.get("path"), anchor.get("line")
+                if (not isinstance(cid, int) or cid in seen or not path
+                        or not isinstance(line, int) or isinstance(line, bool)
+                        or line <= 0):
+                    continue
+                if bot not in {str(author.get("name") or "").lower(),
+                               str(author.get("slug") or "").lower()}:
+                    continue
+                seen.add(cid)
+                threads.append({
+                    "comment_id": cid, "file": path, "line": line,
+                    "body": c.get("text") or "",
+                    "replies": _count_replies(c),
+                    "resolved": (c.get("threadResolved") is True
+                                 or c.get("state") == "RESOLVED"),
+                })
+            if data.get("isLastPage", True):
+                return threads
+            start = data.get("nextPageStart", start + 50)
+        logger.warning(
+            "BB DC get_review_threads for PR #%d: activities scan capped at %d "
+            "pages; older threads are not listed", pr_number, _ACTIVITIES_MAX_PAGES)
+        return threads
 
     def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
         """Return all comments on a PR via the activities endpoint.

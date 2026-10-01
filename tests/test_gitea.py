@@ -1043,9 +1043,10 @@ class TestGetResolvedCommentIds:
         assert resolved == {100, 300}
 
     def test_returns_empty_when_resolver_field_absent(self, client):
-        """Pre-1.24 Gitea doesn't expose the ``resolver`` field — every
-        comment looks unresolved, so the set is empty. Carry-forward
-        degrades to current behavior on older Gitea."""
+        """A Gitea that doesn't expose the ``resolver`` field — every
+        comment looks unresolved, so the set is empty and carry-forward
+        applies no filter. (The field has been in the API since at least
+        1.20.)"""
         comments = [
             {"id": 100, "path": "a.py", "position": 5},  # no resolver key
             {"id": 200, "path": "b.py", "position": 1},
@@ -1063,3 +1064,85 @@ class TestGetResolvedCommentIds:
         get_resp.raise_for_status.side_effect = requests.HTTPError("boom")
         with patch.object(client.session, "get", return_value=get_resp):
             assert client.get_resolved_comment_ids("u/r", 1) == set()
+
+
+class TestGetReviewThreads:
+    """Each bot review comment is one finding thread (Raven replies with
+    issue comments on Gitea); replies count OTHER users' comments on the
+    same (path, position) anchor; resolved reads ``resolver``."""
+
+    def _reviews_and_comments(self, comments):
+        return TestGetResolvedCommentIds._reviews_and_comments(None, comments)
+
+    @pytest.fixture(autouse=True)
+    def _resolve_supported(self, client):
+        # The listing tests run on a Gitea that can resolve; the version
+        # gate has its own tests below.
+        with patch.object(type(client), "_supports_resolve", return_value=True):
+            yield
+
+    def test_lists_bot_comments(self, client):
+        comments = [
+            {"id": 100, "user": {"login": "Raven"}, "body": "🔴 **[high]** bug",
+             "path": "a.py", "position": 5, "resolver": None},
+            {"id": 101, "user": {"login": "alice"}, "body": "disagree",
+             "path": "a.py", "position": 5, "resolver": None},
+            {"id": 102, "user": {"login": "raven"}, "body": "🟡 **[low]** nit",
+             "path": "b.py", "position": None, "original_position": 3,
+             "resolver": {"login": "bob"}},
+            {"id": 103, "user": {"login": "Raven"}, "body": "no anchor",
+             "path": "", "position": 0, "resolver": None},
+        ]
+        with patch.object(client.session, "get",
+                          side_effect=self._reviews_and_comments(comments)):
+            threads = client.get_review_threads("u/r", 1, "Raven")
+        assert threads == [
+            {"comment_id": 100, "file": "a.py", "line": 5, "body": "🔴 **[high]** bug",
+             "replies": 1, "resolved": False},
+            {"comment_id": 102, "file": "b.py", "line": 3, "body": "🟡 **[low]** nit",
+             "replies": 0, "resolved": True},
+        ]
+
+    def test_reviews_http_error_is_none(self, client):
+        resp = MagicMock(status_code=500)
+        resp.raise_for_status.side_effect = requests.HTTPError("500")
+        with patch.object(client.session, "get", return_value=resp):
+            assert client.get_review_threads("u/r", 1, "Raven") is None
+
+    def test_unsupported_resolve_is_none(self, client):
+        """Gitea < 1.26 has no resolve route, so a retracted finding's
+        still-open thread would come back as an orphan: no listing at all,
+        and the server falls back to cache-only prior findings."""
+        with patch.object(type(client), "_supports_resolve", return_value=False):
+            assert client.get_review_threads("u/r", 1, "Raven") is None
+
+
+class TestSupportsResolve:
+    """The resolve route (POST /pulls/comments/{id}/resolve) first ships in
+    Gitea 1.26; the ``resolver`` field is older (>= 1.20), so its presence
+    proves nothing. Keyed on the server version; unreadable → unsupported."""
+
+    @pytest.mark.parametrize("version, ok", [
+        ("1.26.0", True), ("1.28.0+dev-317-gb6368965fb", True), ("2.0.0", True),
+        ("1.25.4", False), ("1.20.0", False),
+        ("7.0.0+gitea-1.21.1", False),   # Forgejo: read the gitea suffix
+        ("11.0.0+gitea-1.26.0", True),
+        ("", False), ("garbage", False),
+    ])
+    def test_version_gate(self, client, version, ok):
+        with _mock_get(client, json_data={"version": version}):
+            assert client._supports_resolve() is ok
+
+    def test_fetch_error_is_unsupported_and_not_cached(self, client):
+        resp = MagicMock(status_code=500)
+        resp.raise_for_status.side_effect = requests.HTTPError("500")
+        with patch.object(client.session, "get", return_value=resp):
+            assert client._supports_resolve() is False
+        with _mock_get(client, json_data={"version": "1.26.0"}):
+            assert client._supports_resolve() is True
+
+    def test_result_is_cached(self, client):
+        with _mock_get(client, json_data={"version": "1.26.0"}) as g:
+            client._supports_resolve()
+            client._supports_resolve()
+        assert g.call_count == 1

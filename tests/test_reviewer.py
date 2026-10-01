@@ -193,6 +193,56 @@ class TestParseResponse:
             result = _parse_response(raw)
             assert "dropped_carried" not in result, f"shape {bad} leaked through"
 
+    def test_kept_prior_list_passes_through_raw(self):
+        """The validator hands a list through untouched; entries are
+        validated where the prior count is known (_validate_kept_prior)."""
+        raw = ('{"severity": "low", "summary": "x", "findings": [], '
+               '"kept_prior": [{"prior_id": 0, "line": 4}, "junk"]}')
+        assert _parse_response(raw)["kept_prior"] == [{"prior_id": 0, "line": 4}, "junk"]
+
+    def test_kept_prior_non_list_omitted(self):
+        for bad in ('"all"', '{"0": 1}', "null", "3"):
+            raw = ('{"severity": "low", "summary": "x", "findings": [], '
+                   f'"kept_prior": {bad}}}')
+            assert "kept_prior" not in _parse_response(raw), bad
+
+
+class TestValidateKeptPrior:
+    """Ids are all-or-nothing. A prior the answer omits is superseded
+    (resolved and dropped), so an entry Raven can't read must not turn
+    the finding it meant to keep into an omission: one bad id voids the
+    answer, and a void answer keeps everything. A bad line only falls
+    back to the prior's own line."""
+
+    def test_valid_entries(self):
+        from raven.reviewer import _validate_kept_prior
+        assert _validate_kept_prior([{"prior_id": 1, "line": 9}, {"prior_id": 0}], 2) == {1: 9, 0: None}
+
+    def test_bare_int_ids(self):
+        from raven.reviewer import _validate_kept_prior
+        assert _validate_kept_prior([0, 2], 3) == {0: None, 2: None}
+
+    def test_empty_list_keeps_none(self):
+        from raven.reviewer import _validate_kept_prior
+        assert _validate_kept_prior([], 2) == {}
+
+    @pytest.mark.parametrize("bad", [
+        {"prior_id": True}, {"prior_id": 5}, {"prior_id": -1}, {"prior_id": "0"},
+        True, "x", None, {"line": 3}, 2.0])
+    def test_one_bad_id_voids_the_answer(self, bad):
+        from raven.reviewer import _validate_kept_prior
+        assert _validate_kept_prior([{"prior_id": 0}, bad], 2) is None
+
+    def test_bad_line_falls_back_to_none(self):
+        from raven.reviewer import _validate_kept_prior
+        raw = [{"prior_id": 0, "line": 0}, {"prior_id": 1, "line": True},
+               {"prior_id": 2, "line": "7"}, {"prior_id": 3, "line": -4}]
+        assert _validate_kept_prior(raw, 4) == {0: None, 1: None, 2: None, 3: None}
+
+    def test_duplicate_id_first_wins(self):
+        from raven.reviewer import _validate_kept_prior
+        assert _validate_kept_prior([{"prior_id": 0, "line": 3}, {"prior_id": 0, "line": 9}], 1) == {0: 3}
+
 
 class TestParseResponseAcceptsOnlyReviewShapedJson:
     """Audit 09-27 #10: the parser used to return the first fenced block,
@@ -1601,6 +1651,60 @@ class TestBinarySourceFileIsCoverageGap:
         assert result["chunked"] is True
         assert result["coverage_gap"] is True
         assert result["coverage_gap_files"] == ["src/app.py"]
+
+
+class TestUnshownChangeIsCoverageGap:
+    """Audit 09-27 #2b, decided 2026-10-01: a section whose ``---`` and
+    ``+++`` lines name the same real file but that has no hunk and no binary
+    marker changed in a way the diff doesn't show. BB DC's synthesized diff
+    can write that shape; git never does, so this costs no false gap on git
+    output."""
+
+    BBDC_UNSHOWN = ("diff --git a/run.sh b/run.sh\n--- a/run.sh\n+++ b/run.sh\n")
+
+    @pytest.mark.parametrize("section", [
+        # A rename: the two sides differ.
+        "diff --git a/b.py b/b.py\n--- a/a.py\n+++ b/b.py\n",
+        # An empty new file and a deletion: one side is /dev/null.
+        "diff --git a/e.txt b/e.txt\n--- /dev/null\n+++ b/e.txt\n",
+        "diff --git a/d.txt b/d.txt\ndeleted file mode 100644\n--- a/d.txt\n+++ /dev/null\n",
+        # Git's own mode-only change and pure rename: no ---/+++ lines.
+        "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n",
+        "diff --git a/a.py b/b.py\nsimilarity index 100%\nrename from a.py\nrename to b.py\n",
+        # A binary section has its own gap kind.
+        "diff --git a/x.bin b/x.bin\n--- a/x.bin\n+++ b/x.bin\nBinary files a/x.bin and b/x.bin differ\n",
+        # An ordinary modification.
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-a\n+b\n",
+    ])
+    def test_shapes_that_show_their_change_are_not_unshown(self, section):
+        from raven.reviewer import strip_diff
+        assert strip_diff(section).unshown_gaps == []
+
+    def test_a_bbdc_hunkless_same_path_section_is_unshown(self):
+        from raven.reviewer import strip_diff
+        result = strip_diff(self.BBDC_UNSHOWN)
+        assert result.unshown_gaps == ["run.sh"]
+        assert result.clean == self.BBDC_UNSHOWN  # kept, so the model sees the name
+
+    def test_a_long_extended_header_still_gaps(self):
+        """The check scans the whole hunk-less section, not a fixed window
+        (Raven's review of BB DC PR #3)."""
+        from raven.reviewer import strip_diff
+        header = "".join(f"x-extended-header-{i}\n" for i in range(12))
+        section = f"diff --git a/run.sh b/run.sh\n{header}--- a/run.sh\n+++ b/run.sh\n"
+        assert strip_diff(section).unshown_gaps == ["run.sh"]
+
+    def test_review_diff_marks_it_as_a_coverage_gap(self, monkeypatch):
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        fake.complete.return_value = _cr(json.dumps(
+            {"severity": "low", "summary": "ok", "findings": []}))
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+        result = review_diff(self.BBDC_UNSHOWN, "user/repo")
+        assert result["coverage_gap"] is True
+        assert result["coverage_gap_files"] == ["run.sh"]
+        [marker] = [f for f in result["findings"] if f.get("file") == "run.sh"]
+        assert "doesn't show" in marker["message"]
 
 
 class TestStrippedFilesAreDisclosed:

@@ -374,6 +374,19 @@ class TestFormatMessage:
         text = _format_message("owner/repo", "ref", {"severity": "low", "summary": "ok"}, "https://git/pr/1", "")
         assert "https://git/pr/1" in text
 
+    def test_clean_review_reads_as_no_issues(self):
+        clean = {"severity": "low", "summary": "Clean", "findings": []}
+        needs = _format_message("owner/repo", "PR #5", clean, "", "needs_review")
+        alert = _format_message("owner/repo", "PR #5", clean, "", "")
+        assert "✅ NO ISSUES — needs your review" in needs
+        assert "Raven Alert* — ✅ NO ISSUES" in alert
+        assert "LOW" not in needs + alert
+
+    def test_blocking_clean_review_keeps_its_tier(self):
+        blocked = {"severity": "low", "summary": "Clean", "findings": [], "blocking": True}
+        text = _format_message("owner/repo", "PR #5", blocked, "", "")
+        assert "🟡 LOW" in text and "NO ISSUES" not in text
+
 
 class TestEmojiComesFromTheScale:
     def test_no_duplicate_emoji_table(self):
@@ -481,6 +494,9 @@ class TestMissingSeverityKeyAgreesAcrossThresholdAndMessage:
 
     def test_format_message_renders_the_least_severe_tier(self):
         review = self._review(["blocker", "bug", "nit"], "bug")
+        # One finding, so the headline shows the tier rather than reading
+        # as no issues (an empty list at the least tier does).
+        review["findings"] = [{"severity": "nit", "message": "m"}]
         text = _format_message("acme/repo", "ref", review, "", "needs_review")
         assert "NIT" in text
         assert "🟡" in text

@@ -73,6 +73,8 @@ _METRIC_HELP: dict[str, str] = {
     "raven_revision_submit_errors_total": "Verdict-revision submit failures.",
     "raven_user_resolved_findings_dropped_total": "User-resolved findings dropped from carry-forward.",
     "raven_carried_findings_dropped_total": "Carried findings dropped by re-validation (model-reported as resolved by the push).",
+    "raven_prior_findings_total": "Prior findings on the code a re-review covers, by outcome: kept (the answer kept it; stays on its thread), superseded (a well-formed answer omitted it; thread resolved), unanswered (no well-formed answer, or over the cap; kept verbatim on its thread), moot (its file left the PR; thread resolved).",
+    "raven_untracked_open_threads_total": "Open Raven inline threads the findings cache did not track that a review acted on (offered for keep-or-resolve, or resolved as moot): legacy duplicates, or threads orphaned by a wiped cache. Threads left alone aren't counted, so this trends to zero once legacy duplicates are collapsed.",
     "raven_unknown_severity_total": "Findings whose severity name Raven does not recognise; treated as the most severe tier (fail closed).",
     "raven_severity_mismatch_total": "Reviews where the model's stated top-level severity disagreed with the highest severity among its own findings; the derived value is used.",
     "raven_ungrounded_findings_dropped_total": "Fresh findings dropped for naming a file the model was never shown (evidence-grounding backstop).",

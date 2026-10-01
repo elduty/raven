@@ -1094,6 +1094,165 @@ class TestCarriedFindingsPrompt:
         assert "dropped_carried" not in result
 
 
+class TestPriorFindingsPrompt:
+    """Prior findings on the code under review: offered with prior_ids
+    for keep-or-resolve. The field is required; a missing, non-list or
+    voided answer means 'unanswered', which keeps every prior and
+    resolves nothing (the server's side, Task 5)."""
+
+    _PRIORS = [
+        {"severity": "high", "file": "a.py", "line": 1, "message": "PRIOR-ONE", "replies": 2},
+        {"severity": "low", "file": "a.py", "line": 1, "message": "PRIOR-TWO", "replies": 0},
+    ]
+
+    def _capture(self, prior, model_output=None, diff="diff --git a/a.py b/a.py\n+new\n"):
+        import json
+        from raven.reviewer import review_diff
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.return_value = _cr(model_output or json.dumps(
+            {"severity": "low", "summary": "ok", "findings": []}))
+        with patch("raven.ai._cached_backend", fake_backend):
+            result = review_diff(diff, "user/repo", prior_findings=prior)
+        return fake_backend.complete.call_args.args[0], result
+
+    def test_section_lists_prior_ids_and_replies(self):
+        prompt, _ = self._capture(self._PRIORS)
+        assert "## Prior Findings On The Code Under Review — keep the ones that still apply" in prompt
+        assert '"prior_id":0' in prompt and '"prior_id":1' in prompt
+        assert '"replies":2' in prompt
+        assert "kept_prior" in prompt and "REQUIRED" in prompt
+
+    def test_keeps_what_it_cannot_verify(self):
+        """Omission resolves a thread, so it must mean 'proven gone', not
+        'not evidenced': an absence claim on an incremental pass, or code
+        outside the shown hunks, would otherwise be resolved unjudged."""
+        prompt, _ = self._capture(self._PRIORS)
+        section = prompt[prompt.find("## Prior Findings On The Code Under Review"):]
+        assert "only when the code shown proves it no longer applies" in section
+        assert "can neither confirm nor refute" in section
+
+    def test_duplicates_keep_the_most_severe_copy(self):
+        """Replies only break ties within a tier: a replies-first rule could
+        keep a non-blocking copy and resolve the blocking one."""
+        prompt, _ = self._capture(self._PRIORS)
+        assert ("the most severe copy that still applies, and among copies of "
+                "equal severity the one with the most `replies`") in " ".join(prompt.split())
+
+    def test_long_prior_message_truncated(self, monkeypatch):
+        """The block renders through _findings_json_block, which caps each
+        message at the carried block's per-item budget."""
+        monkeypatch.setattr("raven.reviewer.REVIEW_PR_CONTEXT_ITEM_CHARS", 50)
+        prompt, _ = self._capture([{"severity": "high", "file": "a.py", "line": 1,
+                                    "message": "x" * 400, "replies": 0}])
+        assert "x" * 400 not in prompt and "truncated" in prompt
+
+    def test_inside_untrusted_block(self):
+        prompt, _ = self._capture(self._PRIORS)
+        blocks = [body for (_t, kind, body) in UNTRUSTED_BLOCK_RE.findall(prompt)
+                  if kind == "prior_findings"]
+        assert blocks and "PRIOR-ONE" in blocks[0]
+        assert "PRIOR-ONE" not in UNTRUSTED_BLOCK_RE.sub("", prompt)
+
+    def test_no_priors_no_section_and_no_tail_note(self):
+        prompt, result = self._capture(None)
+        assert "Prior Findings On The Code Under Review" not in prompt
+        assert "kept_prior" not in prompt
+        assert "prior_answer" not in result
+
+    def test_tail_note_before_the_severity_sentence(self):
+        prompt, _ = self._capture(self._PRIORS)
+        tail = prompt[prompt.find("## Before You Output"):]
+        assert "'Prior Findings On The Code Under Review' block works the other way round" in tail
+        assert "can't confirm or refute" in tail
+        assert prompt.rstrip().endswith("`low` when there are none.")
+
+    def test_answer_maps_to_prior_answer(self):
+        import json
+        _, result = self._capture(self._PRIORS, json.dumps({
+            "severity": "low", "summary": "ok", "findings": [],
+            "kept_prior": [{"prior_id": 0, "line": 7}]}))
+        assert result["prior_answer"] == {"answered": {0, 1}, "kept": {0: 7}}
+        assert "kept_prior" not in result
+
+    def test_empty_list_answers_all_and_keeps_none(self):
+        import json
+        _, result = self._capture(self._PRIORS, json.dumps({
+            "severity": "low", "summary": "ok", "findings": [], "kept_prior": []}))
+        assert result["prior_answer"] == {"answered": {0, 1}, "kept": {}}
+
+    @pytest.mark.parametrize("extra", [{}, {"kept_prior": "all"}, {"kept_prior": None},
+                                       {"kept_prior": [{"prior_id": 0}, {"prior_id": "1"}]}])
+    def test_missing_non_list_or_voided_is_unanswered(self, extra):
+        import json
+        _, result = self._capture(self._PRIORS, json.dumps({
+            "severity": "low", "summary": "ok", "findings": [], **extra}))
+        assert result["prior_answer"] == {"answered": set(), "kept": {}}
+
+    def test_parse_error_is_unanswered(self):
+        _, result = self._capture(self._PRIORS, "not json at all")
+        assert result["prior_answer"] == {"answered": set(), "kept": {}}
+
+    def test_hallucinated_answer_scrubbed_without_priors(self):
+        import json
+        _, result = self._capture(None, json.dumps({
+            "severity": "low", "summary": "ok", "findings": [],
+            "kept_prior": [{"prior_id": 0}]}))
+        assert "kept_prior" not in result and "prior_answer" not in result
+
+    _CHUNKED_DIFF = ("diff --git a/a.py b/a.py\n+1\n+2\n+3\n"
+                     "diff --git a/b.py b/b.py\n+1\n+2\n+3\n")
+    _CHUNK_PRIORS = [
+        {"severity": "high", "file": "b.py", "line": 2, "message": "B-PRIOR", "replies": 0},
+        {"severity": "low", "file": "a.py", "line": 1, "message": "A-PRIOR", "replies": 1},
+    ]
+
+    def _chunked(self, monkeypatch, complete, rules=None):
+        from raven.reviewer import review_diff
+        monkeypatch.setattr("raven.reviewer.MAX_DIFF_LINES", 2)
+        fake_backend = MagicMock()
+        fake_backend.name = "claude_cli"
+        fake_backend.complete.side_effect = complete
+        with patch("raven.ai._cached_backend", fake_backend):
+            return review_diff(self._CHUNKED_DIFF, "user/repo", rules=rules,
+                               prior_findings=self._CHUNK_PRIORS)
+
+    def test_chunks_see_only_their_files_priors_and_map_ids_back(self, monkeypatch):
+        import json
+
+        def complete(prompt, **kw):
+            if "(file: `a.py`)" in prompt:
+                assert "A-PRIOR" in prompt and "B-PRIOR" not in prompt
+                return _cr(json.dumps({"severity": "low", "summary": "ok", "findings": [],
+                                       "kept_prior": [{"prior_id": 0, "line": 3}]}))
+            assert "B-PRIOR" in prompt and "A-PRIOR" not in prompt
+            return _cr("not json")  # b.py's chunk fails → its prior is unanswered
+
+        result = self._chunked(monkeypatch, complete)
+        assert result["chunked"] is True
+        assert result["prior_answer"] == {"answered": {1}, "kept": {1: 3}}
+
+    def test_consolidated_return_carries_the_answer(self, monkeypatch):
+        import json
+
+        def complete(prompt, **kw):
+            # Each chunk raises a low finding: consolidation is skipped when
+            # there are no findings to consolidate.
+            if "(file: `a.py`)" in prompt:
+                return _cr(json.dumps({"severity": "low", "summary": "ok", "kept_prior": [],
+                                       "findings": [{"severity": "low", "file": "a.py",
+                                                     "line": 1, "message": "a nit"}]}))
+            if "(file: `b.py`)" in prompt:
+                return _cr(json.dumps({"severity": "low", "summary": "ok", "kept_prior": [0],
+                                       "findings": [{"severity": "low", "file": "b.py",
+                                                     "line": 1, "message": "b nit"}]}))
+            return _cr(json.dumps({"severity": "low", "summary": "merged", "findings": []}))
+
+        result = self._chunked(monkeypatch, complete, rules={"r.md": "a rule"})
+        assert result.get("consolidated") is True
+        assert result["prior_answer"] == {"answered": {0, 1}, "kept": {0: None}}
+
+
 # ────────────────────────────────────────────────────────────────────── #
 #  Incremental-review scope disclosure                                   #
 # ────────────────────────────────────────────────────────────────────── #

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 from urllib.parse import quote
 
 import requests
@@ -15,6 +16,12 @@ from raven.providers import GitProvider
 logger = logging.getLogger(__name__)
 
 RAVEN_LABEL_NAME = os.environ.get("RAVEN_LABEL_NAME", "raven-reviewed")
+
+# First Gitea release with POST /pulls/comments/{id}/resolve (checked
+# against release/v1.20 .. v1.26 of routers/api/v1/api.go). The
+# ``resolver`` field on review comments is much older (>= 1.20, filled by
+# UI resolves), so it can't stand in for this.
+_RESOLVE_MIN_VERSION = (1, 26)
 
 
 
@@ -35,6 +42,7 @@ class GiteaProvider(GitProvider):
             "Content-Type": "application/json",
         })
         self._username = None
+        self._resolve_supported: bool | None = None
         self._can_dismiss: bool | None = None  # None = unknown, True/False after first attempt
 
     def get_authenticated_user(self) -> str:
@@ -146,13 +154,18 @@ class GiteaProvider(GitProvider):
 
     # ── New methods for the comment-thread-context feature ───────────── #
 
-    def _fetch_review_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
+    def _fetch_review_comments(self, repo_full_name: str, pr_number: int,
+                               strict: bool = False) -> list[dict]:
         """Return all PR review comments (paginated). Internal helper.
 
         Both the reviews list and each review's comments list are paginated
         — long-running PRs are where thread context matters most, so we
         iterate all pages (capped at max_pages=10) rather than silently
         dropping older reviews.
+
+        ``strict`` re-raises a failed page instead of returning what was
+        read: ``get_review_threads`` must not mistake a partial listing for
+        a complete one.
         """
         owner, repo = _split_repo(repo_full_name)
         reviews_url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
@@ -163,6 +176,8 @@ class GiteaProvider(GitProvider):
                 resp = self.session.get(reviews_url, params={"limit": 50, "page": page}, timeout=10)
                 resp.raise_for_status()
             except requests.HTTPError:
+                if strict:
+                    raise
                 return reviews
             batch = resp.json()
             if not batch:
@@ -184,6 +199,8 @@ class GiteaProvider(GitProvider):
                     r = self.session.get(comments_url, params={"limit": 50, "page": page}, timeout=10)
                     r.raise_for_status()
                 except requests.HTTPError:
+                    if strict:
+                        raise
                     break
                 batch = r.json()
                 if not batch:
@@ -277,7 +294,7 @@ class GiteaProvider(GitProvider):
         """Resolve a previously-posted inline review comment.
 
         Uses Gitea's native ``POST /pulls/comments/{id}/resolve`` endpoint
-        (added in Gitea 1.24). The comment body is preserved; only the
+        (added in Gitea 1.26). The comment body is preserved; only the
         resolved state changes. On older Gitea the endpoint returns 404
         and we log + return False; the dev can manually resolve via UI.
         403/404 do not raise.
@@ -300,17 +317,90 @@ class GiteaProvider(GitProvider):
         """Return IDs of review comments the developer has marked resolved.
 
         Reuses ``_fetch_review_comments`` (paginated across all reviews)
-        and emits IDs where ``resolver`` is populated. The ``resolver``
-        field is added in Gitea 1.24 alongside the ``/resolve`` endpoint
-        — on older Gitea the field is simply absent and this returns an
-        empty set (no filtering applied to carry-forward, which matches
-        existing behavior on pre-1.24 instances).
+        and emits IDs where ``resolver`` is populated. The field predates
+        the ``/resolve`` endpoint (it is in the API since at least 1.20),
+        and a resolve from the web UI fills it on any of those versions;
+        only Raven's own API resolve needs 1.26 (``retract_finding``).
         """
         all_comments = self._fetch_review_comments(repo_full_name, pr_number)
         return {
             c["id"] for c in all_comments
             if c.get("resolver") is not None and isinstance(c.get("id"), int)
         }
+
+    def _supports_resolve(self) -> bool:
+        """Can this server resolve a review comment through the API?
+
+        Read from ``GET /api/v1/version`` once per provider instance. A
+        Forgejo version carries the Gitea one as a ``+gitea-X.Y`` suffix,
+        which wins. An unreadable version is unsupported (the safe
+        reading: nothing Raven can't resolve gets offered as an orphan),
+        and a fetch error is not cached, so the next review asks again.
+        """
+        if self._resolve_supported is not None:
+            return self._resolve_supported
+        try:
+            resp = self.session.get(f"{self.base_url}/api/v1/version", timeout=10)
+            resp.raise_for_status()
+            version = str((resp.json() or {}).get("version") or "")
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("Gitea version read failed: %s — treating resolve as "
+                           "unsupported for now", e)
+            return False
+        m = (re.search(r"gitea-(\d+)\.(\d+)", version)
+             or re.match(r"(\d+)\.(\d+)", version))
+        self._resolve_supported = bool(m) and (
+            (int(m.group(1)), int(m.group(2))) >= _RESOLVE_MIN_VERSION)
+        return self._resolve_supported
+
+    def get_review_threads(self, repo_full_name: str, pr_number: int,
+                           bot_user: str) -> list[dict] | None:
+        """List ``bot_user``'s inline review comments as threads, open and
+        resolved.
+
+        Gitea has no reply tree: a conversation is the comments sharing a
+        ``(path, position)`` anchor (see ``get_comment_thread``). Raven
+        replies with issue comments, so each of its review comments is one
+        finding and gets its own entry; ``replies`` counts other users'
+        comments on the same anchor. ``resolved`` reads ``resolver``.
+        ``None`` on a fetch error, and when the server can't resolve
+        through the API (``_supports_resolve``): there a retracted
+        finding's still-open thread would come back as an orphan, and
+        superseded threads would be re-offered on every pass.
+        """
+        bot = (bot_user or "").strip().lower()
+        if not bot or not self._supports_resolve():
+            return None
+        try:
+            comments = self._fetch_review_comments(repo_full_name, pr_number, strict=True)
+        except requests.RequestException as e:
+            logger.warning("Gitea get_review_threads for PR #%d failed: %s", pr_number, e)
+            return None
+
+        def _anchor(c: dict) -> tuple:
+            return (c.get("path"), c.get("position") or c.get("original_position"))
+
+        def _login(c: dict) -> str:
+            return str((c.get("user") or {}).get("login") or "").lower()
+
+        others: dict[tuple, int] = {}
+        for c in comments:
+            if _login(c) != bot:
+                others[_anchor(c)] = others.get(_anchor(c), 0) + 1
+        threads: list[dict] = []
+        for c in comments:
+            path, line = _anchor(c)
+            cid = c.get("id")
+            if (_login(c) != bot or not path or not isinstance(cid, int)
+                    or not isinstance(line, int) or isinstance(line, bool) or line <= 0):
+                continue
+            threads.append({
+                "comment_id": cid, "file": path, "line": line,
+                "body": c.get("body") or "",
+                "replies": others.get((path, line), 0),
+                "resolved": c.get("resolver") is not None,
+            })
+        return threads
 
     def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[dict]:
         """Return all comments on a PR (paginated)."""

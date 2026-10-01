@@ -1,0 +1,18 @@
+{
+ "diffs": [
+  {
+   "source": {
+    "components": [
+     "probe",
+     "blob.bin"
+    ],
+    "parent": "probe",
+    "name": "blob.bin",
+    "extension": "bin",
+    "toString": "probe/blob.bin"
+   },
+   "destination": null,
+   "binary": true
+  }
+ ]
+}
