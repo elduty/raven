@@ -3,13 +3,14 @@
 import hashlib
 import hmac
 import logging
+import re
 import time
 from urllib.parse import quote
 
 import requests
 from flask import abort
 
-from raven.providers import GitProvider, DiffTruncatedError, DiffUnverifiableError
+from raven.providers import GitProvider, DiffHeadMismatchError, DiffIdentityUnverifiableError, DiffTruncatedError, DiffUnverifiableError, IncompleteFileError, ThreadResolvedError
 
 logger = logging.getLogger(__name__)
 
@@ -20,11 +21,33 @@ logger = logging.getLogger(__name__)
 # so an operator can spot pathological PRs that may be dropping state.
 _ACTIVITIES_MAX_PAGES = 30
 
+# Appended to a diff line Bitbucket cut for length (spec 2026-10-01-
+# bbdc-truncated-lines). Advisory for the model only: the gap comes from
+# the section's "truncated lines <n>" header, which content can't write.
+_CUT_LINE_MARKER = " ⟨…line cut by Bitbucket⟩"
+
 
 def _count_replies(comment: dict) -> int:
     """Replies anywhere under a BB DC comment (its nested ``comments`` tree)."""
     return sum(1 + _count_replies(c) for c in comment.get("comments") or []
                if isinstance(c, dict))
+
+
+def _says_thread_resolved(resp) -> bool:
+    """Whether a 400 is BB DC refusing a reply to a resolved thread
+    ("Reply cannot be made to resolved thread.")."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return False
+    errors = data.get("errors") if isinstance(data, dict) else None
+    return any(isinstance(e, dict) and "resolved thread" in str(e.get("message", "")).lower()
+               for e in errors or [])
+
+
+# A git object id as /changes writes one (SHA-1, or SHA-256 on a repo that
+# uses it); anything else is not a content identity.
+_CONTENT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 class BitbucketDCProvider(GitProvider):
@@ -163,6 +186,33 @@ class BitbucketDCProvider(GitProvider):
         closes, left open on the sibling branch.
         """
         project, repo = _split_repo(repo_full_name)
+        # The JSON diff carries no content id and no file mode, so a push
+        # that changed only a binary, or only a mode, would synthesize the
+        # same text as the head it replaced (audit 09-27 #2b). /changes has
+        # both and must describe the same head. A push landing between the
+        # two reads pairs one head's diff with another's changes, so the
+        # pair is read again before the diff is refused.
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            data = self._fetch_json_diff(project, repo, pr_number)
+            diff_head = data.get("toHash")
+            if not diff_head:
+                raise DiffIdentityUnverifiableError(
+                    f"Bitbucket DC returned no head commit for PR #{pr_number}'s diff, "
+                    f"so its files' content identity can't be matched to it.")
+            try:
+                changes = self._fetch_pr_changes(project, repo, pr_number, diff_head)
+                break
+            except DiffHeadMismatchError:
+                if attempt == attempts:
+                    raise
+        diff_text = self._json_diff_to_unified(data, changes=changes)
+        if not diff_text.strip():
+            raise RuntimeError(f"Bitbucket DC returned empty diff for PR #{pr_number}")
+        return diff_text
+
+    def _fetch_json_diff(self, project: str, repo: str, pr_number: int) -> dict:
+        """The PR's ``/diff`` as JSON, refused unless it is whole."""
         url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/diff"
         resp = self.session.get(
             url, headers={"Accept": "application/json"}, timeout=30,
@@ -192,20 +242,99 @@ class BitbucketDCProvider(GitProvider):
         # (audit 2026-06-13 finding #1). Refuse instead — the review
         # flow's error handler posts an actionable comment and blocks
         # the merge; the comment / cached-merge flows abort safely too.
-        if self._diff_response_truncated(data):
+        if self._diff_structurally_truncated(data):
             raise DiffTruncatedError(
                 f"Bitbucket DC returned a truncated diff for PR #{pr_number}: "
                 f"the change exceeds the server's diff size limit, so part of "
                 f"it is missing from the response. Refusing to review a partial "
                 f"diff (would risk approving/merging unseen code)."
             )
-        diff_text = self._json_diff_to_unified(data)
-        if not diff_text.strip():
-            raise RuntimeError(f"Bitbucket DC returned empty diff for PR #{pr_number}")
-        return diff_text
+        return data
 
-    def _json_diff_to_unified(self, data: dict) -> str:
-        """Convert BB DC JSON diff response to unified diff format."""
+    def _fetch_pr_changes(self, project: str, repo: str, pr_number: int,
+                          head: str) -> dict[str, dict]:
+        """The PR's ``/changes`` at ``head``, keyed by path: a deletion's by
+        the path it deletes, and a move's source by the move too, for a diff
+        that shows the move as a deletion and an addition. Every page must
+        name ``head``: one naming another is a push between the reads
+        (:class:`DiffHeadMismatchError`), one naming none can't be matched.
+        A file missing from them would lose its content identity, so a PR
+        past the page cap is refused as too large."""
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/pull-requests/{pr_number}/changes"
+        by_path: dict[str, dict] = {}
+        moved_from: dict[str, dict] = {}
+        start = 0
+        max_pages = 20
+        for _ in range(max_pages):
+            resp = self.session.get(url, params={
+                "start": start, "limit": 1000, "changeScope": "ALL",
+                "withComments": "false"}, timeout=30)
+            resp.raise_for_status()
+            page = resp.json()
+            page_head = page.get("toHash")
+            if not page_head:
+                raise DiffIdentityUnverifiableError(
+                    f"Bitbucket DC returned no head commit for PR #{pr_number}'s "
+                    f"changes, so they can't be matched to its diff.")
+            if page_head != head:
+                raise DiffHeadMismatchError(
+                    f"PR #{pr_number}: the diff describes {head[:12]} but its "
+                    f"changes describe {page_head[:12]} (a push between the reads)")
+            for change in page.get("values") or []:
+                if not isinstance(change, dict):
+                    continue
+                path = (change.get("path") or {}).get("toString")
+                if path:
+                    by_path[path] = change
+                src = (change.get("srcPath") or {}).get("toString")
+                if change.get("type") == "MOVE" and src:
+                    moved_from[src] = change
+            if page.get("isLastPage", True):
+                for src, change in moved_from.items():
+                    by_path.setdefault(src, change)
+                return by_path
+            # A next start that isn't an integer past this one can't be
+            # followed: guessing one could skip files, and re-reading would
+            # blame the PR's size at the cap (Raven's review of BB PR #17).
+            next_start = page.get("nextPageStart")
+            if (not isinstance(next_start, int) or isinstance(next_start, bool)
+                    or next_start <= start):
+                raise DiffIdentityUnverifiableError(
+                    f"PR #{pr_number}'s changes page at {start} names no usable next "
+                    f"page ({next_start!r}), so every file's content identity can't be read.")
+            start = next_start
+        raise DiffTruncatedError(
+            f"PR #{pr_number}'s changes run past {max_pages} pages: too large "
+            f"to read every file's content identity.")
+
+    def _json_diff_to_unified(self, data: dict, *, changes: dict[str, dict] | None) -> str:
+        """Convert BB DC JSON diff response to unified diff format.
+
+        ``changes`` (``_fetch_pr_changes``, keyed by path) adds what the
+        JSON diff lacks, written the way git writes it: an ``index
+        <from>..<to>`` line from the full content ids (zeros for the side
+        an addition or a deletion lacks) and the file's mode lines.
+        The ``index`` line is in the merge-gate identity but not in the
+        rebase-tolerance hash; the mode lines are authored, so both hashes
+        carry them (audit 09-27 #2b). A file missing from ``changes``, or
+        a side of it without a readable content id and executable flag, is
+        refused rather than synthesized without them. ``changes`` has no
+        default, so no caller drops the identity by omission; ``None`` (the
+        text alone) is for tests of the synthesis.
+        """
+        def _mode(executable) -> str:
+            return "100755" if executable else "100644"
+
+        def _side_identity(change: dict, id_key: str, flag_key: str,
+                           file_path: str) -> tuple[str, bool]:
+            content_id, executable = change.get(id_key), change.get(flag_key)
+            if (not isinstance(content_id, str) or not _CONTENT_ID.fullmatch(content_id)
+                    or not content_id.strip("0") or not isinstance(executable, bool)):
+                raise DiffIdentityUnverifiableError(
+                    f"{file_path}'s changes carry no readable {id_key} and "
+                    f"{flag_key}, so its content identity can't be read.")
+            return content_id, executable
+
         # Paths and line text arrive as JSON strings and are written into
         # line-oriented text, so a raw "\n" in either would start a line of
         # its own — a forged "Binary files" or "diff --git" line that hides
@@ -242,11 +371,50 @@ class BitbucketDCProvider(GitProvider):
             # sides, revisit that parser.
             file_path = dst if dst != "/dev/null" else src
             lines.append(f"diff --git {_side('a', file_path)} {_side('b', file_path)}")
+            change = None
+            if changes is not None:
+                change = changes.get(file_path)
+                if change is None:
+                    raise DiffIdentityUnverifiableError(
+                        f"{file_path} is in the diff but not in its changes, so its "
+                        f"content identity can't be read.")
+            # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
             # A deletion's header, written the way git writes one: strip_diff
             # and _is_deletion_chunk read deletion from it, so a deleted
             # binary is shown going rather than gapped.
+            if change is not None:
+                # Each side the file has must read: zeros or a missing mode
+                # line would leave the identity unmoved by exactly the push
+                # this guards (Raven's review of BB PR #17). The side an
+                # addition or a deletion lacks is git's zeros.
+                none = ("0" * 40, None)
+                old_id, old_exec = (none if src == "/dev/null" else _side_identity(
+                    change, "fromContentId", "srcExecutable", file_path))
+                new_id, new_exec = (none if dst == "/dev/null" else _side_identity(
+                    change, "contentId", "executable", file_path))
             if dst == "/dev/null":
-                lines.append("deleted file mode 100644")
+                lines.append("deleted file mode "
+                             + (_mode(old_exec) if change is not None else "100644"))
+            elif change is not None and src == "/dev/null":
+                lines.append(f"new file mode {_mode(new_exec)}")
+            elif change is not None and old_exec != new_exec:
+                lines.append(f"old mode {_mode(old_exec)}")
+                lines.append(f"new mode {_mode(new_exec)}")
+            if change is not None:
+                # Full ids: a 12-digit prefix is cheap to collide on purpose,
+                # and this line is what a binary's identity rests on.
+                lines.append(f"index {old_id}..{new_id}")
+            # A line Bitbucket cut for length marks its file: one header
+            # line in the region only this synthesizer writes, which
+            # strip_diff turns into a per-file coverage gap. The count is
+            # in both hashes on purpose (spec 2026-10-01-bbdc-truncated-lines).
+            # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
+            cut = sum(1 for h in diff_entry.get("hunks") or [] if isinstance(h, dict)
+                      for seg in h.get("segments") or [] if isinstance(seg, dict)
+                      for ln in seg.get("lines") or []
+                      if isinstance(ln, dict) and ln.get("truncated"))
+            if cut:
+                lines.append(f"truncated lines {cut}")
             old_side = "/dev/null" if src == "/dev/null" else _side("a", src)
             new_side = "/dev/null" if dst == "/dev/null" else _side("b", dst)
             lines.append("--- " + old_side)
@@ -273,21 +441,28 @@ class BitbucketDCProvider(GitProvider):
                     elif seg_type == "REMOVED":
                         prefix = "-"
                     for line_obj in segment.get("lines", []):
-                        lines.append(f"{prefix}{_one_line(line_obj.get('line', ''))}")
+                        text = _one_line(line_obj.get("line", ""))
+                        if line_obj.get("truncated"):
+                            text += _CUT_LINE_MARKER
+                        lines.append(f"{prefix}{text}")
         return "\n".join(lines) + "\n"
 
     @staticmethod
-    def _diff_response_truncated(data: dict) -> bool:
-        """True if a BB DC JSON diff response signals truncation at ANY level.
+    def _diff_structurally_truncated(data: dict) -> bool:
+        """True if a BB DC JSON diff response is cut above the line level:
+        the whole diff, a file, a hunk or a segment. Part of the change is
+        then missing, so the diff is refused (audit 2026-06-13 #1).
 
         BB DC caps diff size and flags truncation on the overall response
-        AND, independently, on individual file diffs, hunks, segments, and
-        lines (Atlassian's streaming-diff model: the top-level flag means
-        "at least one hunk was omitted"; the finer flags mark a hunk/segment
-        cut mid-content, which the top-level flag does not always reflect).
-        Any of them means the model would see incomplete code, so we check
-        every level and fail closed. Absent flags read falsy, so a complete
-        diff never trips a false positive.
+        and, independently, on individual file diffs, hunks and segments
+        (Atlassian's streaming-diff model: the top-level flag means "at
+        least one hunk was omitted"; the finer flags mark a cut the
+        top-level flag does not always reflect), so every level is checked.
+
+        A cut LINE (one over the server's length limit) is not structural:
+        the synthesizer marks it and its file, and strip_diff makes the file
+        a coverage gap instead (spec 2026-10-01-bbdc-truncated-lines).
+        Absent flags read falsy, so a complete diff never trips this.
         """
         if not isinstance(data, dict):
             return False
@@ -304,19 +479,18 @@ class BitbucketDCProvider(GitProvider):
                 if h.get("truncated"):
                     return True
                 for seg in h.get("segments") or []:
-                    if not isinstance(seg, dict):
-                        continue
-                    if seg.get("truncated"):
+                    if isinstance(seg, dict) and seg.get("truncated"):
                         return True
-                    for ln in seg.get("lines") or []:
-                        if isinstance(ln, dict) and ln.get("truncated"):
-                            return True
         return False
 
     def fetch_file(self, repo_full_name: str, path: str, ref: str = "HEAD") -> str:
         """Return file contents, or empty string if not found.
 
-        BB DC browse endpoint returns JSON with a 'lines' array.
+        BB DC browse endpoint returns JSON with a 'lines' array. A binary
+        file (``{"binary": true}``, no lines), a line cut for length
+        (``"truncated": true``) and a file past the page cap raise
+        ``IncompleteFileError`` instead of reading as absent or cut short
+        (audit 09-27 #12). An empty file is no lines, not binary.
         """
         project, repo = _split_repo(repo_full_name)
         # Quote the path so names with '#', '?', ' ', or other URL-sensitive
@@ -333,11 +507,19 @@ class BitbucketDCProvider(GitProvider):
                 return ""
             resp.raise_for_status()
             data = resp.json()
+            if data.get("binary"):
+                raise IncompleteFileError(f"{path} is a binary file")
             for line in data.get("lines", []):
+                if line.get("truncated"):
+                    # Browse cuts a line over the server's length limit
+                    # and flags it (probed 2026-10-02).
+                    raise IncompleteFileError(f"{path} has a line cut for length")
                 all_lines.append(line.get("text", ""))
             if data.get("isLastPage", True):
                 break
             start = data.get("nextPageStart", start + 1000)
+        else:
+            raise IncompleteFileError(f"{path} runs past {max_pages} pages")
         if not all_lines:
             return ""
         # Trailing newline for parity with Gitea's fetch_file (and common
@@ -354,8 +536,9 @@ class BitbucketDCProvider(GitProvider):
         hit. We page through ``children`` and return full paths for
         entries whose ``type == "FILE"``.
 
-        Missing directories (404) and any other transport error return
-        [] so the review flow degrades gracefully rather than blocks.
+        A missing directory (404) returns [], so a repo without one reviews
+        normally; any other failure raises, so the caller fails closed
+        rather than read it as "no rules" (audit 09-27 #12).
         """
         project, repo = _split_repo(repo_full_name)
         encoded_path = quote(path, safe="/")
@@ -363,48 +546,44 @@ class BitbucketDCProvider(GitProvider):
         files: list[str] = []
         start = 0
         max_pages = 10
-        try:
-            for _ in range(max_pages):
-                resp = self.session.get(url, params={"at": ref, "start": start, "limit": 500}, timeout=15)
-                if resp.status_code == 404:
-                    return []
-                resp.raise_for_status()
-                data = resp.json()
-                children = data.get("children") or {}
-                values = children.get("values") or []
-                for entry in values:
-                    if not isinstance(entry, dict):
-                        continue
-                    if entry.get("type") != "FILE":
-                        continue
-                    # BB DC returns the child name in path.toString or
-                    # path.components[-1]; prepend the parent path so the
-                    # return value is repo-rooted like Gitea's.
-                    entry_path = (entry.get("path") or {}).get("toString")
-                    if not entry_path:
-                        components = (entry.get("path") or {}).get("components") or []
-                        entry_path = components[-1] if components else None
-                    if not entry_path or not isinstance(entry_path, str):
-                        continue
-                    # BB DC's contract for a directory listing is that
-                    # each child's path component is just the filename,
-                    # not a nested/escaping path. Enforce it explicitly
-                    # — rejects both hostile responses and surprising
-                    # upstream API changes. Matches Gitea's "direct
-                    # children only" guard.
-                    if "/" in entry_path or "\\" in entry_path or entry_path in (".", ".."):
-                        logger.warning(
-                            "BB DC list_directory returned suspicious child name: %r — skipping",
-                            entry_path,
-                        )
-                        continue
-                    files.append(f"{path.rstrip('/')}/{entry_path}")
-                if children.get("isLastPage", True):
-                    break
-                start = children.get("nextPageStart", start + 500)
-        except Exception as e:
-            logger.warning("Failed to list %s@%s: %s", path, ref, e)
-            return []
+        for _ in range(max_pages):
+            resp = self.session.get(url, params={"at": ref, "start": start, "limit": 500}, timeout=15)
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+            children = data.get("children") or {}
+            values = children.get("values") or []
+            for entry in values:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") != "FILE":
+                    continue
+                # BB DC returns the child name in path.toString or
+                # path.components[-1]; prepend the parent path so the
+                # return value is repo-rooted like Gitea's.
+                entry_path = (entry.get("path") or {}).get("toString")
+                if not entry_path:
+                    components = (entry.get("path") or {}).get("components") or []
+                    entry_path = components[-1] if components else None
+                if not entry_path or not isinstance(entry_path, str):
+                    continue
+                # BB DC's contract for a directory listing is that
+                # each child's path component is just the filename,
+                # not a nested/escaping path. Enforce it explicitly
+                # — rejects both hostile responses and surprising
+                # upstream API changes. Matches Gitea's "direct
+                # children only" guard.
+                if "/" in entry_path or "\\" in entry_path or entry_path in (".", ".."):
+                    logger.warning(
+                        "BB DC list_directory returned suspicious child name: %r — skipping",
+                        entry_path,
+                    )
+                    continue
+                files.append(f"{path.rstrip('/')}/{entry_path}")
+            if children.get("isLastPage", True):
+                break
+            start = children.get("nextPageStart", start + 500)
         return files
 
     # ------------------------------------------------------------------ #
@@ -788,6 +967,9 @@ class BitbucketDCProvider(GitProvider):
         if parent_comment_id:
             payload["parent"] = {"id": parent_comment_id}
         resp = self.session.post(url, json=payload, timeout=15)
+        if parent_comment_id and resp.status_code == 400 and _says_thread_resolved(resp):
+            raise ThreadResolvedError(
+                f"PR #{pr_number}: comment {parent_comment_id}'s thread is resolved")
         resp.raise_for_status()
         return resp.json()
 

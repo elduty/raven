@@ -44,6 +44,51 @@ def _mock_post(client, status=201, json_data=None):
     return patch.object(client.session, "post", return_value=mock_resp)
 
 
+def _changes_for(diff_data, **overrides):
+    """A /changes page matching a JSON diff: one MODIFY per entry, distinct
+    content ids, nothing executable. ``overrides`` maps a path to fields."""
+    values = []
+    for i, d in enumerate(diff_data.get("diffs", [])):
+        src = (d.get("source") or {}).get("toString")
+        dst = (d.get("destination") or {}).get("toString")
+        path = dst or src
+        change = {"path": {"toString": path}, "type": "MODIFY", "nodeType": "FILE",
+                  "contentId": f"{i + 1:040x}", "fromContentId": f"{i + 101:040x}",
+                  "executable": False, "srcExecutable": False}
+        if src is None:
+            change.update(type="ADD", fromContentId="0" * 40, srcExecutable=None)
+        elif dst is None:
+            change.update(type="DELETE", contentId="0" * 40, executable=None)
+        elif src != dst:
+            change.update(type="MOVE", srcPath={"toString": src})
+        change.update(overrides.get(path, {}))
+        values.append(change)
+    return {"values": values, "isLastPage": True, "toHash": diff_data.get("toHash", "h" * 40)}
+
+
+def _mock_diff(client, diff_data, changes=None):
+    """Serve a JSON diff at /diff and its /changes (derived unless given:
+    one page, or a list of pages)."""
+    diff_data = dict(diff_data)
+    diff_data.setdefault("toHash", "h" * 40)
+    pages = changes if isinstance(changes, list) else [changes or _changes_for(diff_data)]
+
+    def get(url, params=None, headers=None, timeout=None):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status = MagicMock()
+        resp.headers = {"Content-Type": "application/json"}
+        if url.endswith("/changes"):
+            start = (params or {}).get("start", 0) or 0
+            index = min(start, len(pages) - 1) if start < len(pages) else len(pages) - 1
+            resp.json.return_value = pages[index]
+        else:
+            resp.json.return_value = diff_data
+            resp.text = json.dumps(diff_data)
+        return resp
+    return patch.object(client.session, "get", side_effect=get)
+
+
 def _mock_put(client, status=200, json_data=None):
     mock_resp = MagicMock()
     mock_resp.status_code = status
@@ -891,11 +936,10 @@ class TestFetchPrDiff:
     def test_url_structure(self, client):
         data = {"diffs": [{"source": {"toString": "a.py"},
                            "destination": {"toString": "a.py"}, "hunks": []}]}
-        with _mock_get(client, json_data=data,
-                       content_type="application/json") as mock_get:
+        with _mock_diff(client, data) as mock_get:
             with contextlib.suppress(RuntimeError):
                 client.fetch_pr_diff("PROJ/repo", 42)
-        url = mock_get.call_args[0][0]
+        url = mock_get.call_args_list[0][0][0]   # the diff; /changes follows
         assert "/projects/PROJ/repos/repo/pull-requests/42/diff" in url
 
     # ── Unverifiable (non-JSON) diff fail-closed (audit 2026-07-30) ───── #
@@ -909,11 +953,10 @@ class TestFetchPrDiff:
         """JSON is the only verifiable format, so ask for it by name."""
         data = {"diffs": [{"source": {"toString": "a.py"},
                            "destination": {"toString": "a.py"}, "hunks": []}]}
-        with _mock_get(client, json_data=data,
-                       content_type="application/json") as mock_get:
+        with _mock_diff(client, data) as mock_get:
             with contextlib.suppress(RuntimeError):
                 client.fetch_pr_diff("PROJ/repo", 7)
-        headers = mock_get.call_args.kwargs.get("headers") or {}
+        headers = mock_get.call_args_list[0].kwargs.get("headers") or {}
         assert headers.get("Accept") == "application/json"
 
     def test_plain_text_diff_is_refused(self, client):
@@ -947,42 +990,45 @@ class TestFetchPrDiff:
     # on individual file diffs / hunks / segments / lines. A truncated diff
     # means the model would see only part of the PR; reviewing (and possibly
     # APPROVING + auto-merging) that partial diff is the silent-unseen-code
-    # hole. fetch_pr_diff must refuse it at every truncation level.
+    # hole. fetch_pr_diff must refuse it at every level above the line; a
+    # line cut for length makes its file a coverage gap instead (TestCutLines).
+
+    @staticmethod
+    def _assert_refused_as_truncated(client, data):
+        """Exactly DiffTruncatedError, raised before /changes is read: its
+        subclass DiffUnverifiableError, which a /changes read without a head
+        raises, must not satisfy the check (review of #2b)."""
+        with _mock_diff(client, data) as get:
+            with pytest.raises(DiffTruncatedError, match="truncated") as exc:
+                client.fetch_pr_diff("PROJ/repo", 7)
+        assert type(exc.value) is DiffTruncatedError
+        assert not any(c.args[0].endswith("/changes") for c in get.call_args_list)
 
     def test_truncated_top_level_raises(self, client):
-        data = {
+        self._assert_refused_as_truncated(client, {
             "diffs": [{"source": {"toString": "a.py"},
                        "destination": {"toString": "a.py"}, "hunks": []}],
             "truncated": True,
-        }
-        with _mock_get(client, json_data=data, content_type="application/json"):
-            with pytest.raises(DiffTruncatedError, match="truncated"):
-                client.fetch_pr_diff("PROJ/repo", 7)
+        })
 
     def test_truncated_per_file_raises(self, client):
-        data = {"diffs": [{"source": {"toString": "a.py"},
-                           "destination": {"toString": "a.py"},
-                           "truncated": True, "hunks": []}]}
-        with _mock_get(client, json_data=data, content_type="application/json"):
-            with pytest.raises(DiffTruncatedError):
-                client.fetch_pr_diff("PROJ/repo", 7)
+        self._assert_refused_as_truncated(client, {
+            "diffs": [{"source": {"toString": "a.py"},
+                       "destination": {"toString": "a.py"},
+                       "truncated": True, "hunks": []}]})
 
     def test_truncated_hunk_raises(self, client):
-        data = {"diffs": [{"source": {"toString": "a.py"},
-                           "destination": {"toString": "a.py"},
-                           "hunks": [{"truncated": True, "segments": []}]}]}
-        with _mock_get(client, json_data=data, content_type="application/json"):
-            with pytest.raises(DiffTruncatedError):
-                client.fetch_pr_diff("PROJ/repo", 7)
+        self._assert_refused_as_truncated(client, {
+            "diffs": [{"source": {"toString": "a.py"},
+                       "destination": {"toString": "a.py"},
+                       "hunks": [{"truncated": True, "segments": []}]}]})
 
     def test_truncated_segment_raises(self, client):
-        data = {"diffs": [{"source": {"toString": "a.py"},
-                           "destination": {"toString": "a.py"},
-                           "hunks": [{"segments": [{"truncated": True,
-                                                    "lines": []}]}]}]}
-        with _mock_get(client, json_data=data, content_type="application/json"):
-            with pytest.raises(DiffTruncatedError):
-                client.fetch_pr_diff("PROJ/repo", 7)
+        self._assert_refused_as_truncated(client, {
+            "diffs": [{"source": {"toString": "a.py"},
+                       "destination": {"toString": "a.py"},
+                       "hunks": [{"segments": [{"truncated": True,
+                                                "lines": []}]}]}]})
 
     def test_non_truncated_json_diff_succeeds(self, client):
         """Guard against false positives: a complete JSON diff (all
@@ -997,7 +1043,7 @@ class TestFetchPrDiff:
                                                 "lines": [{"line": "x"}]}]}]}],
             "truncated": False,
         }
-        with _mock_get(client, json_data=data, content_type="application/json"):
+        with _mock_diff(client, data):
             result = client.fetch_pr_diff("PROJ/repo", 7)
         assert "diff --git a/a.py b/a.py" in result
 
@@ -1058,12 +1104,15 @@ class TestListDirectory:
         with _mock_get(client, status=404):
             assert client.list_directory("PROJ/repo", ".claude/rules") == []
 
-    def test_http_error_returns_empty(self, client):
+    def test_http_error_raises(self, client):
+        """Only a 404 means "no rules" (audit 09-27 #12)."""
         import requests
         mock_resp = MagicMock()
+        mock_resp.status_code = 500
         mock_resp.raise_for_status.side_effect = requests.HTTPError("500")
         with patch.object(client.session, "get", return_value=mock_resp):
-            assert client.list_directory("PROJ/repo", ".claude/rules") == []
+            with pytest.raises(requests.HTTPError):
+                client.list_directory("PROJ/repo", ".claude/rules")
 
     def test_passes_ref_to_api(self, client):
         with _mock_get(client, json_data={"children": {"values": [], "isLastPage": True}}) as mock_get:
@@ -1140,6 +1189,35 @@ class TestPostPrComment:
         payload = mock_post.call_args[1]["json"]
         assert payload["text"] == "reply"
         assert payload["parent"] == {"id": 42}
+
+    @staticmethod
+    def _refused(message):
+        import requests
+        resp = MagicMock(status_code=400)
+        resp.json.return_value = {"errors": [{
+            "message": message,
+            "exceptionName": "com.atlassian.bitbucket.validation.ArgumentValidationException"}]}
+        resp.raise_for_status.side_effect = requests.HTTPError("400 Client Error")
+        return resp
+
+    def test_a_reply_to_a_resolved_thread_raises_thread_resolved(self, client):
+        """BB DC refuses a reply once its thread is resolved, with a 400
+        that says so (nova PR #13, 2026-10-02). A typed error lets the
+        comment flow treat it as an expected outcome, not a crash."""
+        from raven.providers import ThreadResolvedError
+        resp = self._refused("Reply cannot be made to resolved thread.")
+        with patch.object(client.session, "post", return_value=resp):
+            with pytest.raises(ThreadResolvedError):
+                client.post_pr_comment("PROJ/repo", 3, "reply", parent_comment_id=42)
+
+    def test_any_other_400_still_raises_http_error(self, client):
+        import requests
+        from raven.providers import ThreadResolvedError
+        resp = self._refused("Something else went wrong.")
+        with patch.object(client.session, "post", return_value=resp):
+            with pytest.raises(requests.HTTPError) as caught:
+                client.post_pr_comment("PROJ/repo", 3, "reply", parent_comment_id=42)
+        assert not isinstance(caught.value, ThreadResolvedError)
 
 
 # ------------------------------------------------------------------ #
@@ -1226,7 +1304,7 @@ class TestJsonDiffToUnified:
                 }],
             }],
         }
-        result = client._json_diff_to_unified(data)
+        result = client._json_diff_to_unified(data, changes=None)
         assert "diff --git a/src/app.py b/src/app.py" in result
         assert "--- a/src/app.py" in result
         assert "+++ b/src/app.py" in result
@@ -1253,7 +1331,7 @@ class TestJsonDiffToUnified:
                 }],
             }],
         }
-        result = client._json_diff_to_unified(data)
+        result = client._json_diff_to_unified(data, changes=None)
         assert "--- /dev/null" in result
         assert "+++ b/new_file.py" in result
         assert "+hello" in result
@@ -1275,14 +1353,14 @@ class TestJsonDiffToUnified:
                 }],
             }],
         }
-        result = client._json_diff_to_unified(data)
+        result = client._json_diff_to_unified(data, changes=None)
         assert "--- a/old_file.py" in result
         assert "+++ /dev/null" in result
         assert "-goodbye" in result
         assert "-world" in result
 
     def test_empty_diffs(self, client):
-        result = client._json_diff_to_unified({"diffs": []})
+        result = client._json_diff_to_unified({"diffs": []}, changes=None)
         assert result == "\n"
 
 
@@ -1300,11 +1378,11 @@ class TestBinaryEntries:
 
     @pytest.fixture()
     def unified(self, client):
-        return client._json_diff_to_unified(self._fixture("bbdc_binary_shapes.json"))
+        return client._json_diff_to_unified(self._fixture("bbdc_binary_shapes.json"), changes=None)
 
     @pytest.fixture()
     def deleted(self, client):
-        return client._json_diff_to_unified(self._fixture("bbdc_binary_deleted.json"))
+        return client._json_diff_to_unified(self._fixture("bbdc_binary_deleted.json"), changes=None)
 
     def test_binary_entries_get_git_markers(self, unified, deleted):
         assert "Binary files a/probe/blob.bin and b/probe/blob.bin differ" in unified
@@ -1363,11 +1441,406 @@ class TestBinaryEntries:
         name survives only in the ``---`` line and the marker; strip_diff
         must still decide on both names (Raven's review of this PR)."""
         from raven.reviewer import strip_diff
-        unified = client._json_diff_to_unified(self._binary_rename(src, dst))
+        unified = client._json_diff_to_unified(self._binary_rename(src, dst), changes=None)
         assert f"Binary files a/{src} and b/{dst} differ" in unified
         result = strip_diff(unified)
         assert result.binary_gaps == gaps
         assert result.stripped == stripped
+
+
+class TestFetchFileRefusesIncompleteReads:
+    """Audit 09-27 #12: the browse endpoint answers a binary file with
+    ``{"binary": true}`` and no lines (probed 2026-10-02), and pages a long
+    one. Returning "" or the first pages read a policy file as absent or
+    cut short, so both raise instead."""
+
+    def test_a_binary_file_raises(self, client):
+        from raven.providers import IncompleteFileError
+        data = {"binary": True, "path": {"toString": "CLAUDE.md"}}
+        with _mock_get(client, json_data=data, content_type="application/json"):
+            with pytest.raises(IncompleteFileError):
+                client.fetch_file("PROJ/repo", "CLAUDE.md", ref="main")
+
+    def test_a_read_past_the_page_cap_raises(self, client):
+        from raven.providers import IncompleteFileError
+        data = {"lines": [{"text": "x"}], "isLastPage": False, "nextPageStart": 1}
+        with _mock_get(client, json_data=data, content_type="application/json"):
+            with pytest.raises(IncompleteFileError):
+                client.fetch_file("PROJ/repo", "CLAUDE.md", ref="main")
+
+    def test_a_cut_line_raises(self, client):
+        """Browse cuts a line over the server's length limit and flags it
+        ``"truncated": true`` (probed 2026-10-02): a policy file with one
+        long paragraph would otherwise read cut short."""
+        from raven.providers import IncompleteFileError
+        data = {"lines": [{"text": "x" * 5000, "truncated": True}], "isLastPage": True}
+        with _mock_get(client, json_data=data, content_type="application/json"):
+            with pytest.raises(IncompleteFileError):
+                client.fetch_file("PROJ/repo", "CLAUDE.md", ref="main")
+
+    def test_an_empty_file_is_still_empty(self, client):
+        """An empty file is served as no lines, not as binary (probed)."""
+        data = {"lines": [], "start": 0, "size": 0, "isLastPage": True}
+        with _mock_get(client, json_data=data, content_type="application/json"):
+            assert client.fetch_file("PROJ/repo", "CLAUDE.md", ref="main") == ""
+
+    def test_a_missing_file_is_still_empty(self, client):
+        with _mock_get(client, status=404):
+            assert client.fetch_file("PROJ/repo", "CLAUDE.md", ref="main") == ""
+
+
+class TestContentIdentityFromChanges:
+    """Audit 09-27 #2b, BB DC content identity: the JSON diff carries no
+    content id and no file mode, so fetch_pr_diff reads /changes and writes
+    git's ``index`` and mode lines. A push that changes only a binary, or
+    only a mode, then moves the merge-gate identity."""
+
+    @staticmethod
+    def _entry(path, src="same", hunks=True, binary=False):
+        src = path if src == "same" else src
+        entry = {"source": {"toString": src} if src else None,
+                 "destination": {"toString": path} if path else None}
+        if binary:
+            entry["binary"] = True
+        elif hunks:
+            entry["hunks"] = [{"sourceLine": 1, "sourceSpan": 1, "destinationLine": 1,
+                               "destinationSpan": 1, "segments": [
+                                   {"type": "REMOVED", "lines": [{"line": "a"}]},
+                                   {"type": "ADDED", "lines": [{"line": "b"}]}]}]
+        return entry
+
+    def _fetch(self, client, entries, changes=None, **overrides):
+        data = {"diffs": entries, "toHash": "h" * 40}
+        if changes is None:
+            changes = _changes_for(data, **overrides)
+        with _mock_diff(client, data, changes):
+            return client.fetch_pr_diff("PROJ/repo", 7)
+
+    def test_a_modified_file_gets_gits_index_line(self, client):
+        unified = self._fetch(client, [self._entry("a.py")], **{"a.py": {
+            "fromContentId": "1" * 40, "contentId": "2" * 40}})
+        header = unified.split("--- ", 1)[0]
+        assert "\nindex " + "1" * 40 + ".." + "2" * 40 + "\n" in header
+
+    def test_a_binary_only_change_moves_the_identity(self, client):
+        from raven.server import _diff_chunk_hashes
+        entries = [self._entry("logo.png", binary=True)]
+        before = self._fetch(client, entries, **{"logo.png": {"contentId": "1" * 40}})
+        after = self._fetch(client, entries, **{"logo.png": {"contentId": "2" * 40}})
+        assert _diff_chunk_hashes(before) != _diff_chunk_hashes(after)
+
+    def test_a_mode_flip_writes_gits_mode_lines_and_is_shown(self, client):
+        from raven.reviewer import strip_diff
+        unified = self._fetch(client, [self._entry("run.sh", hunks=False)], **{"run.sh": {
+            "srcExecutable": False, "executable": True,
+            "fromContentId": "3" * 40, "contentId": "3" * 40}})
+        assert "\nold mode 100644\nnew mode 100755\n" in unified
+        # The change is shown, so the same-path hunk-less section isn't a gap.
+        assert strip_diff(unified).unshown_gaps == []
+
+    def test_a_mode_flip_does_not_hide_an_unshown_content_change(self, client):
+        """The mode lines show the mode, not the content: two content ids
+        and no hunk still gap (review of #2b)."""
+        from raven.reviewer import strip_diff
+        unified = self._fetch(client, [self._entry("run.sh", hunks=False)], **{"run.sh": {
+            "srcExecutable": False, "executable": True}})
+        assert strip_diff(unified).unshown_gaps == ["run.sh"]
+
+    def test_a_mode_only_push_moves_the_identity(self, client):
+        from raven.server import _diff_chunk_hashes
+        from raven.reviewer import diff_hash, split_diff_by_file
+        entries = [self._entry("run.sh")]
+        plain = self._fetch(client, entries)
+        flipped = self._fetch(client, entries, **{"run.sh": {"executable": True}})
+        assert _diff_chunk_hashes(plain) != _diff_chunk_hashes(flipped)
+        # Authored, so the rebase-tolerance hash moves too and it re-reviews.
+        assert diff_hash(dict(split_diff_by_file(plain))["run.sh"]) != \
+            diff_hash(dict(split_diff_by_file(flipped))["run.sh"])
+
+    @pytest.mark.parametrize("executable,mode", [(False, "100644"), (True, "100755")])
+    def test_a_new_file_carries_its_mode(self, client, executable, mode):
+        unified = self._fetch(client, [self._entry("new.sh", src=None)],
+                              **{"new.sh": {"executable": executable}})
+        assert f"\nnew file mode {mode}\n" in unified
+
+    def test_a_deleted_executable_carries_its_mode(self, client):
+        unified = self._fetch(client, [self._entry(None, src="gone.sh")],
+                              **{"gone.sh": {"srcExecutable": True}})
+        assert "\ndeleted file mode 100755\n" in unified
+
+    def test_a_deleted_executable_binary_is_still_read_as_a_deletion(self, client):
+        """End to end on the real payload: the header now carries 100755,
+        and strip_diff still shows the binary going rather than gapping it
+        (Raven, BB PR #17)."""
+        from pathlib import Path
+        from raven.reviewer import strip_diff
+        data = json.loads((Path(__file__).parent
+                           / "fixtures/audit/bbdc_binary_deleted.json").read_text())
+        data["toHash"] = "h" * 40
+        changes = _changes_for(data, **{"probe/blob.bin": {"srcExecutable": True}})
+        with _mock_diff(client, data, changes):
+            unified = client.fetch_pr_diff("PROJ/repo", 7)
+        assert "\ndeleted file mode 100755\n" in unified
+        result = strip_diff(unified)
+        assert result.binary_gaps == [] and result.unshown_gaps == [] and result.gaps == []
+
+    @pytest.mark.parametrize("before,after", [(False, True), (True, False)])
+    def test_a_rename_that_flips_the_mode_shows_it(self, client, before, after):
+        """It used to show as a plain rename (Raven, BB PR #3)."""
+        unified = self._fetch(client, [self._entry("new.sh", src="old.sh")],
+                              **{"new.sh": {"srcExecutable": before, "executable": after}})
+        modes = {False: "100644", True: "100755"}
+        assert f"\nold mode {modes[before]}\nnew mode {modes[after]}\n" in unified
+
+    def test_dropping_the_executable_bit_shows_it(self, client):
+        unified = self._fetch(client, [self._entry("run.sh")], **{"run.sh": {
+            "srcExecutable": True, "executable": False}})
+        assert "\nold mode 100755\nnew mode 100644\n" in unified
+
+    def test_a_move_the_diff_shows_as_a_delete_and_an_add_is_found(self, client):
+        """/changes keys a move by its target; a diff that shows it as a
+        deletion and an addition finds the deletion by the move's source
+        (review of #2b). Each side writes git's zeros for the side it lacks."""
+        entries = [self._entry(None, src="old.sh"), self._entry("new.sh", src=None)]
+        move = {"path": {"toString": "new.sh"}, "srcPath": {"toString": "old.sh"},
+                "type": "MOVE", "nodeType": "FILE", "fromContentId": "a" * 40,
+                "contentId": "b" * 40, "srcExecutable": True, "executable": False}
+        unified = self._fetch(client, entries, changes={
+            "values": [move], "isLastPage": True, "toHash": "h" * 40})
+        assert ("\ndeleted file mode 100755\nindex " + "a" * 40 + ".." + "0" * 40 + "\n"
+                in unified)
+        assert ("\nnew file mode 100644\nindex " + "0" * 40 + ".." + "b" * 40 + "\n"
+                in unified)
+
+    def test_changes_for_another_head_are_refused(self, client):
+        from raven.providers import DiffHeadMismatchError
+        entries = [self._entry("a.py")]
+        changes = _changes_for({"diffs": entries})
+        changes["toHash"] = "e" * 40
+        data = {"diffs": entries, "toHash": "h" * 40}
+        with _mock_diff(client, data, changes) as get:
+            with pytest.raises(DiffHeadMismatchError):
+                client.fetch_pr_diff("PROJ/repo", 7)
+        diff_reads = [c for c in get.call_args_list if c.args[0].endswith("/diff")]
+        assert len(diff_reads) == 3  # the pair is read again before refusing
+
+    def test_a_push_between_the_reads_reads_the_pair_again(self, client):
+        """A push between the /diff and /changes reads pairs two heads; the
+        second pair describes the new head and is what's returned."""
+        old = {"diffs": [self._entry("a.py")], "toHash": "a" * 40}
+        new = {"diffs": [self._entry("b.py")], "toHash": "b" * 40}
+        diffs = iter([old, new])
+
+        def get(url, params=None, headers=None, timeout=None):
+            resp = MagicMock(status_code=200)
+            resp.headers = {"Content-Type": "application/json"}
+            resp.json.return_value = (_changes_for(new) if url.endswith("/changes")
+                                      else next(diffs))
+            return resp
+        with patch.object(client.session, "get", side_effect=get):
+            unified = client.fetch_pr_diff("PROJ/repo", 7)
+        assert "b.py" in unified and "a.py" not in unified
+
+    def test_pages_from_two_heads_are_refused(self, client):
+        from raven.providers import DiffHeadMismatchError
+        entries = [self._entry("a.py"), self._entry("b.py")]
+        full = _changes_for({"diffs": entries})
+        first = {"values": full["values"][:1], "isLastPage": False, "nextPageStart": 1,
+                 "toHash": "h" * 40}
+        second = {"values": full["values"][1:], "isLastPage": True, "toHash": "e" * 40}
+        with pytest.raises(DiffHeadMismatchError):
+            self._fetch(client, entries, changes=[first, second])
+
+    def test_a_page_without_a_head_is_refused(self, client):
+        from raven.providers import DiffIdentityUnverifiableError
+        entries = [self._entry("a.py"), self._entry("b.py")]
+        full = _changes_for({"diffs": entries})
+        first = {"values": full["values"][:1], "isLastPage": False, "nextPageStart": 1,
+                 "toHash": "h" * 40}
+        second = {"values": full["values"][1:], "isLastPage": True}
+        with pytest.raises(DiffIdentityUnverifiableError):
+            self._fetch(client, entries, changes=[first, second])
+
+    def test_a_diff_without_a_head_is_refused(self, client):
+        from raven.providers import DiffIdentityUnverifiableError
+        data = {"diffs": [self._entry("a.py")], "toHash": None}
+        with _mock_diff(client, data, _changes_for({"diffs": data["diffs"]})):
+            with pytest.raises(DiffIdentityUnverifiableError):
+                client.fetch_pr_diff("PROJ/repo", 7)
+
+    def test_a_file_missing_from_changes_is_unverifiable(self, client):
+        from raven.providers import DiffIdentityUnverifiableError
+        entries = [self._entry("a.py"), self._entry("b.py")]
+        changes = _changes_for({"diffs": entries[:1]})
+        with pytest.raises(DiffIdentityUnverifiableError):
+            self._fetch(client, entries, changes=changes)
+
+    @pytest.mark.parametrize("field,value", [
+        ("contentId", None), ("contentId", "0" * 40), ("contentId", "not-an-id"),
+        ("fromContentId", None), ("fromContentId", ""), ("fromContentId", 7),
+        ("executable", None), ("executable", "false"),
+        ("srcExecutable", None), ("srcExecutable", 0),
+    ])
+    def test_a_modification_with_an_unreadable_side_is_refused(self, client, field, value):
+        """Each side a file has needs its content id and its executable
+        flag: writing zeros or no mode line for a missing one would leave
+        the identity unmoved by exactly the push this guards (Raven, #17)."""
+        from raven.providers import DiffIdentityUnverifiableError
+        with pytest.raises(DiffIdentityUnverifiableError):
+            self._fetch(client, [self._entry("a.py")], **{"a.py": {field: value}})
+
+    def test_an_addition_needs_only_its_new_side(self, client):
+        unified = self._fetch(client, [self._entry("new.sh", src=None)],
+                              **{"new.sh": {"contentId": "b" * 40}})
+        assert "\nindex " + "0" * 40 + ".." + "b" * 40 + "\n" in unified
+
+    @pytest.mark.parametrize("path,src,field", [
+        ("new.sh", None, "contentId"), ("new.sh", None, "executable"),
+        (None, "gone.sh", "fromContentId"), (None, "gone.sh", "srcExecutable")])
+    def test_an_addition_or_deletion_needs_the_side_it_has(self, client, path, src, field):
+        from raven.providers import DiffIdentityUnverifiableError
+        with pytest.raises(DiffIdentityUnverifiableError):
+            self._fetch(client, [self._entry(path, src=src)], **{path or src: {field: None}})
+
+    def test_the_converter_has_no_default_for_changes(self, client):
+        """Omitting the identity is a TypeError, not a skipped gate."""
+        with pytest.raises(TypeError):
+            client._json_diff_to_unified({"diffs": []})
+
+    def test_changes_are_read_for_the_whole_pr_without_comments(self, client):
+        data = {"diffs": [self._entry("a.py")], "toHash": "h" * 40}
+        with _mock_diff(client, data) as get:
+            client.fetch_pr_diff("PROJ/repo", 7)
+        params = [c.kwargs["params"] for c in get.call_args_list
+                  if c.args[0].endswith("/changes")]
+        assert params and all(p["changeScope"] == "ALL" and p["withComments"] == "false"
+                              for p in params)
+
+    def test_changes_are_paged(self, client):
+        entries = [self._entry("a.py"), self._entry("b.py")]
+        full = _changes_for({"diffs": entries})
+        first = {"values": full["values"][:1], "isLastPage": False, "nextPageStart": 1,
+                 "toHash": full["toHash"]}
+        second = {"values": full["values"][1:], "isLastPage": True, "toHash": full["toHash"]}
+        unified = self._fetch(client, entries, changes=[first, second])
+        assert unified.count("\nindex ") == 2
+
+    def test_changes_past_the_page_cap_are_too_large(self, client):
+        """Refused as a diff too large to review whole, which is the advice
+        that applies (split the PR), not as an unverifiable format."""
+        entries = [self._entry("a.py")]
+        page = _changes_for({"diffs": entries})
+        endless = [dict(page, isLastPage=False, nextPageStart=i + 1) for i in range(25)]
+        with pytest.raises(DiffTruncatedError) as exc:
+            self._fetch(client, entries, changes=endless)
+        assert type(exc.value) is DiffTruncatedError
+
+    @pytest.mark.parametrize("next_start", [None, "absent", 0, "1", True])
+    def test_a_page_that_cant_be_followed_is_refused_at_once(self, client, next_start):
+        """A non-last page must name a next start past its own: re-reading
+        page 0 up to the cap would blame the PR's size for a paging shape
+        (Raven, BB PR #17)."""
+        from raven.providers import DiffIdentityUnverifiableError
+        entries = [self._entry("a.py")]
+        page = dict(_changes_for({"diffs": entries}), isLastPage=False)
+        if next_start != "absent":
+            page["nextPageStart"] = next_start
+        data = {"diffs": entries, "toHash": "h" * 40}
+        with _mock_diff(client, data, [page]) as get:
+            with pytest.raises(DiffIdentityUnverifiableError):
+                client.fetch_pr_diff("PROJ/repo", 7)
+        assert sum(c.args[0].endswith("/changes") for c in get.call_args_list) == 1
+
+
+class TestNearIdenticalNamesKeepTheirKeys:
+    """The synthesizer writes most paths as-is, so two files whose names
+    differ only by a trailing space or a control character must still
+    parse to two keys; one key would hash only one of them."""
+
+    def test_trailing_space_and_cr_names_are_distinct_keys(self, client):
+        from raven.reviewer import split_diff_by_file
+        def entry(path, old, new):
+            return {"source": {"toString": path}, "destination": {"toString": path},
+                    "hunks": [{"sourceLine": 1, "sourceSpan": 1, "destinationLine": 1,
+                               "destinationSpan": 1, "segments": [
+                                   {"type": "REMOVED", "lines": [{"line": old}]},
+                                   {"type": "ADDED", "lines": [{"line": new}]}]}]}
+        data = {"diffs": [entry("c.py", "x", "x2"), entry("c.py ", "y", "y2"),
+                          entry("c.py\r", "z", "z2")]}
+        keys = [k for k, _ in split_diff_by_file(client._json_diff_to_unified(data, changes=None))]
+        assert keys == ["c.py", "c.py ", "c.py\r"]
+
+
+class TestCutLines:
+    """Spec 2026-10-01-bbdc-truncated-lines: Bitbucket cuts a diff line
+    over its length limit and flags the line ``truncated``. That alone no
+    longer refuses the diff; the synthesizer marks the file and the line."""
+
+    @staticmethod
+    def _fixture():
+        import gzip
+        from pathlib import Path
+        return json.loads(gzip.decompress(
+            (Path(__file__).parent / "fixtures/audit/bbdc_cut_lines.json.gz").read_bytes()))
+
+    @staticmethod
+    def _entry(lines, path="data.json", seg_type="ADDED"):
+        return {"diffs": [{"source": {"toString": path}, "destination": {"toString": path},
+                           "hunks": [{"sourceLine": 1, "sourceSpan": 1, "destinationLine": 1,
+                                      "destinationSpan": len(lines),
+                                      "segments": [{"type": seg_type, "lines": lines}]}]}]}
+
+    def test_real_payload_marks_the_file_and_each_cut_line(self, client):
+        unified = client._json_diff_to_unified(self._fixture(), changes=None)
+        header, rest = unified.split("--- ", 1)
+        assert "\ntruncated lines 2\n" in header
+        cut = [l for l in unified.split("\n") if l.endswith(" ⟨…line cut by Bitbucket⟩")]
+        assert len(cut) == 2 and all(l.startswith("+") for l in cut)
+
+    def test_real_payload_is_a_cut_gap_end_to_end(self, client):
+        """The synthesizer's output is what strip_diff parses: the real
+        payload, through fetch_pr_diff, gaps exactly its file."""
+        from raven.reviewer import strip_diff
+        data = self._fixture()
+        with _mock_diff(client, data):
+            unified = client.fetch_pr_diff("PROJ/repo", 7)
+        paths = [d["destination"]["toString"] for d in data["diffs"]]
+        assert strip_diff(unified).cut_gaps == paths
+
+    def test_a_line_only_cut_does_not_refuse_the_diff(self, client):
+        data = self._entry([{"line": "x" * 5000, "truncated": True}])
+        with _mock_diff(client, data):
+            result = client.fetch_pr_diff("PROJ/repo", 7)
+        assert "truncated lines 1" in result
+
+    def test_a_segment_cut_still_refuses_even_with_a_line_cut(self, client):
+        data = self._entry([{"line": "x", "truncated": True}])
+        data["diffs"][0]["hunks"][0]["segments"][0]["truncated"] = True
+        with _mock_diff(client, data) as get:
+            with pytest.raises(DiffTruncatedError) as exc:
+                client.fetch_pr_diff("PROJ/repo", 7)
+        assert type(exc.value) is DiffTruncatedError
+        assert not any(c.args[0].endswith("/changes") for c in get.call_args_list)
+
+    def test_header_counts_every_cut_line(self, client):
+        data = self._entry([{"line": "a", "truncated": True}, {"line": "b"}])
+        data["diffs"][0]["hunks"].append(
+            {"sourceLine": 9, "sourceSpan": 1, "destinationLine": 9, "destinationSpan": 1,
+             "segments": [{"type": "ADDED", "lines": [{"line": "c", "truncated": True}]}]})
+        unified = client._json_diff_to_unified(data, changes=None)
+        assert unified.count("truncated lines ") == 1
+        assert "truncated lines 2" in unified
+
+    def test_removed_side_cut_is_marked(self, client):
+        unified = client._json_diff_to_unified(
+            self._entry([{"line": "x" * 5000, "truncated": True}], seg_type="REMOVED"), changes=None)
+        assert "truncated lines 1" in unified
+        assert any(l.startswith("-") and l.endswith(" ⟨…line cut by Bitbucket⟩")
+                   for l in unified.split("\n"))
+
+    def test_an_uncut_entry_gets_no_header(self, client):
+        unified = client._json_diff_to_unified(self._entry([{"line": "x"}]), changes=None)
+        assert "truncated lines" not in unified
 
 
 # ------------------------------------------------------------------ #

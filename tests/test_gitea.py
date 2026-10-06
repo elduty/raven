@@ -623,12 +623,15 @@ class TestListDirectory:
         with _mock_get(client, status=404):
             assert client.list_directory("owner/repo", ".claude/rules") == []
 
-    def test_http_error_returns_empty(self, client):
-        """Transport error must not block the review either."""
+    def test_http_error_raises(self, client):
+        """Only a 404 means "no rules". Any other failure raises, so the
+        review can't approve on rules it never saw (audit 09-27 #12)."""
         mock_resp = MagicMock()
+        mock_resp.status_code = 500
         mock_resp.raise_for_status.side_effect = requests.HTTPError("500")
         with patch.object(client.session, "get", return_value=mock_resp):
-            assert client.list_directory("owner/repo", ".claude/rules") == []
+            with pytest.raises(requests.HTTPError):
+                client.list_directory("owner/repo", ".claude/rules")
 
     def test_path_is_a_file_returns_empty(self, client):
         """Gitea returns an object (not a list) when the path resolves

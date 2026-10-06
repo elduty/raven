@@ -21,7 +21,8 @@ from typing import Callable, NamedTuple
 
 from flask import Flask, abort, jsonify, request
 
-from .providers import GitProvider, DiffTruncatedError, DiffUnverifiableError, get_provider, register_provider, registered_providers
+from . import __version__
+from .providers import GitProvider, DiffHeadMismatchError, DiffIdentityUnverifiableError, DiffTruncatedError, DiffUnverifiableError, IncompleteFileError, ThreadResolvedError, get_provider, register_provider, registered_providers
 from .providers.gitea import GiteaProvider
 from .metrics import add, inc, Timer, format_prometheus
 from .notifier import notify
@@ -68,14 +69,18 @@ def _review_failure_reason(exc: Exception) -> str:
     ``DiffTruncatedError`` — the two need different operator advice
     ("split the PR" is wrong when the problem is a response format we
     can't inspect), and an isinstance test against the parent would
-    swallow the subclass.
+    swallow the subclass. Its own subclass ``DiffIdentityUnverifiableError``
+    (a file's content identity unreadable) comes before it, for the same
+    reason.
     """
     if isinstance(exc, AIError):
         return exc.reason
-    if isinstance(exc, DiffHeadUnverifiedError):
+    if isinstance(exc, (DiffHeadUnverifiedError, DiffHeadMismatchError)):
         return "diff_head_unverified"
     if isinstance(exc, HeadUnverifiedError):
         return "head_unverified"
+    if isinstance(exc, DiffIdentityUnverifiableError):
+        return "diff_identity_unverified"
     if isinstance(exc, DiffUnverifiableError):
         return "diff_unverifiable"
     if isinstance(exc, DiffTruncatedError):
@@ -124,7 +129,8 @@ _FAILURE_MESSAGES = {
         "(it could otherwise approve or merge code it never saw). Split the PR "
         "into smaller changes, or raise the server's diff size limit "
         "(`diff.max.lines` / related `*.diff.*` properties), then push a commit "
-        "to re-trigger."
+        "to re-trigger. (Lines Bitbucket cuts for length don't cause this "
+        "notice: they are reviewed, and their file is marked as not fully shown.)"
     ),
     "diff_unverifiable": (
         "🔍 Raven could not verify that it received the **complete** diff. "
@@ -136,6 +142,14 @@ _FAILURE_MESSAGES = {
         "with the PR: the Bitbucket instance needs to serve "
         "`/pull-requests/{id}/diff` as `application/json`. Splitting the PR "
         "will not help."
+    ),
+    "diff_identity_unverified": (
+        "🔗 Raven could not read every changed file's content identity: "
+        "Bitbucket's list of the PR's changed files was missing a file, or the "
+        "commit it describes. Without it Raven can't tie a verdict to the exact "
+        "files of this commit, so nothing was reviewed or merged. Push a commit "
+        "or re-request the review to retry; if it keeps happening, check the "
+        "service logs."
     ),
     "diff_head_unverified": (
         "🔄 Raven could not get a diff of the latest commit: the git host "
@@ -410,7 +424,8 @@ class CacheEntry:
     # tests/test_server.py::TestCoverageGapBlocksMerge.
     coverage_gap_files: list[str] = field(default_factory=list)
     # Per-repo review config this entry was computed under: the resolved
-    # severity scale + the per-repo review prompt override, hashed by
+    # severity scale, the per-repo review prompt override, the base branch
+    # and the CLAUDE.md and rules (audit 09-27 #8), hashed by
     # _entry_config_hash(). review_config_hash() (module-level, wipes the
     # WHOLE cache) can't express "this one repo's scale changed" — this
     # field is the per-entry complement. Defaults to "" for entries loaded
@@ -484,17 +499,37 @@ class CacheEntry:
     unreviewed_hashes: dict[str, str] = field(default_factory=dict)
 
 
-def _entry_config_hash(scale: SeverityScale, prompt_override: str | None) -> str:
+def _entry_config_hash(scale: SeverityScale, prompt_override: str | None, *,
+                       base_ref: str, claude_md: str, rules: dict[str, str]) -> str:
     """Per-repo review config that the global review_config_hash() cannot
-    express: the resolved severity scale and the per-repo prompt override
+    express: the resolved severity scale, the per-repo prompt override
     (closes backlog #15 — the override was missing from the cache key
-    entirely). A mismatch against ``CacheEntry.config_hash`` means the
-    entry was computed under a vocabulary or prompt that no longer
-    applies to this repo."""
+    entirely), the base branch, and the CLAUDE.md and rules the review was
+    judged under (audit 09-27 #8: a retargeted PR, or one whose base
+    changed its policy, reused an approve judged under other policy). A
+    mismatch against ``CacheEntry.config_hash`` means the entry was
+    computed under policy that no longer applies to this PR. The new parts
+    are keyword-only with no default, so a caller can't leave one out.
+
+    The base branch NAME, not its commit: every merge to the base would
+    otherwise send every open PR back for a full review, while the
+    CLAUDE.md and rules digest already catches the policy changing."""
     h = hashlib.sha256()
-    h.update(scale.fingerprint().encode("utf-8"))
-    h.update(b"\x00")
-    h.update((prompt_override or "").encode("utf-8"))
+
+    def _part(text: str) -> None:
+        # Length-prefixed, so no part's content can shift into the next
+        # (Raven's review of BB PR #16: with bare separators, a CLAUDE.md
+        # that absorbed the rules' text hashed like the rules).
+        data = (text or "").encode("utf-8")
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+
+    for part in (scale.fingerprint(), prompt_override or "", base_ref, claude_md):
+        _part(part)
+    _part(str(len(rules or {})))
+    for path in sorted(rules or {}):
+        _part(path)
+        _part(rules[path])
     return h.hexdigest()[:16]
 
 
@@ -1186,7 +1221,8 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
                                  expected_config_hash: str | None = None,
                                  scale: SeverityScale | None = None,
                                  source: str = "no_changes",
-                                 *, scale_fetch_failed: bool) -> bool:
+                                 *, scale_fetch_failed: bool,
+                                 policy_unusable: bool) -> bool:
     """Dispatch auto-merge from a CACHED approve verdict, without a fresh
     AI review pass. Returns True when a merge was dispatched to the
     CI-wait pool, False on any decline.
@@ -1204,6 +1240,12 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
     force-push head-SHA recheck still apply downstream. Gates, in order:
 
       * advisory mode never merges (matches both existing dispatch paths);
+      * ``policy_unusable`` (keyword-only, no default, like the next
+        one) — repo policy the caller couldn't read or validate (the
+        no-changes skip: CLAUDE.md, the rules, the review override or an
+        invalid severities.json; the comment flow also the respond override and an
+        unresolvable base ref), so the cached verdict
+        can't be checked against the policy that now applies (09-27 #12);
       * ``scale_fetch_failed`` (keyword-only, no default: a caller that
         forgot it would otherwise skip this gate silently) — the caller's
         severities.json read failed,
@@ -1228,10 +1270,10 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
         current head's diff — the cached approval must describe the code
         being merged, not some prior commit (stale-approval wedge);
       * when the caller supplies ``expected_config_hash`` (the per-repo
-        severity scale + prompt override this dispatch would be judged
-        under, right now), it must equal ``entry.config_hash`` exactly —
-        otherwise the cached approve was computed under a vocabulary or
-        prompt that no longer applies, and re-dispatching it without a
+        policy this dispatch would be judged under, right now: scale,
+        prompt override, base branch, CLAUDE.md and rules), it must equal
+        ``entry.config_hash`` exactly — otherwise the cached approve was
+        computed under policy that no longer applies, and re-dispatching it without a
         fresh AI pass could auto-merge under a stale gate (severity-scale
         cache-safety half of the per-entry config hash; see
         ``_entry_config_hash``). This DELIBERATELY includes a legacy
@@ -1276,6 +1318,12 @@ def _maybe_dispatch_cached_merge(provider: GitProvider, repo_full_name: str,
         logger.info("PR #%d: advisory mode — cached merge dispatch does not apply",
                     pr_number)
         return _decline("advisory_mode")
+
+    if policy_unusable:
+        logger.warning("PR #%d: a repo policy file could not be read or "
+                       "validated — declining cached merge dispatch "
+                       "(fail-closed)", pr_number)
+        return _decline("policy_unusable")
 
     if scale_fetch_failed:
         logger.warning("PR #%d: severities.json could not be read — declining "
@@ -1816,6 +1864,24 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # ``<repo_policy_TAGID>`` blocks (the trusted tier from the
         # prompt preamble); see ``reviewer._build_trust_preamble``.
         base_ref = payload.get("base_ref") or "HEAD"
+        # Policy sources this pass couldn't read or validate (audit 09-27
+        # #12). Any of them forces needs_work: the review still posts, and
+        # its body names what couldn't be read, but it can't approve or
+        # merge on policy Raven never saw. Static labels only.
+        policy_unusable: list[str] = []
+        # Whether any of them is something other than an unreadable
+        # severities.json, which the dispatcher reports on its own
+        # (declined_scale_fetch_failed). Set here, at the source, rather
+        # than re-derived from the display labels.
+        other_policy_unusable = False
+
+        def _policy_unusable(label: str, *, scale_read: bool = False) -> None:
+            nonlocal other_policy_unusable
+            if label not in policy_unusable:
+                policy_unusable.append(label)
+            if not scale_read:
+                other_policy_unusable = True
+
         claude_md = ""
         try:
             claude_md = provider.fetch_file(repo_full_name, "CLAUDE.md", ref=base_ref)
@@ -1823,11 +1889,12 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             # 404 (missing file) returns "" without raising; reaching this
             # except means an auth/transport/server-side failure that the
             # operator probably wants to see. Warn instead of debug.
-            logger.warning("CLAUDE.md fetch for %s@%s failed (review proceeds without repo context): %s",
-                           repo_full_name, base_ref, e)
-        # NOTE: rule + prompt-override fetches deferred to after the
-        # no-changes-skip path below so a re-review on an unchanged diff
-        # doesn't incur those network calls only to return early.
+            logger.warning("CLAUDE.md fetch for %s@%s failed (review proceeds without repo context, "
+                           "and can't approve): %s", repo_full_name, base_ref, e)
+            _policy_unusable("`CLAUDE.md`")
+        # The rules, review override and scale are read further down,
+        # before the no-changes skip: the cache entry is bound to them
+        # (audit 09-27 #8), so even an unchanged diff needs them.
 
         # Guard: empty diff after stripping lockfiles/binaries
         stripped = strip_diff(diff)
@@ -1900,8 +1967,60 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
              if previous_content_hashes.get(f) != h}
             if previous_content_hashes else set(raw_changed_files)
         )
+        # The repo policy this pass is judged under, read before the
+        # no-changes skip: the cache entry is bound to it (audit 09-27 #8),
+        # so a change since the cached review sends the PR to a full
+        # review instead of the skip or an incremental pass.
+        rules = _fetch_rules(provider, repo_full_name, base_ref,
+                             on_fetch_failed=lambda: _policy_unusable("the review rules"))
+
+        # Deprecated-config-path nag. Same local-closure shape as
+        # scale_fetch_failed below and for the same reason: _process_pr
+        # runs one PR to completion per call, so a closure carries this
+        # without any cross-repo module state.
+        legacy_config_paths: list[str] = []
+
+        def _note_legacy_config_path(relpath: str) -> None:
+            if relpath not in legacy_config_paths:
+                legacy_config_paths.append(relpath)
+
+        review_prompt_override = _fetch_prompt_override(
+            provider, repo_full_name, base_ref, "review",
+            on_legacy_path=_note_legacy_config_path,
+            on_fetch_failed=lambda: _policy_unusable("the review prompt override"),
+        )
+        # An unreadable severities.json, or an invalid one, joins
+        # policy_unusable (fail the merge gate closed below — see
+        # coverage_gap for the same pattern); only "no file" is a silent
+        # default_scale() fall-back. Local state, not module state:
+        # _process_pr runs one PR to completion per call, so a closure is
+        # enough and stays free of the cross-repo leak a shared "current
+        # scale" would risk (see CLAUDE.md's "Severity scale rules" on why
+        # scale is always threaded as a parameter, never global).
+        scale_fetch_failed = False
+
+        def _mark_scale_fetch_failed() -> None:
+            nonlocal scale_fetch_failed
+            scale_fetch_failed = True
+            _policy_unusable("`severities.json`", scale_read=True)
+
+        scale = _fetch_severity_scale(provider, repo_full_name, base_ref,
+                                      on_fetch_failed=_mark_scale_fetch_failed,
+                                      on_invalid=lambda: _policy_unusable("`severities.json` (invalid)"),
+                                      on_legacy_path=_note_legacy_config_path)
+        entry_config_hash = _entry_config_hash(
+            scale, review_prompt_override,
+            base_ref=base_ref, claude_md=claude_md, rules=rules)
+        # An empty hash (an entry from before the hash existed) counts as
+        # a change too, as on the cached-merge path.
+        config_changed = cached is not None and cached.config_hash != entry_config_hash
+
         removed_files = previous_hashes.keys() - current_hashes.keys()
-        if previous_hashes and not raw_changed_files and not removed_files:
+        # Policy Raven couldn't read hashes as if it were absent, so it
+        # reads as a change; the skip declines the merge on it instead of
+        # running a full review that the next healthy trigger would repeat.
+        if (previous_hashes and not raw_changed_files and not removed_files
+                and (not config_changed or policy_unusable)):
             logger.info("PR #%d re-review: no files changed since last review — skipping", pr_number)
             inc("raven_reviews_skipped_total", {"reason": "no_changes", "repo": repo_full_name})
             # A re-trigger with zero changed files is exactly the recovery
@@ -1915,34 +2034,24 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             #
             # The cached approve is reused WITHOUT a fresh AI pass, so it
             # must be checked against the repo's config right now — a
-            # severities.json or prompt-override edit landing on base_ref
-            # since the cached review must not silently keep auto-merging
-            # under a vocabulary that no longer applies. One extra pair of
-            # small file reads on this path only, gated by the helper's own
-            # entry.config_hash comparison. Unlike the read side elsewhere
-            # in this function, a legacy/hash-less entry (config_hash=="")
-            # does NOT skip this comparison — there is no review on this
-            # path to record a real hash and re-warm it, so it is refused
-            # exactly like any other mismatch (see CacheEntry.config_hash's
-            # and _maybe_dispatch_cached_merge's docstrings).
-            no_changes_scale_fetch_failed = False
-
-            def _mark_no_changes_scale_fetch_failed() -> None:
-                nonlocal no_changes_scale_fetch_failed
-                no_changes_scale_fetch_failed = True
-
-            no_changes_scale = _fetch_severity_scale(
-                provider, repo_full_name, base_ref,
-                on_fetch_failed=_mark_no_changes_scale_fetch_failed)
-            no_changes_override = _fetch_prompt_override(
-                provider, repo_full_name, base_ref, "review")
+            # severities.json, prompt-override, CLAUDE.md or rules edit
+            # landing on base_ref since the cached review must not silently
+            # keep auto-merging under policy that no longer applies. A
+            # changed policy never reaches here (config_changed sends it to
+            # a full review below); the helper's own entry.config_hash
+            # comparison stays as the gate, refusing a hash-less entry like
+            # any other mismatch (see CacheEntry.config_hash's and
+            # _maybe_dispatch_cached_merge's docstrings). Policy Raven
+            # couldn't read or validate blocks the merge as it blocks a
+            # fresh review.
             _maybe_dispatch_cached_merge(
                 provider, repo_full_name, pr_number,
                 pr_title, pr_url, head_sha=head_sha,
                 current_hashes=current_hashes,
-                expected_config_hash=_entry_config_hash(no_changes_scale, no_changes_override),
-                scale=no_changes_scale,
-                scale_fetch_failed=no_changes_scale_fetch_failed)
+                expected_config_hash=entry_config_hash,
+                scale=scale,
+                scale_fetch_failed=scale_fetch_failed,
+                policy_unusable=other_policy_unusable)
             return
 
         # Line remap for the files the rebase only slid around: content
@@ -2024,6 +2133,20 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             # Files were removed — do a full review to clear stale findings;
             # their threads resolve as moot (_collect_prior_findings)
             logger.info("PR #%d files removed since last review — full re-review", pr_number)
+            review_diff_text = clean_diff
+        elif previous_hashes and config_changed:
+            # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
+            # The cached review was judged under other policy: the scale,
+            # the prompt override, the base branch, CLAUDE.md or the rules
+            # (audit 09-27 #8). Carrying its findings and verdict into an
+            # incremental pass, or keeping it through the rebase-only
+            # shortcut, would apply the old policy to this head. Review the
+            # whole head; open findings ride in as prior findings, each tier
+            # read through scale.normalize(), so still-valid ones stay on
+            # their threads.
+            logger.info("PR #%d: review policy changed since the cached review — "
+                        "full re-review", pr_number)
+            inc("raven_config_change_full_reviews_total", {"repo": repo_full_name})
             review_diff_text = clean_diff
         elif previous_hashes and changed_files:
             # Incremental: rebuild diff from only changed file chunks.
@@ -2130,44 +2253,6 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         except Exception as e:
             logger.warning("Failed to resolve bot user for PR #%d context filter: %s", pr_number, e)
 
-        # Fetch rules + prompt override now (after the no-changes-skip
-        # path returned). Doing it here keeps re-reviews of unchanged
-        # diffs from incurring rules/list_directory + per-file fetches
-        # only to bail before the AI call.
-        rules = _fetch_rules(provider, repo_full_name, base_ref)
-
-        # Deprecated-config-path nag. Same local-closure shape as
-        # scale_fetch_failed below and for the same reason: _process_pr
-        # runs one PR to completion per call, so a closure carries this
-        # without any cross-repo module state.
-        legacy_config_paths: list[str] = []
-
-        def _note_legacy_config_path(relpath: str) -> None:
-            if relpath not in legacy_config_paths:
-                legacy_config_paths.append(relpath)
-
-        review_prompt_override = _fetch_prompt_override(
-            provider, repo_full_name, base_ref, "review",
-            on_legacy_path=_note_legacy_config_path,
-        )
-        # scale_fetch_failed distinguishes "severities.json could not be
-        # read" (fail the merge gate closed below — see coverage_gap for
-        # the same pattern) from "no file" / "invalid file", both of which
-        # are legitimately silent default_scale() falls-back. A plain
-        # local flag, not module state: _process_pr runs one PR to
-        # completion per call, so a closure is enough and stays free of
-        # the cross-repo leak a shared "current scale" would risk (see
-        # CLAUDE.md's "Severity scale rules" on why scale is always threaded as
-        # a parameter, never global).
-        scale_fetch_failed = False
-
-        def _mark_scale_fetch_failed() -> None:
-            nonlocal scale_fetch_failed
-            scale_fetch_failed = True
-
-        scale = _fetch_severity_scale(provider, repo_full_name, base_ref,
-                                      on_fetch_failed=_mark_scale_fetch_failed,
-                                      on_legacy_path=_note_legacy_config_path)
 
         # User-resolved-comment filter, pass 1 (pre-review). Findings
         # whose backing inline comment the developer marked resolved via
@@ -2338,6 +2423,8 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
         # advisory bodies carry it too.
         if legacy_config_paths:
             review["legacy_config_paths"] = list(legacy_config_paths)
+        if policy_unusable:
+            review["policy_unusable"] = list(policy_unusable)
 
         # Save original findings before merging carried ones (used for cache write)
         fresh_findings = list(review.get("findings", []))
@@ -2588,22 +2675,25 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 "PR #%d: unreviewed files remain (%s) — forcing needs_work verdict",
                 pr_number, ", ".join(review.get("coverage_gap_files") or []))
             approve = False
-        # Same fail-closed treatment for a present-but-unfetchable severity
-        # scale: the review still ran and still posts (the author gets
-        # feedback), but we don't know the repo's real gate, so we must
-        # not auto-merge as if the built-in default applied. Unlike
+        # Same fail-closed treatment for repo policy this pass couldn't read
+        # or validate (an unreadable or invalid severities.json, CLAUDE.md,
+        # the rules, the review override): the review still ran and still
+        # posts (the author gets feedback, and the body names the source),
+        # but we don't know the repo's real policy, so we must not approve
+        # or auto-merge as if the built-in default applied. Unlike
         # coverage_gap this needs no persisted per-entry field — every
-        # review pass (incremental or full) re-fetches the scale from
+        # review pass (incremental or full) re-fetches the policy from
         # scratch, so a forced needs_work verdict this pass is enough: it
         # lands in CacheEntry.verdict, which already makes
         # _maybe_dispatch_cached_merge refuse a later no-op-diff retrigger
         # (entry.verdict != "approve"), and the next real push simply
         # re-fetches.
-        if approve and scale_fetch_failed:
+        if approve and policy_unusable:
             logger.warning(
-                "PR #%d: could not fetch the repo's severity scale — "
+                "PR #%d: could not read or validate repo policy (%s) — "
                 "forcing needs_work verdict (fail-closed; refusing to "
-                "auto-merge under a guessed scale)", pr_number)
+                "approve or auto-merge on policy Raven never saw)",
+                pr_number, ", ".join(policy_unusable))
             approve = False
         # Display only: the headline badge (SeverityScale.badge) must not
         # read "no issues" on a review whose verdict blocks, and the forced
@@ -2649,9 +2739,14 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 sev = review.get("severity", scale.least_severe)
                 emoji, label = scale.badge(sev, review.get("findings"),
                                            blocking=not approve)
+                # A clean review's headline says it all; the model's
+                # sentence only repeated it. Anything else keeps it, to
+                # say why (the user, 2026-10-01).
+                reason = ("" if scale.no_issues(sev, review.get("findings"),
+                                                blocking=not approve)
+                          else f" — {review.get('summary') or 'changes requested'}")
                 body = (
-                    f"🦅 **Raven** — {emoji} "
-                    f"**{label}** — {review.get('summary') or 'changes requested'}"
+                    f"🦅 **Raven** — {emoji} **{label}**{reason}"
                     f"\n\n{_review_footer()}"
                 )
         else:
@@ -2862,7 +2957,7 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
                 verdict=verdict,
                 summary=cache_summary,
                 coverage_gap_files=list(review.get("coverage_gap_files") or []),
-                config_hash=_entry_config_hash(scale, review_prompt_override),
+                config_hash=entry_config_hash,
                 content_hashes=current_content_hashes,
                 hunks=current_hunks,
                 hunk_context=current_hunk_context,
@@ -2905,12 +3000,12 @@ def _process_pr(provider: GitProvider, payload: dict) -> None:
             _notify_if_needed(repo_full_name, pr_number, pr_title, pr_url, review)
             return
 
-        # Same defense-in-depth for an unfetchable severity scale — the
+        # Same defense-in-depth for unreadable or invalid repo policy — the
         # verdict force above should already make this unreachable.
-        if scale_fetch_failed:
+        if policy_unusable:
             logger.warning(
-                "PR #%d approved but the repo's severity scale could not "
-                "be fetched — leaving open without auto-merge", pr_number)
+                "PR #%d approved but repo policy could not be read or "
+                "validated — leaving open without auto-merge", pr_number)
             _notify_if_needed(repo_full_name, pr_number, pr_title, pr_url, review)
             return
 
@@ -3200,12 +3295,14 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # text that would bias its own re-review through the comment-reply
         # path. Code snippets later in this function still use head_sha
         # since they're showing the actual code under review.
+        comment_base_ref_unresolved = False
         try:
             comment_base_ref = provider.get_pr_base_ref(repo_full_name, pr_number)
         except Exception as e:
-            logger.debug("get_pr_base_ref for PR #%s CLAUDE.md fetch failed (falling back to HEAD): %s",
-                         pr_number, e)
+            logger.warning("get_pr_base_ref for PR #%s failed (policy read at HEAD; the reply "
+                           "can't approve): %s", pr_number, e)
             comment_base_ref = "HEAD"
+            comment_base_ref_unresolved = True
         # Repo severity scale — same base-ref provenance as CLAUDE.md above
         # (a scale change must land through its own review cycle, reviewed
         # under the OLD scale). Without this, a repo's own tier names are
@@ -3227,10 +3324,22 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # scale_fetch_failed at the fresh-review call site); mirror it
         # here, which was the last merge-capable path without the guard.
         comment_scale_fetch_failed = False
+        # Any other policy source this reply couldn't read or validate
+        # (CLAUDE.md, a prompt override, an invalid severities.json): the
+        # reply still posts, but it can't approve or merge (09-27 #12).
+        comment_policy_unusable = False
 
         def _mark_comment_scale_fetch_failed() -> None:
             nonlocal comment_scale_fetch_failed
             comment_scale_fetch_failed = True
+
+        def _mark_comment_policy_unusable() -> None:
+            nonlocal comment_policy_unusable
+            comment_policy_unusable = True
+
+        # Policy read at HEAD isn't the policy the PR is held to.
+        if comment_base_ref_unresolved:
+            _mark_comment_policy_unusable()
 
         # Deprecated-config-path nag, as in _process_pr. The reply is the
         # only body this flow posts, so it carries the note for both the
@@ -3244,6 +3353,7 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         comment_scale = _fetch_severity_scale(
             provider, repo_full_name, comment_base_ref,
             on_fetch_failed=_mark_comment_scale_fetch_failed,
+            on_invalid=_mark_comment_policy_unusable,
             on_legacy_path=_note_comment_legacy_config_path)
         claude_md = ""
         try:
@@ -3251,8 +3361,14 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         except Exception as e:
             # 404 (file missing) returns "" without raising; reaching this
             # except means an auth/transport failure worth flagging.
-            logger.warning("CLAUDE.md fetch for PR #%s reply failed (reply proceeds without repo context): %s",
-                           pr_number, e)
+            logger.warning("CLAUDE.md fetch for PR #%s reply failed (reply proceeds without repo context, "
+                           "and can't approve): %s", pr_number, e)
+            _mark_comment_policy_unusable()
+        # Read for the cache entry's hash (audit 09-27 #8): a merge from
+        # this reply must match the policy the cached review was judged
+        # under.
+        comment_rules = _fetch_rules(provider, repo_full_name, comment_base_ref,
+                                     on_fetch_failed=_mark_comment_policy_unusable)
 
         # Fetch conversation (keep last N to avoid prompt bloat). Dedupe
         # against thread IDs so the same comment doesn't appear twice.
@@ -3327,6 +3443,7 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # Reuse the base ref already fetched above for CLAUDE.md when
         # available; only re-call if that initial fetch failed.
         respond_prompt_override = None
+        review_override = None
         override_base_ref = comment_base_ref
         try:
             override_base_ref = (
@@ -3337,10 +3454,26 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             respond_prompt_override = _fetch_prompt_override(
                 provider, repo_full_name, override_base_ref, "respond",
                 on_legacy_path=_note_comment_legacy_config_path,
+                on_fetch_failed=_mark_comment_policy_unusable,
             )
+            # The review override is part of the cached entry's hash, which
+            # both the flip to approve and the merge are checked against.
+            review_override = _fetch_prompt_override(
+                provider, repo_full_name, override_base_ref, "review",
+                on_fetch_failed=_mark_comment_policy_unusable)
         except Exception as e:
-            logger.debug("Could not resolve base ref / respond override for PR #%d: %s",
-                         pr_number, e)
+            # The overrides were never read: unknown, not "none".
+            logger.warning("Could not resolve base ref / prompt overrides for PR #%d: %s",
+                           pr_number, e)
+            _mark_comment_policy_unusable()
+        # The policy this reply runs under, as the cache entry records it
+        # (audit 09-27 #8): an entry judged under other policy (a retarget,
+        # a CLAUDE.md or rules change) can neither approve nor merge from
+        # here. Computed when an approve or a merge is on the table.
+        def _comment_entry_hash() -> str:
+            return _entry_config_hash(
+                comment_scale, review_override, base_ref=comment_base_ref,
+                claude_md=claude_md, rules=comment_rules)
 
         # Generate response. respond_to_comment returns
         # {response, revise, retract_findings} since the comment-thread-context
@@ -3671,20 +3804,58 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                     revise = None
 
             # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
-            # Verdict revision (only when verdict actually changes).
-            do_revision = revise is not None and revise.get("verdict") != prior_verdict
-
-            # Lift entry + remaining_findings ABOVE submit_review so the
-            # advisory body wrap can render the synthetic review correctly
-            # (needs severity + findings list at body-construction time).
-            # The dispatch site below reads these same locals — single
-            # source of truth, no duplicate flatten.
+            # The server derives a comment-driven approve, as the review flow
+            # does (audit 09-27 #3a): it stands only if the findings left
+            # after the retractions don't block under the repo's scale, and
+            # only if that scale was read. The model's revise.verdict alone
+            # approved over a live blocker; and a failed read, whose fallback
+            # scale can be looser than the repo's, posted and cached the
+            # formal APPROVE although only that pass's merge was blocked.
+            #
+            # entry + remaining_findings are read once, here, for this gate,
+            # the advisory body wrap (severity + findings list at body time)
+            # and the dispatch site below: a single source of truth, so a
+            # filter added to the findings applies to the approve gate too.
             with _previous_diffs_lock:
                 entry = _previous_diffs.get(pr_key)
             remaining_findings: list[dict] = []
             if entry is not None:
                 for fl in entry.findings.values():
                     remaining_findings.extend(fl)
+            if revise is not None and revise.get("verdict") == "approve":
+                if entry is None:
+                    refusal = "no_cache_entry"
+                elif comment_policy_unusable:
+                    refusal = "policy_unusable"
+                elif comment_scale_fetch_failed:
+                    refusal = "scale_fetch_failed"
+                elif entry.config_hash != _comment_entry_hash():
+                    # Judged under other policy: the formal APPROVE could
+                    # count for branch protection, so refuse it, not only
+                    # the merge the dispatcher would decline.
+                    refusal = "policy_changed"
+                elif (any(comment_scale.blocks(f.get("severity")) for f in remaining_findings)
+                      or not _approve_from_severity(
+                          _max_severity_from_findings(remaining_findings, comment_scale),
+                          comment_scale)):
+                    # Each finding through blocks(), which reads a name this
+                    # scale doesn't know (a finding cached under another
+                    # scale) as the most severe tier; the max-severity check
+                    # keeps a scale whose least tier blocks from approving.
+                    refusal = "blocking_findings_remain"
+                else:
+                    refusal = None
+                if refusal:
+                    logger.warning(
+                        "PR #%d: suppressing comment-driven flip-to-approve (%s)",
+                        pr_number, refusal)
+                    inc("raven_comment_mutations_skipped_total",
+                        {"reason": refusal, "repo": repo_full_name})
+                    revise = None
+
+            # Verdict-logic trigger: changing this bumps reviewer._VERDICT_LOGIC_VERSION.
+            # Verdict revision (only when verdict actually changes).
+            do_revision = revise is not None and revise.get("verdict") != prior_verdict
 
             if not do_revision:
                 new_verdict = prior_verdict
@@ -3821,16 +3992,15 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
                 except Exception as e:
                     logger.debug("get_pr_metadata for PR #%d failed: %s", pr_number, e)
                     meta = {}
-                review_override = _fetch_prompt_override(
-                    provider, repo_full_name, override_base_ref, "review")
                 _maybe_dispatch_cached_merge(
                     provider, repo_full_name, pr_number,
                     meta.get("title") or f"PR #{pr_number}",
                     meta.get("html_url") or "",
                     head_sha=pinned_head, current_hashes=pinned_hashes,
-                    expected_config_hash=_entry_config_hash(comment_scale, review_override),
+                    expected_config_hash=_comment_entry_hash(),
                     scale=comment_scale, source="comment",
-                    scale_fetch_failed=comment_scale_fetch_failed)
+                    scale_fetch_failed=comment_scale_fetch_failed,
+                    policy_unusable=comment_policy_unusable)
         finally:
             # ``_save_cache()`` catches all exceptions internally (disk
             # full / permission denied are WARNING-logged + counted via
@@ -3846,6 +4016,15 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
             # touch it.
             with _in_progress_lock:
                 _comment_mutating_prs.discard(pr_key)
+
+    except ThreadResolvedError as e:
+        # Someone resolved the thread while Raven was answering: they closed
+        # the conversation, so the answer is dropped, as is the failure
+        # reply, which the same resolved thread would refuse. Nothing after
+        # the reply ran, so no state changed.
+        logger.warning("Reply skipped for %s#%s: %s", repo_full_name, pr_number, e)
+        inc("raven_comment_replies_skipped_total",
+            {"reason": "thread_resolved", "repo": repo_full_name or "unknown"})
 
     except Exception as e:
         reason = _review_failure_reason(e)
@@ -3863,16 +4042,22 @@ def _process_comment(provider: GitProvider, payload: dict) -> None:
         # Same classified failure metric as the review flow so timeout /
         # usage-cap / auth spikes on comment replies show on the same
         # dashboard. The reply UX keeps its own threaded message below
-        # (a verdict-style review comment would be wrong here); only the
-        # metric is unified. respond_to_comment already retried the
-        # transient classes inside reviewer.py.
+        # (a verdict-style review comment would be wrong here). respond_to_comment
+        # already retried the transient classes inside reviewer.py.
         inc("raven_review_failures_total",
             {"reason": reason, "repo": repo_label})
         if repo_full_name and pr_number:
+            # A diff Raven refused (truncated, unverifiable or not bound to
+            # one head) gets the same actionable notice as the review flow
+            # (07-02 #6). Anything else keeps the generic text: an
+            # unclassified exception's message must never reach the PR.
+            reply = (_failure_comment(reason)
+                     if reason in ("diff_truncated", "diff_unverifiable",
+                                   "diff_identity_unverified", "diff_head_unverified")
+                     else "\U0001f985 \u26a0\ufe0f Couldn't respond — internal error while processing your comment.")
             try:
                 provider.post_pr_comment(
-                    repo_full_name, pr_number,
-                    "\U0001f985 \u26a0\ufe0f Couldn't respond — internal error while processing your comment.",
+                    repo_full_name, pr_number, reply,
                     parent_comment_id=comment_id,
                 )
             except Exception:
@@ -4455,14 +4640,20 @@ def _fetch_changed_files(provider: GitProvider, repo_full_name: str, head_sha: s
     """
     # A source file git diffed as binary is a coverage gap (strip_diff)
     # whose content can't be shown meaningfully, and one with few
-    # newlines would pass the line cap whole: don't fetch it.
-    binary = set(strip_diff(clean_diff).binary_gaps)
-    file_chunks = [(f, c) for f, c in split_diff_by_file(clean_diff) if f not in binary]
+    # newlines would pass the line cap whole: don't fetch it. Nor a file
+    # Bitbucket cut lines in: it is a gap too, and its contents would add
+    # the same over-long lines to the prompt a second time.
+    stripped = strip_diff(clean_diff)
+    unfetched = set(stripped.binary_gaps) | set(stripped.cut_gaps)
+    file_chunks = [(f, c) for f, c in split_diff_by_file(clean_diff) if f not in unfetched]
     file_contents: dict[str, str] = {}
     omitted: list[str] = []
     for filename, _ in file_chunks[:MAX_FILES]:
         try:
             content = provider.fetch_file(repo_full_name, filename, ref=head_sha)
+        except IncompleteFileError:
+            omitted.append(f"{filename} (the platform couldn't return it whole)")
+            continue
         except Exception as e:
             logger.debug("Could not fetch %s for context: %s", filename, e)
             continue
@@ -4589,13 +4780,17 @@ def _fetch_repo_config_file(provider: GitProvider, repo_full_name: str,
     return _RepoConfigFile("", False, fetch_failed)
 
 
-def _fetch_rules(provider: GitProvider, repo_full_name: str, ref: str) -> dict[str, str]:
+def _fetch_rules(provider: GitProvider, repo_full_name: str, ref: str,
+                 on_fetch_failed: Callable[[], None] | None = None) -> dict[str, str]:
     """Read ``*.md`` files from ``RULES_DIR`` at ``ref``, return
     ``{path: contents}`` sorted by path.
 
     Best-effort: a missing directory, listing error, or individual
     fetch failure returns an empty/partial map rather than raising —
-    the review must proceed regardless.
+    the review must proceed regardless. A listing error or a rule file
+    that can't be read fires ``on_fetch_failed``, so the caller can keep
+    the review from approving on rules it never saw (audit 09-27 #12); a
+    missing directory or file doesn't.
     """
     if not RULES_DIR:
         return {}
@@ -4607,6 +4802,8 @@ def _fetch_rules(provider: GitProvider, repo_full_name: str, ref: str) -> dict[s
         # (auth, transport) the operator should see.
         logger.warning("Could not list %s at %s (review proceeds without rule context): %s",
                        RULES_DIR, ref[:8], e)
+        if on_fetch_failed is not None:
+            on_fetch_failed()
         return {}
     if not entries:
         return {}
@@ -4625,6 +4822,8 @@ def _fetch_rules(provider: GitProvider, repo_full_name: str, ref: str) -> dict[s
             # operational failure on a single rule file. Other rules
             # still get processed; warn so operator sees the gap.
             logger.warning("Could not fetch rule file %s: %s", path, e)
+            if on_fetch_failed is not None:
+                on_fetch_failed()
     if rules:
         logger.info("Loaded %d rule file(s) from %s for %s", len(rules), RULES_DIR, repo_full_name)
     return rules
@@ -4633,6 +4832,7 @@ def _fetch_rules(provider: GitProvider, repo_full_name: str, ref: str) -> dict[s
 def _fetch_prompt_override(provider: GitProvider, repo_full_name: str,
                             ref: str, name: str,
                             on_legacy_path: Callable[[str], None] | None = None,
+                            on_fetch_failed: Callable[[], None] | None = None,
                             ) -> str | None:
     """Fetch a per-repo prompt override from ``{CONFIG_DIR}/prompts/{name}.md``,
     falling back to the legacy ``{RULES_DIR}/raven/prompts/{name}.md``.
@@ -4647,10 +4847,16 @@ def _fetch_prompt_override(provider: GitProvider, repo_full_name: str,
 
     ``on_legacy_path`` — see ``_fetch_repo_config_file``. Optional and
     keyword-friendly so every existing call site is unaffected.
+
+    ``on_fetch_failed`` fires when either path couldn't be read: ``None``
+    then means "unknown", not "no override", and a caller deciding an
+    approve or a merge must not treat the two alike (audit 09-27 #12).
     """
     relpath = f"prompts/{name}.md"
     result = _fetch_repo_config_file(provider, repo_full_name, ref, relpath,
                                      on_legacy_path=on_legacy_path)
+    if result.fetch_failed and on_fetch_failed is not None:
+        on_fetch_failed()
     if not result.content:
         return None
     logger.info("Loaded %s prompt override for %s", name, repo_full_name)
@@ -4661,6 +4867,7 @@ def _fetch_severity_scale(provider: GitProvider, repo_full_name: str,
                           ref: str,
                           on_fetch_failed: Callable[[], None] | None = None,
                           on_legacy_path: Callable[[str], None] | None = None,
+                          on_invalid: Callable[[], None] | None = None,
                           ) -> SeverityScale:
     """Load ``{CONFIG_DIR}/severities.json`` at ``ref``, falling back to
     the legacy ``{RULES_DIR}/raven/severities.json``.
@@ -4690,6 +4897,11 @@ def _fetch_severity_scale(provider: GitProvider, repo_full_name: str,
 
     ``on_legacy_path`` — see ``_fetch_repo_config_file``.
 
+    ``on_invalid`` fires for a file that is present but invalid. The
+    review still runs under the default scale, but the repo meant a
+    different one, so the caller keeps it from approving or merging
+    (audit 09-27 #12).
+
     A read failure on EITHER path fires ``on_fetch_failed``, even when the
     other path yielded a usable scale: an unreadable ``{CONFIG_DIR}``
     file may be a scale stricter than whatever we managed to fall back
@@ -4715,6 +4927,8 @@ def _fetch_severity_scale(provider: GitProvider, repo_full_name: str,
         logger.warning("Invalid %s in %s — using the default severity scale: %s",
                        path, repo_full_name, e)
         inc("raven_severity_scale_invalid_total", {"repo": repo_full_name})
+        if on_invalid is not None:
+            on_invalid()
         return default_scale()
 
     logger.info("Using repo severity scale for %s: %s (blocks at %s)",
@@ -4732,41 +4946,37 @@ def _notify_if_needed(repo_full_name: str, pr_number: int, pr_title: str, pr_url
 def _max_severity_from_findings(findings: list[dict],
                                 scale: SeverityScale | None = None) -> str:
     """Highest severity name among findings; the scale's least severe tier
-    when the list is empty or no severity is recognised.
+    when the list is empty.
 
-    Deliberately NOT scale.normalize() — same reasoning as
-    reviewer._cap_findings, reviewer._recompute_severity, and the
-    carried-candidates cap above. normalize() fails CLOSED (unknown ->
-    most severe) for model-emitted severities; this helper reproduces the
-    pre-scale ``SEVERITY_ORDER.get(f.get("severity", "low"), 0)``
-    behaviour, where an unrecognised or missing severity ranked LOWEST.
-    Changing that direction is a Phase B decision, not a side effect of
-    the refactor.
-
-    One deliberate exception to matching the old behaviour byte-for-byte:
-    names are stripped and lowercased before lookup (matching
-    ``reviewer._validate_review`` post-#211), so a whitespace/case
-    variant of a known name (e.g. ``"  HIGH  "``) still resolves to that
-    tier instead of being treated as unknown. The old un-normalized
-    ``SEVERITY_ORDER.get(name, 0)`` lookup would have ranked
-    ``"  HIGH  "`` as unknown (lowest) purely because of formatting noise
-    — reproducing that here would reintroduce the exact whitespace bug
-    #211 fixed.
+    Each name goes through ``scale.rank()``, which reads a name the scale
+    doesn't know (or a missing one) as its MOST severe tier, as
+    ``scale.normalize()`` does for model-emitted severities. That was the
+    deferred "Phase B decision": an unrecognised severity used to rank
+    lowest, so a finding cached under another scale could let a review
+    approve (audit 09-27 #8). Names are stripped and lowercased before
+    lookup, as ``reviewer._validate_review`` does (#211).
     """
     scale = scale or default_scale()
     if not findings:
         return scale.least_severe
     least_rank = scale.ranks[scale.least_severe]
-    best = max(
-        (scale.ranks.get(
-            str(f.get("severity", "") or "").strip().lower(), least_rank)
-         for f in findings),
-        default=least_rank,
-    )
+    best = max((scale.rank(f.get("severity", "")) for f in findings), default=least_rank)
     for name, rank in scale.ranks.items():
         if rank == best:
             return name
     return scale.least_severe
+
+
+def _policy_unusable_lines(review: dict) -> list[str]:
+    """Why a review that would otherwise approve can't: repo policy this
+    pass couldn't read or validate (audit 09-27 #12). The labels are
+    static (set by ``_process_pr``), never an exception's text."""
+    labels = review.get("policy_unusable") or []
+    if not labels or not isinstance(labels, list):
+        return []
+    return [f"⚠️ **Repository policy unavailable:** Raven couldn't read or "
+            f"validate {', '.join(labels)} at the base branch, so this review "
+            f"can't approve or auto-merge. Re-trigger the review once that's fixed."]
 
 
 def _legacy_config_path_lines(review: dict) -> list[str]:
@@ -4875,7 +5085,8 @@ def _review_footer() -> str:
     """The provenance line that closes every review body Raven composes:
     the full summary, and inline mode's short body whenever one is posted."""
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    return f"*Reviewed by Raven · {RAVEN_AI_MODEL} · effort {RAVEN_AI_EFFORT} · {timestamp}*"
+    return (f"*Reviewed by Raven v{__version__} · {RAVEN_AI_MODEL} · "
+            f"effort {RAVEN_AI_EFFORT} · {timestamp}*")
 
 
 def _format_comment(review: dict, mode: str = "review",
@@ -4929,6 +5140,11 @@ def _format_comment(review: dict, mode: str = "review",
     if legacy_lines:
         lines.append("")
         lines.extend(legacy_lines)
+
+    policy_lines = _policy_unusable_lines(review)
+    if policy_lines:
+        lines.append("")
+        lines.extend(policy_lines)
 
     if findings:
         lines.append("")
@@ -4998,7 +5214,9 @@ def _format_inline_leftovers(findings: list[dict],
     scale = scale or default_scale()
     mismatch_lines = _severity_mismatch_lines(review) if review else []
     legacy_lines = _legacy_config_path_lines(review) if review else []
-    if not findings and not on_threads and not mismatch_lines and not legacy_lines:
+    policy_lines = _policy_unusable_lines(review) if review else []
+    if (not findings and not on_threads and not mismatch_lines and not legacy_lines
+            and not policy_lines):
         return ""
     lines = ["🦅 **Raven**"]
     for heading, group in (("Findings without an inline location:", findings),
@@ -5019,6 +5237,9 @@ def _format_inline_leftovers(findings: list[dict],
     if legacy_lines:
         lines.append("")
         lines.extend(legacy_lines)
+    if policy_lines:
+        lines.append("")
+        lines.extend(policy_lines)
     lines.append("")
     lines.append(_review_footer())
     return "\n".join(lines)

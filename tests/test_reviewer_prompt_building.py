@@ -2645,3 +2645,36 @@ class TestStrippedFilesSection:
         prompts = [c.args[0] for c in fake.complete.call_args_list]
         assert len(prompts) == 2
         assert all('type="stripped_files"' in p for p in prompts)
+
+
+class TestCutLineNote:
+    """Raven's review of BB PR #7: the cut-line marker is explained the way
+    the ⟨U+XXXX⟩ markers are, and only for the files whose header says
+    Bitbucket cut lines, since an author can type the marker anywhere."""
+
+    NOTE = "Bitbucket cut lines longer than its limit"
+    CUT = ("diff --git a/d.json b/d.json\ntruncated lines 1\n--- a/d.json\n+++ b/d.json\n"
+           "@@ -1 +1 @@\n-{}\n+{\"blob\": \"aaa ⟨…line cut by Bitbucket⟩\n")
+    TEXT = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n+x\n"
+    DIFF = TEXT
+
+    _review_prompt = TestHiddenLineBreakMarkers._review_prompt
+    _respond_prompt = TestHiddenLineBreakMarkers._respond_prompt
+
+    def test_review_note_names_the_cut_file(self):
+        prompt = self._review_prompt(diff=self.TEXT + self.CUT)
+        [line] = [l for l in prompt.split("\n") if self.NOTE in l]
+        assert "`d.json`" in line and "a.py" not in line
+
+    def test_no_note_for_a_typed_marker(self):
+        typed = self.TEXT.replace("+x\n", "+x ⟨…line cut by Bitbucket⟩\n")
+        assert self.NOTE not in self._review_prompt(diff=typed)
+
+    def test_respond_note_names_the_cut_file(self, monkeypatch):
+        prompt = self._respond_prompt(monkeypatch, diff=self.TEXT + self.CUT)
+        assert self.NOTE in prompt and "`d.json`" in prompt
+
+    def test_note_quotes_the_providers_marker(self):
+        from raven.providers.bitbucket_dc import _CUT_LINE_MARKER
+        from raven.reviewer import _cut_lines_note
+        assert f"`{_CUT_LINE_MARKER}`" in _cut_lines_note(self.CUT)

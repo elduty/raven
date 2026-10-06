@@ -2,6 +2,43 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## v0.7.2 — 2026-10-06
+
+Approvals and cached reviews now follow the policy and the exact commit they were judged under, and Bitbucket PRs with long lines or binary-only changes are handled. **Upgrade recommended**, above all on Bitbucket Data Center. Upgrading wipes the findings cache once (see Upgrading).
+
+### Fixed
+
+- **A Bitbucket PR with very long lines is reviewed instead of refused.** Bitbucket cuts any diff line over its length limit, and Raven used to refuse the whole PR when it did, posting "📐 The diff is too large" on every push. Now the rest of the PR is reviewed, and each file with a cut line is marked as not fully shown: it blocks approve and auto-merge until a human reviews it. A diff Bitbucket truncates above the line level is still refused.
+- A comment reply on a PR whose diff Raven refused now gets the same actionable notice as the review, instead of a generic internal-error message.
+- Diff file names are parsed more strictly, and a file replaced by a symlink is reviewed and tracked as one change.
+- A comment-driven approval is now decided by Raven: it stands only when the findings left after the discussion don't block under the repo's severity scale, and only when that scale could be read. The model's reply alone no longer approves.
+- **On Bitbucket, a push that changes only a file's binary content or its mode now counts as a change.** Raven reads each file's content id and mode alongside the diff, so such a push is no longer taken for the reviewed head. A mode change (such as a script made executable) is shown to the model: before, a mode-only change was marked as not fully shown and blocked approval, and a rename that flipped the mode showed as a plain rename. If Bitbucket's list of changed files can't be matched to the diff, Raven refuses the review with a notice saying so (🔗).
+- **A cached review is tied to the policy it was judged under.** If a PR's base branch, `CLAUDE.md`, review rules, severity scale or prompt override has changed since its last review, the next trigger reviews the whole PR again instead of reusing or extending the old verdict. A finding whose severity the current scale doesn't recognise now counts as the most severe, not the least.
+- **Repository policy Raven can't read or validate blocks approval.** If `CLAUDE.md`, the review rules, a prompt override or `severities.json` can't be read at the base branch, or `severities.json` is invalid, the review still posts and says what it couldn't read, but it can't approve or auto-merge. Before, only an unreadable `severities.json` blocked. On Bitbucket, a policy file served as binary, with a line cut for length, or too long to read whole no longer reads as absent or cut short, and a failed listing of the rules directory no longer reads as "no rules" on either platform.
+- On Bitbucket, a reply Raven writes to a thread someone resolved in the meantime is dropped quietly, instead of being logged as an internal error with a failed error reply.
+
+### Added
+
+- Metrics: `raven_config_change_full_reviews_total{repo}` and `raven_comment_replies_skipped_total{reason}`; new `reason` values on `raven_comment_mutations_skipped_total` (`blocking_findings_remain`, `scale_fetch_failed`, `policy_unusable`, `policy_changed`) and on `raven_review_failures_total` (`diff_identity_unverified`).
+
+### Changed
+
+- **The review footer names Raven's version:** `Reviewed by Raven vX.Y.Z · model · effort · time`. A build from main between releases shows the last release's version plus `+dev` (`v0.7.2+dev`).
+- **Inline mode:** a clean review's one-line comment is now just `✅ NO ISSUES` and the footer. The model's summary sentence only repeated the headline. A review that blocks, or that rates a severity without listing findings, keeps its sentence to say why.
+
+### Upgrading
+
+- Upgrading wipes the findings cache once.
+- On Bitbucket Data Center, Raven reads each PR's `/changes` alongside its diff: one more API call per diff fetch, with the same read access.
+
+### Corrections to earlier notes
+
+- v0.6.0 said the no-changes skip "only fires for a byte-identical head". That holds from v0.7.0 on git (before, its hashes left out stripped lockfiles and binaries) and from v0.7.2 on Bitbucket Data Center (before, they left out binary content and file modes).
+
+### Stats
+
+1998 tests across 22 test files (up from 1847 at v0.7.1).
+
 ## v0.7.1 — 2026-10-01
 
 Review threads stop multiplying, and a security fix for Bitbucket Data Center. **Upgrade recommended**, above all on Bitbucket Data Center. Upgrading wipes the findings cache once (see Upgrading).
@@ -190,7 +227,7 @@ Feature release. A repository can now define its own severity vocabulary instead
 
 ### Unchanged on purpose
 
-Auto-merge is not widened by the above. The no-changes skip — the path that can send a cached approval straight to a merge with no fresh review — still compares raw chunk hashes, so it only fires for a byte-identical head. A push that only rebases reviews nothing and merges nothing; the next real push takes the incremental path as usual.
+Auto-merge is not widened by the above. The no-changes skip — the path that can send a cached approval straight to a merge with no fresh review — still compares raw chunk hashes, so it only fires for a byte-identical head (corrected under v0.7.2). A push that only rebases reviews nothing and merges nothing; the next real push takes the incremental path as usual.
 
 ### Upgrading
 

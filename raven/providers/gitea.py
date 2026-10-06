@@ -758,22 +758,19 @@ class GiteaProvider(GitProvider):
     def list_directory(self, repo_full_name: str, path: str, ref: str = "HEAD") -> list[str]:
         """List regular files directly under ``path`` at ``ref`` (flat).
 
-        Returns [] for missing directories (404) and any other API error
-        so a missing ``.claude/rules/`` degrades gracefully rather than
-        blocking the review.
+        Returns [] for a missing directory (404), so a repo without
+        ``.claude/rules/`` reviews normally, and raises on any other API
+        error: the caller fails closed rather than read it as "no rules"
+        (audit 09-27 #12).
         """
         owner, repo = _split_repo(repo_full_name)
         encoded_path = quote(path, safe="/")
         url = f"{self.base_url}/api/v1/repos/{owner}/{repo}/contents/{encoded_path}"
-        try:
-            resp = self.session.get(url, params={"ref": ref}, timeout=15)
-            if resp.status_code == 404:
-                return []
-            resp.raise_for_status()
-            entries = resp.json()
-        except Exception as e:
-            logger.warning("Failed to list %s@%s: %s", path, ref, e)
+        resp = self.session.get(url, params={"ref": ref}, timeout=15)
+        if resp.status_code == 404:
             return []
+        resp.raise_for_status()
+        entries = resp.json()
         if not isinstance(entries, list):
             # Gitea returns an object (not a list) when ``path`` is a file,
             # not a directory. Treat that as "no directory here".

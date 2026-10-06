@@ -289,6 +289,30 @@ def _hidden_line_break_note(*sections: str) -> str:
     return ""
 
 
+_CUT_LINE_NOTE = (
+    "Bitbucket cut lines longer than its limit in {files}: each such line "
+    "ends with `{marker}`, and the rest of it was not shown. Don't treat the "
+    "cut itself as a defect (a string or bracket that looks unclosed there): "
+    "Raven already marks those files as not fully shown. In any other file "
+    "the marker is ordinary text.\n\n"
+)
+# The BB DC synthesizer's marker (providers/bitbucket_dc.py), restated
+# here so the reviewer doesn't import a provider; a test pins the two.
+_CUT_LINE_MARKER_TEXT = " ⟨…line cut by Bitbucket⟩"
+
+
+def _cut_lines_note(diff: str) -> str:
+    """The note explaining the cut-line marker, naming the files whose
+    header says Bitbucket cut lines (``strip_diff``'s ``cut_gaps``). Only
+    there does the marker mean a cut: an author can type it anywhere."""
+    files = strip_diff(diff).cut_gaps if diff else []
+    if not files:
+        return ""
+    return _CUT_LINE_NOTE.format(
+        files=", ".join(f"`{_path_label(f)}`" for f in files),
+        marker=_CUT_LINE_MARKER_TEXT)
+
+
 def _wrap_untrusted(kind: str, body: str, tag_id: str) -> str:
     """Wrap user-controlled content in randomised <untrusted_input> tags.
 
@@ -339,13 +363,17 @@ def _path_has_control_char(path: str) -> bool:
 def _is_deletion_chunk(chunk: str) -> bool:
     """True for a file-diff chunk that deletes its file. A deletion keeps
     the old name on both sides of its header and adds no code, so a
-    control character in that name is no reason to hold the review."""
-    for line in chunk.split("\n"):
-        if line.startswith("@@"):
-            return False
-        if line.startswith("deleted file mode") or line == "+++ /dev/null":
-            return True
-    return False
+    control character in that name is no reason to hold the review. A
+    chunk holding several sections (a typechange deletes the path and
+    creates it again) deletes its file only if every section does."""
+    def deletes(section: str) -> bool:
+        for line in section.split("\n"):
+            if line.startswith("@@"):
+                return False
+            if line.startswith("deleted file mode") or line == "+++ /dev/null":
+                return True
+        return False
+    return all(deletes(s) for s in _diff_sections(chunk))
 
 
 def _json_escape(c: str) -> str:
@@ -965,6 +993,12 @@ SKIP_SUFFIX_PATTERNS = [".lock"]
 
 _DIFF_HEADER_PREFIX = "diff --git "
 
+# The header line the BB DC synthesizer writes for a file whose diff had
+# lines cut for length (providers/bitbucket_dc.py). Only a whole header
+# line counts: a content line is prefixed, and a path is inside the
+# ``diff --git`` line.
+_CUT_LINES_RE = re.compile(r"truncated lines [0-9]+")
+
 # How many stripped paths the review prompt names ("Changed but not
 # shown"); the rest are counted.
 _MAX_STRIPPED_LISTED = 50
@@ -1009,6 +1043,15 @@ def _unquote_git_path(body: str) -> str:
 def _strip_side_prefix(path: str) -> str:
     """Drop a leading ``a/`` or ``b/`` diff-side prefix, if present."""
     return path[2:] if path.startswith(("a/", "b/")) else path
+
+
+def _without_newline(line: str) -> str:
+    """``line`` minus its ``\\n``. Diff text splits on ``\\n`` only, so
+    everything before it, a ``\\r`` or a trailing space included, belongs
+    to the line, and to any path on it: stripping more gave two files
+    whose names differ only there one key, so the per-file hashes and the
+    model's view kept only one of them."""
+    return line[:-1] if line.endswith("\n") else line
 
 
 def _parse_diff_header_path(line: str) -> str:
@@ -1060,7 +1103,7 @@ def _parse_diff_header_path(line: str) -> str:
     Returns the path WITHOUT its ``b/`` prefix.
     """
     rest = line[len(_DIFF_HEADER_PREFIX):] if line.startswith(_DIFF_HEADER_PREFIX) else line
-    rest = rest.strip()
+    rest = _without_newline(rest)
 
     # 1. Neither side quoted — same-path split point (see docstring for
     #    why this precedes the quoted branches).
@@ -1080,12 +1123,20 @@ def _parse_diff_header_path(line: str) -> str:
     if rest.startswith('"'):
         leading = re.match(r'"(?:[^"\\]|\\.)*"', rest)
         if leading:
-            remainder = rest[leading.end():].strip()
+            remainder = rest[leading.end():]
+            remainder = remainder[1:] if remainder.startswith(" ") else remainder
             if remainder:
                 return _strip_side_prefix(remainder)
 
-    # 4. Unquoted rename (or malformed) — historical behaviour.
-    return _strip_side_prefix(rest.split(" ")[-1].strip())
+    # 4. Unquoted rename (or malformed) — historical behaviour: the last
+    #    token. A b-side ending in a space leaves that token empty, so take
+    #    what follows the last " b/" instead; and never return an empty
+    #    path, since split_diff_by_file drops a section with no key.
+    last = rest.split(" ")[-1]
+    if not last:
+        idx = rest.rfind(" b/")
+        last = rest[idx + 1:] if idx != -1 else rest
+    return _strip_side_prefix(last) or rest
 
 
 _RENAME_TO_PREFIX = "rename to "
@@ -1146,13 +1197,16 @@ def _side_path(lines: list[str], header_index: int, marker: str,
     side prefix removed, or ``None`` (``/dev/null``, or no such line before
     the first hunk)."""
     for line in lines[header_index + 1: header_index + 1 + lookahead]:
-        stripped = line.rstrip("\r\n")
+        stripped = _without_newline(line)
         if stripped.startswith((_DIFF_HEADER_PREFIX, "@@ ")):
             break
         if stripped.startswith(marker):
-            # Git ends the line with a tab when the path has a space; an
-            # unquoted path can't end in one (git would quote it).
-            path = stripped[len(marker):].rstrip("\t")
+            # Git ends the line with one tab when the path has a space, and
+            # only then; any other trailing tab is the name's own (git
+            # would quote it, BB DC writes it as-is).
+            path = stripped[len(marker):]
+            if path.endswith("\t") and " " in path[:-1]:
+                path = path[:-1]
             if path == "/dev/null":
                 return None
             if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
@@ -1164,11 +1218,11 @@ def _side_path(lines: list[str], header_index: int, marker: str,
 def _rename_field(lines: list[str], header_index: int, prefix: str,
                   lookahead: int) -> str | None:
     for line in lines[header_index + 1: header_index + 1 + lookahead]:
-        stripped = line.rstrip("\r\n")
+        stripped = _without_newline(line)
         if stripped.startswith((_DIFF_HEADER_PREFIX, "--- ", "@@ ")):
             break
         if stripped.startswith(prefix):
-            path = stripped[len(prefix):].strip()
+            path = stripped[len(prefix):]
             if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
                 path = _unquote_git_path(path[1:-1])
             return path or None
@@ -1215,6 +1269,9 @@ class StripResult(NamedTuple):
                              # on both sides with no hunk and no binary
                              # marker: something changed that the diff
                              # doesn't show, so they are a coverage gap too
+    cut_gaps: list[str]     # paths whose header says Bitbucket cut lines
+                            # for length: the section is kept, but part of
+                            # it was not shown, so they are a coverage gap
 
 
 def _is_lockfile_name(path: str) -> bool:
@@ -1262,12 +1319,17 @@ def strip_diff(diff: str) -> StripResult:
     Deletion is read from the ``deleted file mode`` header line, not from
     the marker line, which carries the author's path unquoted: a file at
     ``lib and /dev/null`` ends its marker the way a deletion does.
+
+    A ``truncated lines <n>`` header line means Bitbucket cut some of the
+    section's lines for length. The section is kept and reported in
+    ``cut_gaps`` unless it deletes the file, for the same reason.
     """
     lines = _diff_lines(diff, keepends=True)
     output: list[str] = []
     stripped: list[str] = []
     gaps: list[str] = []
     binary_gaps: list[str] = []
+    cut_gaps: list[str] = []
     skip = False
     filename = ""
     in_hunks = False
@@ -1305,6 +1367,11 @@ def strip_diff(diff: str) -> StripResult:
                 output.append(line)
                 if not deleted and filename not in binary_gaps:
                     binary_gaps.append(filename)
+        elif not in_hunks and _CUT_LINES_RE.fullmatch(line.rstrip("\r\n")):
+            if not skip:
+                output.append(line)
+                if not deleted and filename not in cut_gaps:
+                    cut_gaps.append(filename)
         else:
             if line.startswith("@@"):
                 in_hunks = True
@@ -1316,7 +1383,16 @@ def strip_diff(diff: str) -> StripResult:
     clean = "".join(output)
     unshown_gaps = [fn for fn, chunk in split_diff_by_file(clean)
                     if _is_unshown_change(chunk)]
-    return StripResult(clean, stripped, gaps, binary_gaps, unshown_gaps)
+    return StripResult(clean, stripped, gaps, binary_gaps, unshown_gaps,
+                       cut_gaps)
+
+
+def _names_two_contents(line: str) -> bool:
+    """An ``index <from>..<to>`` header line whose two content ids differ."""
+    if not line.startswith("index "):
+        return False
+    ids = line[len("index "):].split(maxsplit=1)[0].split("..")
+    return len(ids) == 2 and ids[0] != ids[1]
 
 
 def _is_unshown_change(chunk: str) -> bool:
@@ -1326,14 +1402,24 @@ def _is_unshown_change(chunk: str) -> bool:
     have no ``---``/``+++`` lines); BB DC's synthesized diff can (audit
     09-27 #2b; decided 2026-10-01 to fail closed). Only the same-path shape
     counts here: new and deleted files, renames and binary sections are
-    left to the other rules."""
-    lines = _diff_lines(chunk, keepends=True)
-    if any(line.startswith(("@@", "Binary files")) for line in lines):
-        return False
-    # The whole section is header (it has no hunk), so scan all of it
-    # rather than _side_path's default window.
-    old = _side_path(lines, 0, "--- ", lookahead=len(lines))
-    return old is not None and old == _side_path(lines, 0, "+++ ", lookahead=len(lines))
+    left to the other rules. Any such section of a chunk counts."""
+    for section in _diff_sections(chunk):
+        lines = _diff_lines(section, keepends=True)
+        # A hunk or a binary marker is something the model is shown.
+        if any(line.startswith(("@@", "Binary files")) for line in lines):
+            continue
+        # So is a mode change (BB DC writes git's mode lines from /changes,
+        # 09-27 #2b), but only when it is the whole change: an index line
+        # naming two contents means the content changed too, unseen.
+        if (any(line.startswith(("old mode ", "new mode ")) for line in lines)
+                and not any(_names_two_contents(line) for line in lines)):
+            continue
+        # The whole section is header (it has no hunk), so scan all of it
+        # rather than _side_path's default window.
+        old = _side_path(lines, 0, "--- ", lookahead=len(lines))
+        if old is not None and old == _side_path(lines, 0, "+++ ", lookahead=len(lines)):
+            return True
+    return False
 
 
 def _strip_lockfiles_and_binaries(diff: str) -> str:
@@ -1351,6 +1437,14 @@ def split_diff_by_file(diff: str) -> list[tuple[str, str]]:
     leading newline or git-format-patch metadata) are appended to
     ``current_lines`` but never emitted, since the final flush guards
     on ``current_file`` being set.
+
+    A path that heads several sections gets one entry holding all of
+    them, in order: git writes a typechange (a file turned into a
+    symlink) as a deletion and a creation of one path, and every caller
+    keys a dict by path, so a second entry would replace the first and
+    drop that section from the hashes and from the model's view. Code
+    that reads a chunk's structure goes section by section
+    (``_diff_sections``).
     """
     chunks: list[tuple[str, str]] = []
     current_file = None
@@ -1373,7 +1467,22 @@ def split_diff_by_file(diff: str) -> list[tuple[str, str]]:
     if current_file and current_lines:
         chunks.append((current_file, "".join(current_lines)))
 
-    return chunks
+    joined: dict[str, str] = {}
+    for path, chunk in chunks:
+        joined[path] = joined.get(path, "") + chunk
+    return list(joined.items())
+
+
+def _diff_sections(chunk: str) -> list[str]:
+    """The ``diff --git`` sections of a chunk, which holds more than one
+    when its path heads several (``split_diff_by_file``)."""
+    sections: list[str] = []
+    for line in _diff_lines(chunk, keepends=True):
+        if line.startswith(_DIFF_HEADER_PREFIX) or not sections:
+            sections.append(line)
+        else:
+            sections[-1] += line
+    return sections
 
 
 # Bump when the normalization below changes shape — it feeds
@@ -1404,7 +1513,7 @@ DIFF_HASH_SCHEME = "v3-authored-headers-body-digest"
 # accepts an identical edit from both sides), and the second deploy would
 # then not wipe anything; distinct tokens make concurrent bumps conflict.
 # The server.py trigger sites carry a one-line pointer back here.
-_VERDICT_LOGIC_VERSION = "2026-10-01-bbdc-binary-marker"
+_VERDICT_LOGIC_VERSION = "2026-10-02-bbdc-content-identity"
 
 _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
@@ -1440,17 +1549,22 @@ def diff_hash_content(chunk: str) -> str:
     approve may only skip straight to a merge when nothing at all moved.
     """
     kept: list[str] = []
-    seen_hunk = False
+    seen_hunk = False   # in the current section
+    any_hunk = False    # in the whole chunk
     for line in _diff_lines(chunk):
+        if line.startswith(_DIFF_HEADER_PREFIX):
+            # A chunk can hold several sections of one path
+            # (split_diff_by_file); each has its own header region.
+            seen_hunk = False
         if line.startswith("@@"):
-            seen_hunk = True
+            seen_hunk = any_hunk = True
             continue
         if not seen_hunk:
             if not line.startswith(_REBASE_HEADER_PREFIXES):
                 kept.append(line)
         elif line[:1] in ("+", "-", "\\"):
             kept.append(line)
-    if not seen_hunk:
+    if not any_hunk:
         # No hunks at all — a pure mode change, a pure rename, or a diff
         # shape we don't model. "Just the +/- lines" is the empty string
         # for every such chunk, which would make them all compare equal
@@ -1646,6 +1760,10 @@ def review_diff(diff: str, repo_name: str, claude_md: str = "",
         parse_gaps.setdefault(fn, (
             f"`{_path_label(fn)}` changed in a way the diff doesn't show, so the "
             "change was not seen — review it by hand"))
+    for fn in stripped.cut_gaps:
+        parse_gaps.setdefault(fn, (
+            f"`{_path_label(fn)}` has lines longer than Bitbucket's limit; they "
+            "were cut, so part of the file was not shown — review it by hand"))
 
     # A path that can end a line is a coverage gap (audit 09-27 #9).
     # _path_label keeps such a name from injecting prompt text, but the
@@ -2397,6 +2515,7 @@ def _review_single_chunk(diff: str, repo_name: str, claude_md: str = "", filenam
     # The note sits before the diff, which precedes the file contents.
     diff_section = ("## Diff to Review\n\n"
                     + _hidden_line_break_note(diff, *(file_contents or {}).values())
+                    + _cut_lines_note(diff)
                     + _wrap_untrusted("pr_diff", _visible_line_breaks(diff), tag_id))
 
     # Incremental carry-forward re-validation. Findings from a previous
@@ -2780,8 +2899,11 @@ def _recompute_severity(findings: list[dict],
     or none recognised).
 
     Deliberately NOT scale.normalize() — same reasoning as
-    ``_cap_findings``, ``server._max_severity_from_findings``, and the
-    carried-candidates cap in ``server._process_pr``. ``normalize()``
+    ``_cap_findings`` and the carried-candidates cap in
+    ``server._process_pr``; the findings here are the model's, already
+    normalized by ``_validate_review``. (``server._max_severity_from_findings``,
+    which also sees cached findings, fails closed since audit 09-27 #8.)
+    ``normalize()``
     fails CLOSED (unknown -> most severe) for model-emitted severities;
     this reproduces the pre-scale
     ``SEVERITY_ORDER.get(f.get("severity", "low"), 0)`` behaviour, where
@@ -3456,7 +3578,8 @@ def respond_to_comment(comment_body: str, conversation: list[dict], diff: str,
         f"{verdict_section}{thread_section}\n\n"
         f"{effective_template}\n"
         f"{_RESPOND_JSON_SUFFIX}\n\n"
-        f"## PR Diff\n\n" + _wrap_untrusted("pr_diff", _visible_line_breaks(diff), tag_id) + "\n\n"
+        f"## PR Diff\n\n" + _cut_lines_note(diff)
+        + _wrap_untrusted("pr_diff", _visible_line_breaks(diff), tag_id) + "\n\n"
         f"## Other PR Conversation\n\n"
         + _wrap_untrusted("conversation", conv_text, tag_id) + "\n\n"
         f"## Comment to respond to\n\n"

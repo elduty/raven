@@ -38,6 +38,48 @@ class DiffUnverifiableError(DiffTruncatedError):
     """
 
 
+class DiffIdentityUnverifiableError(DiffUnverifiableError):
+    """The diff is complete, but a changed file's content identity can't be
+    read: Bitbucket DC's ``/changes`` lacks the file, or names no head
+    commit to match the diff's against. Without it a later push could
+    change the file and leave the merge-gate identity unchanged, so the
+    diff is refused like an unverifiable one; ``server.py`` gives it its
+    own notice (``diff_identity_unverified``), since neither "split the
+    PR" nor "serve the diff as JSON" applies."""
+
+
+class DiffHeadMismatchError(RuntimeError):
+    """Two reads of one PR's diff described different heads: Bitbucket
+    DC's ``/diff`` and its ``/changes`` (content ids and modes) came from
+    either side of a push, even after the pair was read again. Merging
+    them would pair one commit's text with another's identity, so the diff
+    is refused; ``server.py`` classifies it with the head-binding failures
+    (``diff_head_unverified``)."""
+
+
+class IncompleteFileError(RuntimeError):
+    """A provider couldn't return a file whole.
+
+    Bitbucket DC's browse endpoint answers a binary file with
+    ``{"binary": true}`` and no lines, and pages a long one; returning ""
+    or the first pages would read a policy file (``CLAUDE.md``, a rule,
+    ``severities.json``) as absent or cut short. Raised instead, so a
+    caller that depends on the whole file fails closed (audit 09-27 #12).
+    """
+
+
+class ThreadResolvedError(RuntimeError):
+    """The platform refused a reply because its thread was resolved first.
+
+    Bitbucket DC rejects any reply to a resolved thread (a 400, "Reply
+    cannot be made to resolved thread."), and a person can resolve the
+    thread while Raven is still writing its answer: nova PR #13 had each
+    thread replied to and resolved within a second, before Raven replied.
+    Whoever resolved it closed the conversation, so the comment flow skips
+    the reply instead of treating it as a crash.
+    """
+
+
 class GitProvider(ABC):
     """Abstract interface for git platform operations."""
 
@@ -84,9 +126,10 @@ class GitProvider(ABC):
 
         Default returns ``[]`` — providers that don't implement it
         simply disable the rules feature gracefully. Real implementations
-        must be tolerant: any API failure (404, auth, transport) should
-        return ``[]`` rather than raise, since a missing directory is
-        the common case and must not block the review.
+        return ``[]`` for a missing directory (404), the common case, and
+        RAISE on any other failure (auth, transport, 5xx): the caller then
+        keeps the review from approving on rules it never saw (audit 09-27
+        #12). Returning ``[]`` for those read a failed listing as "no rules".
         """
         return []
 

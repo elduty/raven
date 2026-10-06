@@ -126,11 +126,16 @@ class SeverityScale:
         claims there are no issues either. Display only: the gate still
         reads the severity itself.
         """
-        if (not blocking and not self.blocks(severity)
-                and isinstance(findings, list) and not findings
-                and self.normalize(severity) == self.least_severe):
+        if self.no_issues(severity, findings, blocking):
             return "✅", "NO ISSUES"
         return self.emoji(severity), str(severity).upper()
+
+    def no_issues(self, severity: str, findings: list | None,
+                  blocking: bool = False) -> bool:
+        """Whether ``badge`` reads ``✅ NO ISSUES`` (see there)."""
+        return (not blocking and not self.blocks(severity)
+                and isinstance(findings, list) and not findings
+                and self.normalize(severity) == self.least_severe)
 
     # ── identity ──────────────────────────────────────────────────── #
 
