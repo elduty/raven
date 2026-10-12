@@ -269,7 +269,7 @@ Raven submits formal reviews (APPROVED or REQUEST_CHANGES on Gitea, approve/need
 - 🔴 [high] `db.py:execute()` — user input concatenated directly into SQL string
 - 🟠 [medium] `auth.py:login()` — no rate limiting on failed attempts
 
-*Reviewed by Raven v0.7.2 · claude-opus-4-8 · effort max · 2026-03-22 00:41 UTC*
+*Reviewed by Raven v0.7.3 · claude-opus-4-8 · effort max · 2026-03-22 00:41 UTC*
 ```
 
 Each finding with a file and line number is also posted as an inline comment on the exact diff line.

@@ -4,4 +4,4 @@
 # CHANGELOG.md: the newest released version, plus "+dev" while the
 # Unreleased section lists changes. A release sets the new version; the
 # first change after it adds "+dev" again.
-__version__ = "0.7.2"
+__version__ = "0.7.3"

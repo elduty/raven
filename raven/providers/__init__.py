@@ -60,11 +60,12 @@ class DiffHeadMismatchError(RuntimeError):
 class IncompleteFileError(RuntimeError):
     """A provider couldn't return a file whole.
 
-    Bitbucket DC's browse endpoint answers a binary file with
-    ``{"binary": true}`` and no lines, and pages a long one; returning ""
-    or the first pages would read a policy file (``CLAUDE.md``, a rule,
-    ``severities.json``) as absent or cut short. Raised instead, so a
-    caller that depends on the whole file fails closed (audit 09-27 #12).
+    Bitbucket DC's ``fetch_file`` reads ``/raw``, which has no binary flag
+    and no paging, so it raises this for a binary file (git's test) and for
+    one past its byte cap; returning "" or a prefix would read a policy
+    file (``CLAUDE.md``, a rule, ``severities.json``) as absent or cut
+    short. Raised instead, so a caller that depends on the whole file fails
+    closed (audit 09-27 #12).
     """
 
 

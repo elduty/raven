@@ -2,6 +2,23 @@
 
 All notable changes to Raven are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; dates are UTC.
 
+## v0.7.3 — 2026-10-12
+
+On Bitbucket, a long line in a rule file or `CLAUDE.md` no longer makes the repo's policy unreadable. **Upgrade recommended** on Bitbucket Data Center; nothing changes on Gitea.
+
+### Fixed
+
+- **On Bitbucket, a policy file with a very long line no longer blocks approval.** Raven read files through a Bitbucket API that cuts every line over 5,000 characters, so a valid rule file or `CLAUDE.md` with one long paragraph counted as unreadable, and every review in that repo said "Repository policy unavailable". Raven now reads files as stored. A binary file, or one over 2 MiB, still counts as unreadable. Changed files attached to the review as context are read the same way, so a file with a long line is shown whole instead of being left out.
+
+### Upgrading
+
+- No cache wipe. On Bitbucket Data Center, an open PR whose last review couldn't read a rule file gets a full review the next time it's reviewed, because the rule now reads. Where `CLAUDE.md` or a rule file has no final newline, open PRs get one full review the same way: Raven now reads the file exactly as stored.
+- Raven reads files through Bitbucket's `/raw` endpoint instead of `/browse`, with the same read access.
+
+### Stats
+
+2006 tests across 22 test files (up from 1998 at v0.7.2).
+
 ## v0.7.2 — 2026-10-06
 
 Approvals and cached reviews now follow the policy and the exact commit they were judged under, and Bitbucket PRs with long lines or binary-only changes are handled. **Upgrade recommended**, above all on Bitbucket Data Center. Upgrading wipes the findings cache once (see Upgrading).

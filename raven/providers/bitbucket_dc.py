@@ -26,6 +26,15 @@ _ACTIVITIES_MAX_PAGES = 30
 # the section's "truncated lines <n>" header, which content can't write.
 _CUT_LINE_MARKER = " ⟨…line cut by Bitbucket⟩"
 
+# fetch_file reads /raw, which has no paging and no binary flag, so it caps
+# the read itself. 2 MiB is under what /browse let through before (500
+# context lines of up to 5,000 characters), so no file reaches the prompt
+# larger than it could then. Git calls a file binary for a NUL in its first
+# 8,000 bytes (buffer_is_binary), so a file the diff shows as text reads as
+# text.
+_MAX_FILE_BYTES = 2 * 1024 * 1024
+_GIT_BINARY_WINDOW = 8000
+
 
 def _count_replies(comment: dict) -> int:
     """Replies anywhere under a BB DC comment (its nested ``comments`` tree)."""
@@ -486,46 +495,34 @@ class BitbucketDCProvider(GitProvider):
     def fetch_file(self, repo_full_name: str, path: str, ref: str = "HEAD") -> str:
         """Return file contents, or empty string if not found.
 
-        BB DC browse endpoint returns JSON with a 'lines' array. A binary
-        file (``{"binary": true}``, no lines), a line cut for length
-        (``"truncated": true``) and a file past the page cap raise
-        ``IncompleteFileError`` instead of reading as absent or cut short
-        (audit 09-27 #12). An empty file is no lines, not binary.
+        Reads ``/raw``: the file's bytes as stored, decoded as UTF-8 with
+        replacement like Gitea's ``fetch_file``. ``/browse`` served lines
+        and cut any over 5,000 characters, so a valid policy file with one
+        long paragraph read as unusable. A binary file (git's test) and one
+        over ``_MAX_FILE_BYTES`` raise ``IncompleteFileError`` instead of
+        reading as absent or cut short (audit 09-27 #12).
         """
         project, repo = _split_repo(repo_full_name)
         # Quote the path so names with '#', '?', ' ', or other URL-sensitive
         # characters don't break routing or get mis-parsed as query strings.
         # safe='/' preserves directory separators.
         encoded_path = quote(path, safe="/")
-        url = f"{self.api_url}/projects/{project}/repos/{repo}/browse/{encoded_path}"
-        all_lines: list[str] = []
-        start = 0
-        max_pages = 20
-        for _ in range(max_pages):
-            resp = self.session.get(url, params={"at": ref, "start": start, "limit": 1000}, timeout=15)
+        url = f"{self.api_url}/projects/{project}/repos/{repo}/raw/{encoded_path}"
+        resp = self.session.get(url, params={"at": ref}, timeout=15, stream=True)
+        try:
             if resp.status_code == 404:
                 return ""
             resp.raise_for_status()
-            data = resp.json()
-            if data.get("binary"):
-                raise IncompleteFileError(f"{path} is a binary file")
-            for line in data.get("lines", []):
-                if line.get("truncated"):
-                    # Browse cuts a line over the server's length limit
-                    # and flags it (probed 2026-10-02).
-                    raise IncompleteFileError(f"{path} has a line cut for length")
-                all_lines.append(line.get("text", ""))
-            if data.get("isLastPage", True):
-                break
-            start = data.get("nextPageStart", start + 1000)
-        else:
-            raise IncompleteFileError(f"{path} runs past {max_pages} pages")
-        if not all_lines:
-            return ""
-        # Trailing newline for parity with Gitea's fetch_file (and common
-        # file conventions) so downstream line-count/offset logic doesn't
-        # undercount by one on the last line.
-        return "\n".join(all_lines) + "\n"
+            body = bytearray()
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                body += chunk
+                if len(body) > _MAX_FILE_BYTES:
+                    raise IncompleteFileError(f"{path} is over {_MAX_FILE_BYTES} bytes")
+        finally:
+            resp.close()
+        if b"\0" in body[:_GIT_BINARY_WINDOW]:
+            raise IncompleteFileError(f"{path} is a binary file")
+        return body.decode("utf-8", errors="replace")
 
     def list_directory(self, repo_full_name: str, path: str, ref: str = "HEAD") -> list[str]:
         """List regular files directly under ``path`` at ``ref`` (flat).

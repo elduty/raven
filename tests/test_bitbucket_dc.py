@@ -1052,30 +1052,87 @@ class TestFetchPrDiff:
 #  File fetching                                                      #
 # ------------------------------------------------------------------ #
 
+@contextlib.contextmanager
+def _mock_raw(client, body=b"", status=200):
+    """A streamed ``/raw`` response. ``iter_content`` serves ``body`` in the
+    requested chunk size and counts what it served in ``resp.served``, so a
+    test can tell a capped read stopped early."""
+    resp = MagicMock()
+    resp.status_code = status
+    resp.served = 0
+    if status >= 400 and status != 404:
+        resp.raise_for_status.side_effect = requests.HTTPError(str(status))
+
+    def iter_content(chunk_size=1, decode_unicode=False):
+        for i in range(0, len(body), chunk_size):
+            piece = body[i:i + chunk_size]
+            resp.served += len(piece)
+            yield piece
+
+    resp.iter_content.side_effect = iter_content
+    with patch.object(client.session, "get", return_value=resp) as mock_get:
+        yield mock_get, resp
+
+
 class TestFetchFile:
-    def test_success(self, client):
-        data = {"lines": [{"text": "line 1"}, {"text": "line 2"}]}
-        with _mock_get(client, json_data=data):
-            result = client.fetch_file("PROJ/repo", "README.md", ref="main")
-        # Trailing newline for parity with Gitea.
-        assert result == "line 1\nline 2\n"
+    """``fetch_file`` reads ``/raw``: the file's bytes as stored, where
+    ``/browse`` served lines and cut any over 5,000 characters, so a valid
+    policy file with one long paragraph read as unusable (a work repo's
+    rule file, 2026-10-09)."""
+
+    def test_returns_the_file_as_stored(self, client):
+        with _mock_raw(client, b"line 1\nline 2\n"):
+            assert client.fetch_file("PROJ/repo", "README.md", ref="main") == "line 1\nline 2\n"
+
+    def test_adds_no_newline_the_file_lacks(self, client):
+        """Exact bytes, as Gitea's ``fetch_file`` returns them."""
+        with _mock_raw(client, b"a\nb"):
+            assert client.fetch_file("PROJ/repo", "README.md", ref="main") == "a\nb"
+
+    def test_keeps_crlf_and_a_lone_carriage_return(self, client):
+        """A lone ``\\r`` has to reach the prompt for ``_visible_line_breaks``
+        to mark it, as it does in the diff."""
+        body = "a\r\nb\rimport os\n"
+        with _mock_raw(client, body.encode()):
+            assert client.fetch_file("PROJ/repo", "x.py", ref="main") == body
+
+    def test_a_line_longer_than_browse_served_is_returned_whole(self, client):
+        """The case that found it: a rule file with one 28,312-character line."""
+        body = "# Rule\n\n" + "x" * 28312 + "\n"
+        with _mock_raw(client, body.encode()):
+            assert client.fetch_file("PROJ/repo", ".claude/rules/a.md", ref="main") == body
+
+    def test_reads_the_raw_endpoint_at_ref_as_a_stream(self, client):
+        with _mock_raw(client, b"x\n") as (mock_get, _):
+            client.fetch_file("PROJ/repo", "README.md", ref="feature-sha")
+        assert mock_get.call_args[0][0] == (
+            f"{BB_DC_BASE}/rest/api/latest/projects/PROJ/repos/repo/raw/README.md")
+        assert mock_get.call_args[1]["params"] == {"at": "feature-sha"}
+        assert mock_get.call_args[1]["stream"] is True
 
     def test_not_found(self, client):
-        with _mock_get(client, status=404):
-            result = client.fetch_file("PROJ/repo", "missing.md")
-        assert result == ""
+        with _mock_raw(client, status=404):
+            assert client.fetch_file("PROJ/repo", "missing.md") == ""
 
-    def test_empty_file_returns_empty_string_not_newline(self, client):
-        """An empty lines array returns '' rather than a bare newline
-        so callers can truthiness-check the result."""
-        with _mock_get(client, json_data={"lines": []}):
-            result = client.fetch_file("PROJ/repo", "empty.txt")
-        assert result == ""
+    def test_empty_file_returns_empty_string(self, client):
+        with _mock_raw(client, b""):
+            assert client.fetch_file("PROJ/repo", "empty.txt") == ""
+
+    def test_http_error_raises(self, client):
+        """Only a 404 means "no such file"."""
+        with _mock_raw(client, status=500):
+            with pytest.raises(requests.HTTPError):
+                client.fetch_file("PROJ/repo", "CLAUDE.md", ref="main")
+
+    def test_invalid_utf8_is_replaced_not_raised(self, client):
+        """Decoded as Gitea's ``fetch_file`` decodes it."""
+        with _mock_raw(client, b"caf\xe9\n"):
+            assert client.fetch_file("PROJ/repo", "notes.md", ref="main") == "caf�\n"
 
     def test_path_with_special_chars_is_url_encoded(self, client):
         """URL-sensitive characters in the path must be percent-encoded
         so they don't break routing."""
-        with _mock_get(client, json_data={"lines": [{"text": "x"}]}) as mock_get:
+        with _mock_raw(client, b"x") as (mock_get, _):
             client.fetch_file("PROJ/repo", "docs/issue #42.md")
         url = mock_get.call_args[0][0]
         assert "#" not in url
@@ -1449,44 +1506,49 @@ class TestBinaryEntries:
 
 
 class TestFetchFileRefusesIncompleteReads:
-    """Audit 09-27 #12: the browse endpoint answers a binary file with
-    ``{"binary": true}`` and no lines (probed 2026-10-02), and pages a long
-    one. Returning "" or the first pages read a policy file as absent or
-    cut short, so both raise instead."""
+    """Audit 09-27 #12: a binary file or one too large to read whole must
+    raise, not read as "" or cut short, or a policy file reads as absent or
+    partial. ``/raw`` has no binary flag and no paging, so ``fetch_file``
+    applies git's binary test and its own byte cap."""
 
     def test_a_binary_file_raises(self, client):
         from raven.providers import IncompleteFileError
-        data = {"binary": True, "path": {"toString": "CLAUDE.md"}}
-        with _mock_get(client, json_data=data, content_type="application/json"):
+        with _mock_raw(client, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"):
             with pytest.raises(IncompleteFileError):
                 client.fetch_file("PROJ/repo", "CLAUDE.md", ref="main")
 
-    def test_a_read_past_the_page_cap_raises(self, client):
+    def test_a_nul_past_gits_binary_window_is_text(self, client):
+        """Git calls a file binary only for a NUL in its first 8,000 bytes,
+        so a file the diff shows as text reads as text."""
+        body = b"x" * 8000 + b"\x00\n"
+        with _mock_raw(client, body):
+            assert client.fetch_file("PROJ/repo", "data.txt", ref="main") == body.decode()
+
+    def test_a_file_over_the_byte_cap_raises_without_reading_it_all(self, client):
         from raven.providers import IncompleteFileError
-        data = {"lines": [{"text": "x"}], "isLastPage": False, "nextPageStart": 1}
-        with _mock_get(client, json_data=data, content_type="application/json"):
+        from raven.providers.bitbucket_dc import _MAX_FILE_BYTES
+        with _mock_raw(client, b"x" * (_MAX_FILE_BYTES * 3)) as (_, resp):
             with pytest.raises(IncompleteFileError):
-                client.fetch_file("PROJ/repo", "CLAUDE.md", ref="main")
+                client.fetch_file("PROJ/repo", "huge.min.js", ref="main")
+        assert resp.served < _MAX_FILE_BYTES * 2
 
-    def test_a_cut_line_raises(self, client):
-        """Browse cuts a line over the server's length limit and flags it
-        ``"truncated": true`` (probed 2026-10-02): a policy file with one
-        long paragraph would otherwise read cut short."""
+    def test_a_file_at_the_byte_cap_is_returned(self, client):
+        from raven.providers.bitbucket_dc import _MAX_FILE_BYTES
+        with _mock_raw(client, b"x" * _MAX_FILE_BYTES):
+            assert len(client.fetch_file("PROJ/repo", "big.txt", ref="main")) == _MAX_FILE_BYTES
+
+    @pytest.mark.parametrize("body", [b"text\n", b"\x00binary", None])
+    def test_the_streamed_response_is_closed(self, client, body):
+        """A streamed response holds its connection until closed: on a
+        read, a binary refusal and a cap refusal alike."""
         from raven.providers import IncompleteFileError
-        data = {"lines": [{"text": "x" * 5000, "truncated": True}], "isLastPage": True}
-        with _mock_get(client, json_data=data, content_type="application/json"):
-            with pytest.raises(IncompleteFileError):
-                client.fetch_file("PROJ/repo", "CLAUDE.md", ref="main")
-
-    def test_an_empty_file_is_still_empty(self, client):
-        """An empty file is served as no lines, not as binary (probed)."""
-        data = {"lines": [], "start": 0, "size": 0, "isLastPage": True}
-        with _mock_get(client, json_data=data, content_type="application/json"):
-            assert client.fetch_file("PROJ/repo", "CLAUDE.md", ref="main") == ""
-
-    def test_a_missing_file_is_still_empty(self, client):
-        with _mock_get(client, status=404):
-            assert client.fetch_file("PROJ/repo", "CLAUDE.md", ref="main") == ""
+        from raven.providers.bitbucket_dc import _MAX_FILE_BYTES
+        if body is None:
+            body = b"x" * (_MAX_FILE_BYTES + 1)
+        with _mock_raw(client, body) as (_, resp):
+            with contextlib.suppress(IncompleteFileError):
+                client.fetch_file("PROJ/repo", "f", ref="main")
+        resp.close.assert_called_once()
 
 
 class TestContentIdentityFromChanges:
